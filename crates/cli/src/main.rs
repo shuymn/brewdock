@@ -1,4 +1,4 @@
-#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 use anyhow::Result;
 use clap::Parser;

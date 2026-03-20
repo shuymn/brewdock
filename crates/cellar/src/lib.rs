@@ -1,3 +1,3 @@
-#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Cellar materialization, receipt, linking, and state management for brewdock.

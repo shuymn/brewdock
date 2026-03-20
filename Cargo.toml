@@ -32,6 +32,16 @@ unwrap_used = "deny"
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 
+# clippy::cargo group — configured individually to avoid source-level group override
+cargo_common_metadata = "warn"
+negative_feature_names = "warn"
+redundant_feature_names = "warn"
+wildcard_dependencies = "warn"
+# Transitive deps may pull multiple versions; not under our control
+multiple_crate_versions = "allow"
+
 [workspace.dependencies]
 thiserror = "2"
 tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

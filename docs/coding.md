@@ -124,7 +124,7 @@ Add these dependencies when the use case arises. Do not reimplement what they pr
 ## Style
 
 - Run `task fmt` before committing. Formatting uses **nightly** `rustfmt` with unstable options enabled in [rustfmt.toml](../rustfmt.toml): import grouping (`StdExternalCrate`), crate-level import granularity, impl item reordering, wildcard suffix condensing, and formatting inside doc comments / macro matchers. Do not strip `unstable_features` without replacing the dependent options.
-- Clippy: `task lint` runs `cargo clippy ... -- -D warnings`. See [docs/tooling.md](../docs/tooling.md) for the full Clippy policy (lint sources, thresholds, crate-level attributes). When you add a library crate root, copy the `#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]` attributes from `src/main.rs` to the new `lib.rs`.
+- Clippy: `task lint` runs `cargo clippy ... -- -D warnings`. See [docs/tooling.md](../docs/tooling.md) for the full Clippy policy (lint sources, thresholds, crate-level attributes). When you add a library crate root, add `#![warn(clippy::pedantic, clippy::nursery)]` to the new `lib.rs`. `clippy::cargo` lints are configured in `[workspace.lints.clippy]` (not in source) to avoid group-vs-individual override conflicts.
 - Prefer iterators over explicit loops when the transform chain is readable.
 - When a loop body is large or multi-step logic doesn't map naturally to closures, a plain `for` loop is more readable.
 - Use `usize` for indices, not `i32` or `u32`.

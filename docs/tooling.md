@@ -16,9 +16,9 @@ Read this file when working with build, CI, hooks, or adding tools.
 - That action sets **`RUSTFLAGS=-D warnings`** by default for the job, so `task test` and `task build` in CI fail on **rustc** warnings too (not only Clippy). Locally, important lints are already denied via `Cargo.toml` `[lints]`; remaining rustc warnings are caught by `task lint` and CI.
 - The default toolchain is **nightly** ([rust-toolchain.toml](../rust-toolchain.toml)) so `cargo fmt` respects unstable options in [rustfmt.toml](../rustfmt.toml). For a quieter baseline, pin nightly to a specific date in `rust-toolchain.toml`.
 - **Clippy policy** (this is the canonical reference; other docs defer here):
-  - [Cargo.toml](../Cargo.toml) `[lints.rust]` / `[lints.clippy]`: denies common footguns (`unwrap_used`, `expect_used`, `todo`, `dbg_macro`, etc.). These apply to all code including tests.
+  - [Cargo.toml](../Cargo.toml) `[workspace.lints.rust]` / `[workspace.lints.clippy]`: denies common footguns (`unwrap_used`, `expect_used`, `todo`, `dbg_macro`, etc.) and configures `clippy::cargo` lints individually (`cargo_common_metadata`, `wildcard_dependencies`, etc. as warn; `multiple_crate_versions` as allow). These apply to all code including tests.
   - [clippy.toml](../clippy.toml): tightens complexity and size thresholds.
-  - Crate root (`main.rs` or `lib.rs`): `#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]` — these become errors under `task lint` (`-D warnings`). When adding a new crate root, copy these attributes.
+  - Crate root (`main.rs` or `lib.rs`): `#![warn(clippy::pedantic, clippy::nursery)]` — these become errors under `task lint` (`-D warnings`). `clippy::cargo` is NOT set in source; it is configured in `[workspace.lints.clippy]` to avoid group-vs-individual override conflicts. When adding a new crate root, add the two attributes above.
 
 ## Adding Tools
 

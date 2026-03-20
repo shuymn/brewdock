@@ -1,3 +1,3 @@
-#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![warn(clippy::pedantic, clippy::nursery)]
 
 //! Bottle download, verification, and extraction for brewdock.
