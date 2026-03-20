@@ -9,6 +9,12 @@ pub struct StateDb {
     conn: rusqlite::Connection,
 }
 
+impl std::fmt::Debug for StateDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateDb").finish_non_exhaustive()
+    }
+}
+
 impl StateDb {
     /// Opens (or creates) the database at the given path.
     ///
@@ -103,17 +109,6 @@ impl StateDb {
     }
 }
 
-/// Maps a `SQLite` row to an [`InstallRecord`].
-fn row_to_record(row: &rusqlite::Row<'_>) -> Result<InstallRecord, rusqlite::Error> {
-    Ok(InstallRecord {
-        name: row.get(0)?,
-        version: row.get(1)?,
-        revision: row.get(2)?,
-        installed_on_request: row.get(3)?,
-        installed_at: row.get(4)?,
-    })
-}
-
 /// A record of an installed formula.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRecord {
@@ -127,6 +122,17 @@ pub struct InstallRecord {
     pub installed_on_request: bool,
     /// Installation timestamp (ISO 8601).
     pub installed_at: String,
+}
+
+/// Maps a `SQLite` row to an [`InstallRecord`].
+fn row_to_record(row: &rusqlite::Row<'_>) -> Result<InstallRecord, rusqlite::Error> {
+    Ok(InstallRecord {
+        name: row.get(0)?,
+        version: row.get(1)?,
+        revision: row.get(2)?,
+        installed_on_request: row.get(3)?,
+        installed_at: row.get(4)?,
+    })
 }
 
 #[cfg(test)]

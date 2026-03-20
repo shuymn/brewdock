@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum CellarError {
     /// A filesystem I/O operation failed.
-    #[error("I/O error: {0}")]
+    #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
     /// A symlink target already exists and points to a different keg.
@@ -14,11 +14,18 @@ pub enum CellarError {
         path: PathBuf,
     },
 
+    /// A required parent directory could not be determined.
+    #[error("missing parent directory for {path}")]
+    MissingParentDirectory {
+        /// Path missing a parent directory.
+        path: PathBuf,
+    },
+
     /// A `SQLite` database operation failed.
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
     /// JSON serialization or deserialization failed.
-    #[error("JSON error: {0}")]
+    #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }

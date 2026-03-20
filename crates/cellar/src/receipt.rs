@@ -7,7 +7,7 @@ use crate::error::CellarError;
 /// A Homebrew-compatible install receipt.
 ///
 /// Written as `INSTALL_RECEIPT.json` in the keg directory.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[allow(clippy::struct_excessive_bools)] // Matches Homebrew's JSON schema
 pub struct InstallReceipt {
     /// Version of the tool that performed the installation.
@@ -42,6 +42,15 @@ pub struct InstallReceipt {
     pub arch: String,
 }
 
+/// Why a formula was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallReason {
+    /// The formula was explicitly requested by the user.
+    OnRequest,
+    /// The formula was installed as a dependency.
+    AsDependency,
+}
+
 impl InstallReceipt {
     /// Creates a receipt for a bottle installation.
     ///
@@ -49,12 +58,13 @@ impl InstallReceipt {
     /// appropriate defaults for bottle pours.
     #[must_use]
     pub fn for_bottle(
-        installed_as_dependency: bool,
-        installed_on_request: bool,
+        install_reason: InstallReason,
         time: Option<f64>,
         runtime_dependencies: Vec<ReceiptDependency>,
         source: ReceiptSource,
     ) -> Self {
+        let installed_as_dependency = matches!(install_reason, InstallReason::AsDependency);
+        let installed_on_request = matches!(install_reason, InstallReason::OnRequest);
         Self {
             homebrew_version: format!("brewdock {}", env!("CARGO_PKG_VERSION")),
             used_options: Vec::new(),
@@ -76,7 +86,7 @@ impl InstallReceipt {
 }
 
 /// A runtime dependency entry in the install receipt.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReceiptDependency {
     /// Fully qualified formula name.
     pub full_name: String,
@@ -91,7 +101,7 @@ pub struct ReceiptDependency {
 }
 
 /// Formula source information in the install receipt.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReceiptSource {
     /// Conventional tap path.
     pub path: String,
@@ -104,7 +114,7 @@ pub struct ReceiptSource {
 }
 
 /// Version information within the formula source.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReceiptSourceVersions {
     /// Stable version string.
     pub stable: String,
@@ -133,8 +143,7 @@ mod tests {
 
     fn sample_receipt() -> InstallReceipt {
         InstallReceipt::for_bottle(
-            false,
-            true,
+            InstallReason::OnRequest,
             Some(1_700_000_000.0),
             vec![ReceiptDependency {
                 full_name: "oniguruma".to_owned(),
@@ -163,16 +172,16 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&receipt)?;
         let value: serde_json::Value = serde_json::from_str(&json_str)?;
 
-        assert!(value["poured_from_bottle"].as_bool() == Some(true));
-        assert!(value["built_as_bottle"].as_bool() == Some(true));
-        assert!(value["installed_on_request"].as_bool() == Some(true));
-        assert!(value["installed_as_dependency"].as_bool() == Some(false));
-        assert!(value["time"].as_f64() == Some(1_700_000_000.0));
+        assert_eq!(value["poured_from_bottle"].as_bool(), Some(true));
+        assert_eq!(value["built_as_bottle"].as_bool(), Some(true));
+        assert_eq!(value["installed_on_request"].as_bool(), Some(true));
+        assert_eq!(value["installed_as_dependency"].as_bool(), Some(false));
+        assert_eq!(value["time"].as_f64(), Some(1_700_000_000.0));
         assert!(value["source_modified_time"].is_null());
         assert!(value["used_options"].as_array().is_some_and(Vec::is_empty));
-        assert!(value["source"]["tap"].as_str() == Some("homebrew/core"));
-        assert!(value["source"]["spec"].as_str() == Some("stable"));
-        assert!(value["source"]["versions"]["stable"].as_str() == Some("1.7"));
+        assert_eq!(value["source"]["tap"].as_str(), Some("homebrew/core"));
+        assert_eq!(value["source"]["spec"].as_str(), Some("stable"));
+        assert_eq!(value["source"]["versions"]["stable"].as_str(), Some("1.7"));
 
         let deps = value["runtime_dependencies"]
             .as_array()
@@ -197,7 +206,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         let value: serde_json::Value = serde_json::from_str(&content)?;
-        assert!(value["poured_from_bottle"].as_bool() == Some(true));
+        assert_eq!(value["poured_from_bottle"].as_bool(), Some(true));
         Ok(())
     }
 
@@ -210,8 +219,7 @@ mod tests {
     #[test]
     fn test_receipt_empty_dependencies() -> Result<(), Box<dyn std::error::Error>> {
         let receipt = InstallReceipt::for_bottle(
-            true,
-            false,
+            InstallReason::AsDependency,
             None,
             Vec::new(),
             ReceiptSource {
@@ -228,14 +236,27 @@ mod tests {
         let json_str = serde_json::to_string(&receipt)?;
         let value: serde_json::Value = serde_json::from_str(&json_str)?;
 
-        assert!(value["installed_as_dependency"].as_bool() == Some(true));
-        assert!(value["installed_on_request"].as_bool() == Some(false));
+        assert_eq!(value["installed_as_dependency"].as_bool(), Some(true));
+        assert_eq!(value["installed_on_request"].as_bool(), Some(false));
         assert!(value["time"].is_null());
         assert!(
             value["runtime_dependencies"]
                 .as_array()
                 .is_some_and(Vec::is_empty)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_receipt_returns_io_error_when_keg_path_is_not_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let keg_path = dir.path().join("not-a-directory");
+        std::fs::write(&keg_path, "file")?;
+
+        let result = write_receipt(&keg_path, &sample_receipt());
+
+        assert!(matches!(result, Err(CellarError::Io(_))));
         Ok(())
     }
 }

@@ -14,6 +14,7 @@ const LINKABLE_DIRS: &[&str] = &["bin", "sbin", "lib", "include", "share", "etc"
 ///
 /// Returns [`CellarError::LinkCollision`] if a target already exists and points to
 /// a different keg.
+/// Returns [`CellarError::MissingParentDirectory`] if a target path has no parent.
 /// Returns [`CellarError::Io`] on filesystem failure.
 pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
     for &dir_name in LINKABLE_DIRS {
@@ -43,7 +44,7 @@ pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             let rel_target = relative_from_to(
                 link_path
                     .parent()
-                    .ok_or_else(|| CellarError::LinkCollision {
+                    .ok_or_else(|| CellarError::MissingParentDirectory {
                         path: link_path.clone(),
                     })?,
                 &file,

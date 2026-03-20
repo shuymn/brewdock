@@ -14,7 +14,8 @@ pub use error::CellarError;
 pub use link::{link, unlink};
 pub use materialize::materialize;
 pub use receipt::{
-    InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions, write_receipt,
+    InstallReason, InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
+    write_receipt,
 };
 pub use relocate::relocate_keg;
 pub use state::{InstallRecord, StateDb};
