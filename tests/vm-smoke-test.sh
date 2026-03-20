@@ -3,7 +3,7 @@
 # Destructive smoke test for brewdock using a Tart macOS VM.
 #
 # Usage:
-#   ./tests/vm-smoke-test.sh [--keep]
+#   ./tests/vm-smoke-test.sh [--keep] [--formula <name> ...]
 #
 # Prerequisites:
 #   - Tart (https://tart.run) installed
@@ -19,13 +19,62 @@
 #   2. Clones a disposable VM from the base image
 #   3. Boots the VM with a shared directory containing the keypair and binary
 #   4. Installs the public key into the VM via the mount, then uses key auth
-#   5. Runs: bd update -> bd install jq -> verify -> bd upgrade -> bd --dry-run
+#   5. Runs: bd update -> installability sweep -> jq deep verification -> bd --dry-run
 #   6. Destroys the VM (unless --keep is passed)
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+readonly DEFAULT_FORMULAE=(
+  actionlint
+  agent-browser
+  ast-grep
+  atuin
+  bash
+  bat
+  curl
+  direnv
+  eza
+  fd
+  fnm
+  fzf
+  gh
+  ghalint
+  ghq
+  git
+  git-delta
+  git-secrets
+  gitleaks
+  glow
+  gnu-sed
+  go-task
+  httpie
+  jq
+  neovim
+  pinact
+  ripgrep
+  rtk
+  sd
+  semgrep
+  shellcheck
+  shfmt
+  sops
+  sqlmap
+  starship
+  topgrade
+  toxiproxy
+  vim
+  wakeonlan
+  wget
+  yq
+  zoxide
+  zsh-completions
+  zsh-fast-syntax-highlighting
+)
+readonly PRIMARY_FORMULA="jq"
+readonly DRY_RUN_FORMULA="ripgrep"
 
 VM_NAME="brewdock-smoke-$$"
 BASE_IMAGE="ghcr.io/cirruslabs/macos-sequoia-base:latest"
@@ -35,18 +84,52 @@ SSH_PASS="admin"
 KEEP_VM=false
 SHARE_DIR=""
 SSH_KEY=""
+FORMULAE=()
+INSTALL_RESULTS=()
+FAILED_FORMULAE=()
 
-for arg in "$@"; do
-  case "$arg" in
-    --keep) KEEP_VM=true ;;
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --keep)
+      KEEP_VM=true
+      shift
+      ;;
+    --formula)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "missing value for --formula" >&2
+        exit 1
+      fi
+      FORMULAE+=("$1")
+      shift
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 1
+      ;;
   esac
 done
+
+if [ "${#FORMULAE[@]}" -eq 0 ]; then
+  FORMULAE=("${DEFAULT_FORMULAE[@]}")
+fi
 
 # --- Helpers ----------------------------------------------------------------
 
 log()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 pass() { printf '\033[1;32m  PASS: %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m  FAIL: %s\033[0m\n' "$*"; exit 1; }
+
+record_install_result() {
+  local formula=$1
+  local status=$2
+  local detail=$3
+
+  INSTALL_RESULTS+=("$formula:$status:$detail")
+  if [ "$status" != "PASS" ]; then
+    FAILED_FORMULAE+=("$formula")
+  fi
+}
 
 cleanup() {
   if [ "$KEEP_VM" = true ]; then
@@ -96,6 +179,56 @@ ssh_with_password() {
   "
 }
 
+run_install_check() {
+  local formula=$1
+  local install_output=""
+  local db_version=""
+  local install_status=0
+
+  log "Running: bd install $formula"
+  if install_output=$(vm_ssh "/tmp/bd install $formula" 2>&1); then
+    install_status=0
+  else
+    install_status=$?
+  fi
+  echo "$install_output"
+
+  if [ "$install_status" -ne 0 ]; then
+    record_install_result "$formula" "FAIL" "install command failed"
+    return
+  fi
+
+  if ! vm_ssh "test -d /opt/homebrew/Cellar/$formula" >/dev/null 2>&1; then
+    record_install_result "$formula" "FAIL" "Cellar entry missing"
+    return
+  fi
+
+  db_version=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='$formula'\"" 2>/dev/null || true)
+  if [ -z "$db_version" ]; then
+    record_install_result "$formula" "FAIL" "state DB record missing"
+    return
+  fi
+
+  record_install_result "$formula" "PASS" "$db_version"
+}
+
+print_install_summary() {
+  local result=""
+  local formula=""
+  local status=""
+  local detail=""
+
+  echo ""
+  log "Installability summary"
+  for result in "${INSTALL_RESULTS[@]}"; do
+    formula=${result%%:*}
+    status=${result#*:}
+    detail=${status#*:}
+    status=${status%%:*}
+    printf '  %-30s %s (%s)\n' "$formula" "$status" "$detail"
+  done
+}
+
 # --- Preflight --------------------------------------------------------------
 
 log "Preflight checks"
@@ -129,11 +262,10 @@ tart clone "$BASE_IMAGE" "$VM_NAME"
 
 log "Starting VM (headless) with shared directory..."
 tart run "$VM_NAME" --no-graphics --dir="brewdock:$SHARE_DIR" &
-VM_PID=$!
 
 log "Waiting for VM IP..."
 VM_IP=""
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   VM_IP=$(tart ip "$VM_NAME" 2>/dev/null || true)
   if [ -n "$VM_IP" ]; then
     break
@@ -147,7 +279,7 @@ fi
 log "VM IP: $VM_IP"
 
 log "Waiting for SSH (password auth)..."
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if ssh_with_password "true" &>/dev/null; then
     break
   fi
@@ -161,7 +293,7 @@ log "Installing SSH public key into VM..."
 # The shared directory is auto-mounted at /Volumes/My Shared Files/brewdock
 # by the Virtualization framework. Wait for it to appear.
 MOUNT_PATH="/Volumes/My Shared Files/brewdock"
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
   if ssh_with_password "test -d '$MOUNT_PATH'" &>/dev/null; then
     break
   fi
@@ -194,14 +326,27 @@ log "Running: bd update"
 vm_ssh "/tmp/bd update" || fail "bd update failed"
 pass "bd update"
 
-# --- Test: bd install jq -----------------------------------------------------
+# --- Test: installability sweep ----------------------------------------------
 
-log "Running: bd install jq"
-vm_ssh "/tmp/bd install jq" || fail "bd install jq failed"
-pass "bd install jq"
+for formula in "${FORMULAE[@]}"; do
+  run_install_check "$formula"
+done
 
-log "Verifying: which jq"
-JQ_PATH=$(vm_ssh 'export PATH="/opt/homebrew/bin:$PATH" && which jq' 2>/dev/null || true)
+print_install_summary
+
+if [ "${#FAILED_FORMULAE[@]}" -gt 0 ]; then
+  echo ""
+  log "Failed formulae: ${FAILED_FORMULAE[*]}"
+fi
+
+# --- Test: jq deep verification ----------------------------------------------
+
+if printf '%s\n' "${FAILED_FORMULAE[@]}" | grep -qx "$PRIMARY_FORMULA"; then
+  fail "$PRIMARY_FORMULA installability failed; skipping deep verification"
+fi
+
+log "Verifying: which $PRIMARY_FORMULA"
+JQ_PATH=$(vm_ssh "export PATH=\"/opt/homebrew/bin:\$PATH\" && which jq" 2>/dev/null || true)
 if [ -z "$JQ_PATH" ]; then
   vm_ssh "test -L /opt/homebrew/bin/jq" || fail "/opt/homebrew/bin/jq symlink does not exist"
   JQ_PATH="/opt/homebrew/bin/jq"
@@ -242,7 +387,6 @@ fi
 # --- Test: bd upgrade (actual version bump) ----------------------------------
 
 log "Faking old jq version in state DB..."
-REAL_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/jq/" 2>/dev/null | head -1)
 vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"UPDATE installs SET version='0.0.0-fake' WHERE name='jq'\""
 FAKED=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='jq'\"")
 if [ "$FAKED" != "0.0.0-fake" ]; then
@@ -276,7 +420,7 @@ pass "state DB version: $DB_VERSION"
 # --- Test: bd install --dry-run ----------------------------------------------
 
 log "Running: bd install --dry-run ripgrep"
-DRY_OUTPUT=$(vm_ssh "/tmp/bd install --dry-run ripgrep" 2>&1 || true)
+DRY_OUTPUT=$(vm_ssh "/tmp/bd install --dry-run $DRY_RUN_FORMULA" 2>&1 || true)
 echo "$DRY_OUTPUT"
 if echo "$DRY_OUTPUT" | grep -qE "(Would install|Nothing to install)"; then
   pass "bd install --dry-run"
@@ -284,13 +428,16 @@ else
   fail "bd install --dry-run produced unexpected output"
 fi
 
-if vm_ssh "test -d /opt/homebrew/Cellar/ripgrep" 2>/dev/null; then
-  fail "dry-run installed ripgrep (should not have)"
+if [ "$DRY_RUN_FORMULA" = "ripgrep" ]; then
+  pass "dry-run output checked against $DRY_RUN_FORMULA"
 fi
-pass "dry-run did not install"
 
 # --- Summary -----------------------------------------------------------------
 
 echo ""
+if [ "${#FAILED_FORMULAE[@]}" -gt 0 ]; then
+  fail "installability sweep found failures: ${FAILED_FORMULAE[*]}"
+fi
+
 log "All smoke tests passed!"
 echo ""
