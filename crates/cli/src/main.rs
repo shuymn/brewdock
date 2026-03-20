@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use brewdock_core::{HostTag, HttpBottleDownloader, HttpFormulaRepository, Layout, Orchestrator};
 use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
 mod commands;
 
@@ -15,6 +16,18 @@ mod testutil;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Show what would be done without executing.
+    #[arg(long, global = true)]
+    dry_run: bool,
+
+    /// Increase log detail.
+    #[arg(long, global = true, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Suppress non-error output.
+    #[arg(long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
 }
 
 #[derive(clap::Subcommand)]
@@ -36,10 +49,9 @@ enum Commands {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Intentionally discard: fails harmlessly if a subscriber is already set (e.g., in tests).
-    let _ = tracing_subscriber::fmt::try_init();
-
     let cli = Cli::parse();
+
+    init_tracing(cli.verbose, cli.quiet);
 
     let layout = Layout::production();
     let host_tag = HostTag::detect().context("platform detection failed")?;
@@ -51,10 +63,30 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Commands::Install { formulae } => commands::install::run(&orchestrator, &formulae).await,
-        Commands::Update => commands::update::run(&orchestrator).await,
-        Commands::Upgrade { formulae } => commands::upgrade::run(&orchestrator, &formulae).await,
+        Commands::Install { formulae } => {
+            commands::install::run(&orchestrator, &formulae, cli.dry_run, cli.quiet).await
+        }
+        Commands::Update => commands::update::run(&orchestrator, cli.dry_run, cli.quiet).await,
+        Commands::Upgrade { formulae } => {
+            commands::upgrade::run(&orchestrator, &formulae, cli.dry_run, cli.quiet).await
+        }
     }
+}
+
+/// Initializes the tracing subscriber based on verbosity flags.
+fn init_tracing(verbose: bool, quiet: bool) {
+    let level = if verbose {
+        "debug"
+    } else if quiet {
+        "error"
+    } else {
+        "info"
+    };
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    // Intentionally discard: fails harmlessly if a subscriber is already set (e.g., in tests).
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 #[cfg(test)]
@@ -114,5 +146,41 @@ mod tests {
             Commands::Upgrade { ref formulae } if formulae.len() == 1 && formulae[0] == "jq"
         ));
         Ok(())
+    }
+
+    #[test]
+    fn test_dry_run_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "--dry-run", "install", "jq"])?;
+        assert!(cli.dry_run);
+        Ok(())
+    }
+
+    #[test]
+    fn test_dry_run_flag_after_subcommand() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "install", "--dry-run", "jq"])?;
+        assert!(cli.dry_run);
+        Ok(())
+    }
+
+    #[test]
+    fn test_verbose_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "--verbose", "install", "jq"])?;
+        assert!(cli.verbose);
+        assert!(!cli.quiet);
+        Ok(())
+    }
+
+    #[test]
+    fn test_quiet_flag_parsed() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "--quiet", "install", "jq"])?;
+        assert!(cli.quiet);
+        assert!(!cli.verbose);
+        Ok(())
+    }
+
+    #[test]
+    fn test_verbose_and_quiet_conflict() {
+        let result = Cli::try_parse_from(["bd", "--verbose", "--quiet", "install", "jq"]);
+        assert!(result.is_err());
     }
 }

@@ -9,16 +9,41 @@ use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     orchestrator: &Orchestrator<R, D>,
     formulae: &[String],
+    dry_run: bool,
+    quiet: bool,
 ) -> Result<()> {
+    if dry_run {
+        let plan = orchestrator
+            .plan_upgrade(formulae)
+            .await
+            .context("upgrade planning failed")?;
+        if !quiet {
+            if plan.is_empty() {
+                println!("Already up-to-date");
+            } else {
+                println!("Would upgrade:");
+                for entry in &plan {
+                    println!(
+                        "  {} {} -> {}",
+                        entry.name, entry.from_version, entry.to_version
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let upgraded = orchestrator
         .upgrade(formulae)
         .await
         .context("upgrade failed")?;
-    if upgraded.is_empty() {
-        println!("Already up-to-date");
-    } else {
-        for name in &upgraded {
-            println!("Upgraded {name}");
+    if !quiet {
+        if upgraded.is_empty() {
+            println!("Already up-to-date");
+        } else {
+            for name in &upgraded {
+                println!("Upgraded {name}");
+            }
         }
     }
     Ok(())
@@ -59,7 +84,7 @@ mod tests {
         let orchestrator =
             make_orchestrator(vec![formula], vec![(sha, tar)], counter, layout.clone());
 
-        run(&orchestrator, &["a".to_owned()]).await?;
+        run(&orchestrator, &["a".to_owned()], false, false).await?;
 
         assert!(layout.cellar().join("a/2.0/bin/a_tool").exists());
         Ok(())
@@ -85,7 +110,52 @@ mod tests {
         let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone());
 
         // Should succeed without error (nothing to upgrade).
-        run(&orchestrator, &["a".to_owned()]).await?;
+        run(&orchestrator, &["a".to_owned()], false, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_upgrade_does_not_execute() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // Pre-populate state DB with old version.
+        let state_db = StateDb::open(&layout.db_path())?;
+        state_db.insert(&InstallRecord {
+            name: "a".to_owned(),
+            version: "1.0".to_owned(),
+            revision: 0,
+            installed_on_request: true,
+            installed_at: "1000".to_owned(),
+        })?;
+        drop(state_db);
+
+        let sha = "sha_new";
+        let formula = make_formula("a", "2.0", &[], sha);
+        let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![(sha, tar)],
+            counter.clone(),
+            layout.clone(),
+        );
+
+        run(&orchestrator, &["a".to_owned()], true, false).await?;
+
+        // dry_run: new version not installed
+        assert!(!layout.cellar().join("a/2.0").exists());
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no downloads in dry-run"
+        );
+
+        // Old state preserved
+        let state_db = StateDb::open(&layout.db_path())?;
+        let record = state_db.get("a")?.ok_or("expected record")?;
+        assert_eq!(record.version, "1.0");
         Ok(())
     }
 }
