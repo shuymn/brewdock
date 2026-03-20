@@ -1,0 +1,47 @@
+{
+  "name": "sqlmap",
+  "full_name": "sqlmap",
+  "versions": {
+    "stable": "1.10.3",
+    "head": "HEAD",
+    "bottle": true
+  },
+  "revision": 0,
+  "ruby_source_path": "Formula/s/sqlmap.rb",
+  "bottle": {
+    "stable": {
+      "rebuild": 0,
+      "root_url": "https://ghcr.io/v2/homebrew/core",
+      "files": {
+        "all": {
+          "cellar": ":any_skip_relocation",
+          "url": "https://ghcr.io/v2/homebrew/core/sqlmap/blobs/sha256:49665dd265de2071595686613b6e83500f5f24bb0c81b59add925ae49755f1b5",
+          "sha256": "49665dd265de2071595686613b6e83500f5f24bb0c81b59add925ae49755f1b5"
+        }
+      }
+    }
+  },
+  "urls": {
+    "stable": {
+      "url": "https://github.com/sqlmapproject/sqlmap/archive/refs/tags/1.10.3.tar.gz",
+      "tag": null,
+      "revision": null,
+      "using": null,
+      "checksum": "55df94d28ff5cfa022e53296a548d3b6867d4f2bf2f95fb1038ad251f8d8bd71"
+    }
+  },
+  "pour_bottle_only_if": null,
+  "keg_only": false,
+  "dependencies": [
+    "python@3.14"
+  ],
+  "build_dependencies": [],
+  "uses_from_macos": [
+    {
+      "sqlite": "test"
+    }
+  ],
+  "requirements": [],
+  "disabled": false,
+  "post_install_defined": false
+}

@@ -17,8 +17,8 @@ pub use error::{FormulaError, UnsupportedReason};
 pub use resolve::resolve_install_order;
 pub use supportability::check_supportability;
 pub use types::{
-    BottleFile, BottleSpec, BottleStable, Formula, FormulaUrls, MacOsDependency, NamedEntry,
-    Requirement, StableUrl, Versions,
+    BottleFile, BottleSpec, BottleStable, Formula, FormulaUrls, MacOsDependency,
+    MacOsDependencyDetail, NamedEntry, Requirement, StableUrl, Versions,
 };
 
 #[cfg(test)]

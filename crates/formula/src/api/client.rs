@@ -91,6 +91,9 @@ mod tests {
     use super::*;
 
     const JQ_FIXTURE: &str = include_str!("../../tests/fixtures/formula/jq.json");
+    const SEMGREP_FIXTURE: &str = include_str!("../../tests/fixtures/formula/semgrep.json");
+    const ZSH_COMPLETIONS_FIXTURE: &str =
+        include_str!("../../tests/fixtures/formula/zsh-completions.json");
 
     fn make_repo(server: &MockServer) -> HttpFormulaRepository {
         HttpFormulaRepository::with_base_url(server.base_url())
@@ -160,6 +163,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_formula_parses_live_uses_from_macos_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start();
+        let formula = server.mock(|when, then| {
+            when.method(GET).path("/formula/zsh-completions.json");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(ZSH_COMPLETIONS_FIXTURE);
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.get_formula("zsh-completions").await?;
+
+        formula.assert();
+        assert_eq!(result.name, "zsh-completions");
+        assert_eq!(result.uses_from_macos.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_get_all_formulae_success() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start();
         let formulae = server.mock(|when, then| {
@@ -175,6 +198,27 @@ mod tests {
         formulae.assert();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "jq");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_all_formulae_parses_mixed_uses_from_macos_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start();
+        let formulae = server.mock(|when, then| {
+            when.method(GET).path("/formula.json");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(format!("[{JQ_FIXTURE},{SEMGREP_FIXTURE}]"));
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.get_all_formulae().await?;
+
+        formulae.assert();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1].name, "semgrep");
+        assert_eq!(result[1].uses_from_macos.len(), 2);
         Ok(())
     }
 

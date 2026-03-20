@@ -1,0 +1,45 @@
+{
+  "name": "zsh-completions",
+  "full_name": "zsh-completions",
+  "versions": {
+    "stable": "0.35.0",
+    "head": "HEAD",
+    "bottle": true
+  },
+  "revision": 0,
+  "ruby_source_path": "Formula/z/zsh-completions.rb",
+  "bottle": {
+    "stable": {
+      "rebuild": 1,
+      "root_url": "https://ghcr.io/v2/homebrew/core",
+      "files": {
+        "all": {
+          "cellar": ":any_skip_relocation",
+          "url": "https://ghcr.io/v2/homebrew/core/zsh-completions/blobs/sha256:98d3985c4c7883eceb5136fef89f1e169067fe290eb540efeb5fec4ace5396be",
+          "sha256": "98d3985c4c7883eceb5136fef89f1e169067fe290eb540efeb5fec4ace5396be"
+        }
+      }
+    }
+  },
+  "urls": {
+    "stable": {
+      "url": "https://github.com/zsh-users/zsh-completions/archive/refs/tags/0.35.0.tar.gz",
+      "tag": null,
+      "revision": null,
+      "using": null,
+      "checksum": "811bb4213622720872e08d6e0857f1dd7bc12ff7aa2099a170b76301a53f4fbe"
+    }
+  },
+  "pour_bottle_only_if": null,
+  "keg_only": false,
+  "dependencies": [],
+  "build_dependencies": [],
+  "uses_from_macos": [
+    {
+      "zsh": "test"
+    }
+  ],
+  "requirements": [],
+  "disabled": false,
+  "post_install_defined": false
+}

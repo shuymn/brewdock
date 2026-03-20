@@ -1,0 +1,63 @@
+{
+  "name": "semgrep",
+  "full_name": "semgrep",
+  "versions": {
+    "stable": "1.156.0",
+    "head": "HEAD",
+    "bottle": true
+  },
+  "revision": 0,
+  "ruby_source_path": "Formula/s/semgrep.rb",
+  "bottle": {
+    "stable": {
+      "rebuild": 0,
+      "root_url": "https://ghcr.io/v2/homebrew/core",
+      "files": {
+        "arm64_tahoe": {
+          "cellar": ":any",
+          "url": "https://ghcr.io/v2/homebrew/core/semgrep/blobs/sha256:67db317dc1a8fcd0c8ba92d3fc92516145054ef36f3af46afc548afa38e9455b",
+          "sha256": "67db317dc1a8fcd0c8ba92d3fc92516145054ef36f3af46afc548afa38e9455b"
+        },
+        "arm64_sequoia": {
+          "cellar": ":any",
+          "url": "https://ghcr.io/v2/homebrew/core/semgrep/blobs/sha256:72b7cf27bcb25270d6bdb6123bd94355f262a6fce6973580fead799ec52b7b90",
+          "sha256": "72b7cf27bcb25270d6bdb6123bd94355f262a6fce6973580fead799ec52b7b90"
+        },
+        "arm64_sonoma": {
+          "cellar": ":any",
+          "url": "https://ghcr.io/v2/homebrew/core/semgrep/blobs/sha256:34bdc430f993472b51055986321231ca3cd537145d989c4769360a1844ea549f",
+          "sha256": "34bdc430f993472b51055986321231ca3cd537145d989c4769360a1844ea549f"
+        }
+      }
+    }
+  },
+  "urls": {
+    "stable": {
+      "url": "https://github.com/semgrep/semgrep.git",
+      "tag": "v1.156.0",
+      "revision": "ab584982f6ecdaaa7954a14e5350a70c060e097f",
+      "using": null,
+      "checksum": null
+    }
+  },
+  "pour_bottle_only_if": null,
+  "keg_only": false,
+  "dependencies": [
+    "certifi",
+    "cryptography"
+  ],
+  "build_dependencies": [
+    "ocaml",
+    "opam",
+    "pkgconf"
+  ],
+  "uses_from_macos": [
+    {
+      "rsync": "build"
+    },
+    "curl"
+  ],
+  "requirements": [],
+  "disabled": false,
+  "post_install_defined": false
+}

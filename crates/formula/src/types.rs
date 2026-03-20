@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self},
+    ser::SerializeMap,
+};
 
 use crate::cellar_type::CellarType;
 
@@ -137,13 +141,21 @@ pub struct StableUrl {
 }
 
 /// A dependency that macOS may provide.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MacOsDependency {
     /// String shorthand such as `"zlib"`.
     Name(String),
-    /// Structured entry that still carries a name.
-    Detailed(NamedEntry),
+    /// Structured entry with a dependency name and usage contexts.
+    Detailed(MacOsDependencyDetail),
+}
+
+/// Structured `uses_from_macos` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacOsDependencyDetail {
+    /// macOS-provided dependency name.
+    pub name: String,
+    /// Contexts where the dependency is used.
+    pub contexts: Vec<String>,
 }
 
 /// Homebrew requirement entry.
@@ -163,10 +175,99 @@ pub struct NamedEntry {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum MacOsDependencyWire {
+    Name(String),
+    Detailed(HashMap<String, MacOsDependencyContexts>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum MacOsDependencyContexts {
+    One(String),
+    Many(Vec<String>),
+}
+
+const USES_FROM_MACOS_ENTRY_ERROR: &str = "uses_from_macos object must contain exactly one entry";
+
+impl MacOsDependencyContexts {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(context) => vec![context],
+            Self::Many(contexts) => contexts,
+        }
+    }
+}
+
+impl Serialize for MacOsDependency {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Name(name) => serializer.serialize_str(name),
+            Self::Detailed(detail) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                match detail.contexts.as_slice() {
+                    [context] => map.serialize_entry(&detail.name, context)?,
+                    contexts => map.serialize_entry(&detail.name, contexts)?,
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MacOsDependency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = MacOsDependencyWire::deserialize(deserializer)?;
+        match wire {
+            MacOsDependencyWire::Name(name) => Ok(Self::Name(name)),
+            MacOsDependencyWire::Detailed(entries) => Ok(Self::Detailed(
+                deserialize_macos_dependency_detail(entries)?,
+            )),
+        }
+    }
+}
+
+fn deserialize_macos_dependency_detail<E>(
+    entries: HashMap<String, MacOsDependencyContexts>,
+) -> Result<MacOsDependencyDetail, E>
+where
+    E: de::Error,
+{
+    let mut entries = entries.into_iter();
+    let (name, contexts) = entries
+        .next()
+        .ok_or_else(|| E::custom(USES_FROM_MACOS_ENTRY_ERROR))?;
+    if entries.next().is_some() {
+        return Err(E::custom(USES_FROM_MACOS_ENTRY_ERROR));
+    }
+
+    Ok(MacOsDependencyDetail {
+        name,
+        contexts: contexts.into_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::test_formula;
+
+    fn detailed_dependency(name: &str, contexts: &[&str]) -> MacOsDependency {
+        MacOsDependency::Detailed(MacOsDependencyDetail {
+            name: name.to_owned(),
+            contexts: contexts
+                .iter()
+                .map(|context| (*context).to_owned())
+                .collect(),
+        })
+    }
 
     #[test]
     fn test_deserialize_jq_fixture() -> Result<(), Box<dyn std::error::Error>> {
@@ -301,5 +402,95 @@ mod tests {
         assert_eq!(f.name, "jq");
         assert_eq!(f.dependencies, vec!["oniguruma"]);
         assert!(f.bottle.stable.is_some());
+    }
+
+    #[test]
+    fn test_deserialize_uses_from_macos_string_form() -> Result<(), serde_json::Error> {
+        let dep: MacOsDependency = serde_json::from_str(r#""curl""#)?;
+        assert_eq!(dep, MacOsDependency::Name("curl".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_uses_from_macos_single_context_object() -> Result<(), serde_json::Error> {
+        let dep: MacOsDependency = serde_json::from_str(r#"{"zsh":"test"}"#)?;
+        assert_eq!(dep, detailed_dependency("zsh", &["test"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_uses_from_macos_multiple_contexts_object() -> Result<(), serde_json::Error>
+    {
+        let dep: MacOsDependency = serde_json::from_str(r#"{"zsh":["build","test"]}"#)?;
+        assert_eq!(dep, detailed_dependency("zsh", &["build", "test"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_uses_from_macos_mixed_array() -> Result<(), serde_json::Error> {
+        let deps: Vec<MacOsDependency> = serde_json::from_str(r#"["curl",{"rsync":"build"}]"#)?;
+        assert_eq!(
+            deps,
+            vec![
+                MacOsDependency::Name("curl".to_owned()),
+                detailed_dependency("rsync", &["build"]),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_zsh_completions_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        let json = include_str!("../tests/fixtures/formula/zsh-completions.json");
+        let formula: Formula = serde_json::from_str(json)?;
+        assert_eq!(
+            formula.uses_from_macos,
+            vec![detailed_dependency("zsh", &["test"])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_zsh_fast_syntax_highlighting_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let json = include_str!("../tests/fixtures/formula/zsh-fast-syntax-highlighting.json");
+        let formula: Formula = serde_json::from_str(json)?;
+        assert_eq!(
+            formula.uses_from_macos,
+            vec![detailed_dependency("zsh", &["build", "test"])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_sqlmap_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        let json = include_str!("../tests/fixtures/formula/sqlmap.json");
+        let formula: Formula = serde_json::from_str(json)?;
+        assert_eq!(
+            formula.uses_from_macos,
+            vec![detailed_dependency("sqlite", &["test"])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_semgrep_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        let json = include_str!("../tests/fixtures/formula/semgrep.json");
+        let formula: Formula = serde_json::from_str(json)?;
+        assert_eq!(
+            formula.uses_from_macos,
+            vec![
+                detailed_dependency("rsync", &["build"]),
+                MacOsDependency::Name("curl".to_owned()),
+            ]
+        );
+        assert!(
+            formula
+                .bottle
+                .stable
+                .as_ref()
+                .is_some_and(|stable| stable.files.contains_key("arm64_tahoe"))
+        );
+        Ok(())
     }
 }
