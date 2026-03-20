@@ -4,8 +4,12 @@
 
 pub mod error;
 pub mod layout;
+pub mod lock;
+pub mod orchestrate;
 pub mod platform;
 
 pub use error::BrewdockError;
 pub use layout::Layout;
+pub use lock::FileLock;
+pub use orchestrate::Orchestrator;
 pub use platform::HostTag;

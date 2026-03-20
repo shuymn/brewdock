@@ -1,3 +1,7 @@
+use brewdock_bottle::BottleError;
+use brewdock_cellar::CellarError;
+use brewdock_formula::FormulaError;
+
 use crate::platform::PlatformError;
 
 /// Top-level error type aggregating all sub-crate errors.
@@ -10,4 +14,16 @@ pub enum BrewdockError {
     /// I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// Formula operation error.
+    #[error(transparent)]
+    Formula(#[from] FormulaError),
+
+    /// Bottle operation error.
+    #[error(transparent)]
+    Bottle(#[from] BottleError),
+
+    /// Cellar operation error.
+    #[error(transparent)]
+    Cellar(#[from] CellarError),
 }

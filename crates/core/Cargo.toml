@@ -12,9 +12,16 @@ description = "Core types and orchestration for brewdock"
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+brewdock-formula = { path = "../formula" }
+brewdock-bottle = { path = "../bottle" }
+brewdock-cellar = { path = "../cellar" }
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+flate2 = "1"
+tar = "0.4"
 
 [lints]
 workspace = true
