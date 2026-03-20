@@ -7,6 +7,8 @@ Read this file before writing or modifying tests in this repository.
 - Use `task test` for the full suite (unit, integration, and doctests via `cargo test`).
 - Use `task check` for CI-equivalent local verification (includes `cargo doc` without dependency docs).
 - For focused runs: `cargo test -p brewdock-core <filter>`, `cargo test -p brewdock-formula <filter>`, etc. Use `-- --nocapture` for output.
+- Use [`tests/vm-smoke-test.sh`](../tests/vm-smoke-test.sh) for destructive install smoke tests that must not touch the local `/opt/homebrew` environment. It runs inside a disposable Tart macOS VM: `./tests/vm-smoke-test.sh [--keep] [--formula <name> ...]`.
+- Before running the VM smoke test, satisfy the script prerequisites: install `tart`, pull `ghcr.io/cirruslabs/macos-sequoia-base:latest`, and build the release CLI with `cargo build --release -p brewdock-cli`.
 
 ## Suite Expectations
 
