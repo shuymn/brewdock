@@ -1,6 +1,6 @@
-use brewdock_bottle::BottleError;
-use brewdock_cellar::CellarError;
-use brewdock_formula::FormulaError;
+pub use brewdock_bottle::BottleError;
+pub use brewdock_cellar::CellarError;
+pub use brewdock_formula::FormulaError;
 
 use crate::platform::PlatformError;
 
