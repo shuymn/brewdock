@@ -55,7 +55,7 @@ None.
   - Why not split vertically further?: download → verify → extract → store は単一パイプライン; 各ステップが前段の出力に依存
   - Escalate if: Homebrew bottle の tar 構造が想定と異なる場合
 
-- [ ] Theme: Cellar materialization + receipt + linking + state
+- [x] Theme: Cellar materialization + receipt + linking + state
   - Outcome: bottle 内容の Cellar 配置・receipt 書き込み・symlink 作成・SQLite 状態管理が動作
   - Goal: brewdock-cellar crate 実装（materialize, receipt, link, state）
   - Must Not Break: `task check` green; brewdock-formula の public API 不変
