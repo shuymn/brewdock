@@ -13,7 +13,7 @@ pub(crate) mod util;
 
 pub use error::CellarError;
 pub use link::{link, unlink};
-pub use materialize::materialize;
+pub use materialize::{atomic_symlink_replace, materialize};
 pub use post_install::{
     PostInstallContext, PostInstallTransaction, extract_post_install_block, run_post_install,
 };

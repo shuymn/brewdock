@@ -8,8 +8,8 @@ use std::{
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
     InstallReason, InstallReceipt, InstallRecord, PostInstallContext, PostInstallTransaction,
-    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, StateDb, link, materialize,
-    relocate_keg, run_post_install, unlink, write_receipt,
+    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, StateDb, atomic_symlink_replace, link,
+    materialize, relocate_keg, run_post_install, unlink, write_receipt,
 };
 use brewdock_formula::{
     CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
@@ -991,10 +991,7 @@ fn refresh_opt_link(
 ) -> Result<(), BrewdockError> {
     std::fs::create_dir_all(opt_dir)?;
     let opt_link = opt_dir.join(formula_name);
-    if opt_link.symlink_metadata().is_ok() {
-        std::fs::remove_file(&opt_link)?;
-    }
-    std::os::unix::fs::symlink(keg_path, &opt_link)?;
+    atomic_symlink_replace(keg_path, &opt_link, formula_name)?;
     Ok(())
 }
 

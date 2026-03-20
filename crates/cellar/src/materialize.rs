@@ -22,15 +22,40 @@ pub fn materialize(
 
     std::fs::create_dir_all(opt_dir)?;
     let opt_link = opt_dir.join(name);
+    let rel_target = relative_from_to(opt_dir, keg_path);
+    atomic_symlink_replace(&rel_target, &opt_link, name)?;
 
-    // Remove existing opt symlink if present.
-    if opt_link.symlink_metadata().is_ok() {
-        std::fs::remove_file(&opt_link)?;
+    Ok(())
+}
+
+/// Creates a symlink atomically by writing to a temporary path and renaming.
+///
+/// This avoids a window where the link is absent between `remove_file` and `symlink`.
+/// If a stale temporary symlink exists from a previous crash, it is cleaned up first.
+///
+/// # Errors
+///
+/// Returns [`CellarError::MissingParentDirectory`] if `link_path` has no parent.
+/// Returns [`CellarError::Io`] on filesystem failure.
+pub fn atomic_symlink_replace(
+    target: &Path,
+    link_path: &Path,
+    name: &str,
+) -> Result<(), CellarError> {
+    let link_dir = link_path
+        .parent()
+        .ok_or_else(|| CellarError::MissingParentDirectory {
+            path: link_path.to_owned(),
+        })?;
+    let temp_link = link_dir.join(format!(".{name}.brewdock-tmp"));
+
+    // Clean up stale temp from a previous crash.
+    if temp_link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&temp_link)?;
     }
 
-    let rel_target = relative_from_to(opt_dir, keg_path);
-    std::os::unix::fs::symlink(rel_target, &opt_link)?;
-
+    std::os::unix::fs::symlink(target, &temp_link)?;
+    std::fs::rename(&temp_link, link_path)?;
     Ok(())
 }
 
@@ -105,6 +130,59 @@ mod tests {
         let resolved = std::fs::canonicalize(&opt_link)?;
         let expected = std::fs::canonicalize(&keg_path)?;
         assert_eq!(resolved, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_symlink_replace_creates_new_link() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target)?;
+        let link_path = dir.path().join("link");
+
+        atomic_symlink_replace(&target, &link_path, "link")?;
+
+        assert!(link_path.is_symlink());
+        assert_eq!(std::fs::read_link(&link_path)?, target);
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_symlink_replace_replaces_existing_link() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let old_target = dir.path().join("old");
+        let new_target = dir.path().join("new");
+        std::fs::create_dir_all(&old_target)?;
+        std::fs::create_dir_all(&new_target)?;
+        let link_path = dir.path().join("link");
+
+        std::os::unix::fs::symlink(&old_target, &link_path)?;
+        assert_eq!(std::fs::read_link(&link_path)?, old_target);
+
+        atomic_symlink_replace(&new_target, &link_path, "link")?;
+
+        assert!(link_path.is_symlink());
+        assert_eq!(std::fs::read_link(&link_path)?, new_target);
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_symlink_replace_handles_stale_temp() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target)?;
+        let link_path = dir.path().join("link");
+
+        // Create a stale temp symlink.
+        let stale_temp = dir.path().join(".link.brewdock-tmp");
+        std::os::unix::fs::symlink(Path::new("/nonexistent"), &stale_temp)?;
+        assert!(stale_temp.symlink_metadata().is_ok());
+
+        atomic_symlink_replace(&target, &link_path, "link")?;
+
+        assert!(link_path.is_symlink());
+        assert!(stale_temp.symlink_metadata().is_err());
         Ok(())
     }
 
