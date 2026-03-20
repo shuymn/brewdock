@@ -43,7 +43,7 @@ pub enum UnsupportedReason {
     #[error("no bottle available")]
     NoBottle,
 
-    /// The formula defines a `post_install` hook (not supported by brewdock).
+    /// The formula defines a `post_install` hook that execution cannot handle yet.
     #[error("has post_install hook")]
     PostInstallDefined,
 
@@ -54,6 +54,10 @@ pub enum UnsupportedReason {
     /// No bottle exists for the specified platform tag.
     #[error("no bottle for platform {0}")]
     NoBottleForTag(String),
+
+    /// The formula requires source fallback execution.
+    #[error("requires source build")]
+    SourceBuildRequired,
 }
 
 /// A dependency cycle represented as a list of formula names.
@@ -110,6 +114,10 @@ mod tests {
         assert_eq!(
             UnsupportedReason::NoBottleForTag("arm64_sequoia".to_owned()).to_string(),
             "no bottle for platform arm64_sequoia"
+        );
+        assert_eq!(
+            UnsupportedReason::SourceBuildRequired.to_string(),
+            "requires source build"
         );
     }
 }

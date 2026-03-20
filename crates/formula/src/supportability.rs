@@ -1,5 +1,6 @@
 use crate::{
     error::{FormulaError, UnsupportedReason},
+    select_bottle,
     types::Formula,
 };
 
@@ -7,10 +8,8 @@ use crate::{
 ///
 /// Verifies that the formula:
 /// - Is not disabled
-/// - Has a pre-built bottle
-/// - Does not define a `post_install` hook
+/// - Has a compatible bottle or source fallback metadata
 /// - Has no `pour_bottle_only_if` restriction
-/// - Has a bottle file for the given host tag
 ///
 /// # Errors
 ///
@@ -21,17 +20,6 @@ pub fn check_supportability(formula: &Formula, host_tag: &str) -> Result<(), For
         return Err(unsupported(&formula.name, UnsupportedReason::Disabled));
     }
 
-    if !formula.versions.bottle {
-        return Err(unsupported(&formula.name, UnsupportedReason::NoBottle));
-    }
-
-    if formula.post_install_defined {
-        return Err(unsupported(
-            &formula.name,
-            UnsupportedReason::PostInstallDefined,
-        ));
-    }
-
     if formula.pour_bottle_only_if.is_some() {
         return Err(unsupported(
             &formula.name,
@@ -39,17 +27,17 @@ pub fn check_supportability(formula: &Formula, host_tag: &str) -> Result<(), For
         ));
     }
 
-    let has_bottle = formula
-        .bottle
-        .stable
-        .as_ref()
-        .is_some_and(|s| s.files.contains_key(host_tag));
+    if formula.versions.bottle && select_bottle(formula, host_tag).is_some() {
+        return Ok(());
+    }
 
-    if !has_bottle {
-        return Err(unsupported(
-            &formula.name,
-            UnsupportedReason::NoBottleForTag(host_tag.to_owned()),
-        ));
+    if formula.urls.stable.is_none() {
+        let reason = if formula.versions.bottle {
+            UnsupportedReason::NoBottleForTag(host_tag.to_owned())
+        } else {
+            UnsupportedReason::NoBottle
+        };
+        return Err(unsupported(&formula.name, reason));
     }
 
     Ok(())
@@ -91,9 +79,10 @@ mod tests {
     }
 
     #[test]
-    fn test_supportability_no_bottle() {
+    fn test_supportability_no_bottle_or_source() {
         let mut formula = test_formula("nobottle", &[]);
         formula.versions.bottle = false;
+        formula.urls.stable = None;
         let err = check_supportability(&formula, TAG);
         assert!(matches!(
             err,
@@ -105,17 +94,11 @@ mod tests {
     }
 
     #[test]
-    fn test_supportability_post_install() {
+    fn test_supportability_post_install_remains_plannable() -> Result<(), FormulaError> {
         let mut formula = test_formula("postinst", &[]);
         formula.post_install_defined = true;
-        let err = check_supportability(&formula, TAG);
-        assert!(matches!(
-            err,
-            Err(FormulaError::Unsupported {
-                reason: UnsupportedReason::PostInstallDefined,
-                ..
-            })
-        ));
+        check_supportability(&formula, TAG)?;
+        Ok(())
     }
 
     #[test]
@@ -134,7 +117,8 @@ mod tests {
 
     #[test]
     fn test_supportability_no_bottle_for_tag() {
-        let formula = test_formula("noarch", &[]);
+        let mut formula = test_formula("noarch", &[]);
+        formula.urls.stable = None;
         let err = check_supportability(&formula, "x86_64_monterey");
         assert!(matches!(
             err,
@@ -149,13 +133,28 @@ mod tests {
     fn test_supportability_empty_bottle_spec() {
         let mut formula = test_formula("empty", &[]);
         formula.bottle.stable = None;
-        let err = check_supportability(&formula, TAG);
-        assert!(matches!(
-            err,
-            Err(FormulaError::Unsupported {
-                reason: UnsupportedReason::NoBottleForTag(_),
-                ..
-            })
-        ));
+        assert!(check_supportability(&formula, TAG).is_ok());
+    }
+
+    #[test]
+    fn test_supportability_compatible_bottle_is_supported() -> Result<(), FormulaError> {
+        let mut formula = test_formula("compat", &[]);
+        let stable = formula
+            .bottle
+            .stable
+            .as_mut()
+            .ok_or_else(|| FormulaError::NotFound {
+                name: "compat".to_owned(),
+            })?;
+        let bottle = stable
+            .files
+            .remove(TAG)
+            .ok_or_else(|| FormulaError::NotFound {
+                name: TAG.to_owned(),
+            })?;
+        stable.files.insert("arm64_sonoma".to_owned(), bottle);
+
+        check_supportability(&formula, TAG)?;
+        Ok(())
     }
 }
