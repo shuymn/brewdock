@@ -105,7 +105,7 @@ None.
   - Why not split vertically further?: install/update/upgrade は同一 CLI バイナリの 3 subcommand; 個別に出すと中途半端な UX
   - Escalate if: tokio runtime 構成が orchestrator の async 要件と衝突する場合
 
-- [ ] Theme: Polish + UX
+- [x] Theme: Polish + UX
   - Outcome: --dry-run, --verbose/--quiet, ユーザー向けエラーメッセージが動作
   - Goal: エラー UX 改善、dry-run・verbose/quiet フラグ、cargo doc clean
   - Must Not Break: `task check` green; 既存コマンドの動作不変
