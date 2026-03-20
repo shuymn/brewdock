@@ -1,0 +1,16 @@
+[package]
+name = "brewdock-bottle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Bottle download, verification, and extraction for brewdock"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

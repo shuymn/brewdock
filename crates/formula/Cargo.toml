@@ -1,0 +1,16 @@
+[package]
+name = "brewdock-formula"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Formula types, API client, and dependency resolution for brewdock"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

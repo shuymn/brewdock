@@ -8,7 +8,7 @@ None.
 
 ## Theme Backlog
 
-- [ ] Theme: Workspace scaffold + Layout + platform + core types
+- [x] Theme: Workspace scaffold + Layout + platform + core types
   - Outcome: 5-crate workspace が compile; `bd --version` がバージョン表示; Layout パス算出が検証済み
   - Goal: single-crate → 5-crate workspace 移行; Layout・platform・error 基盤型定義
   - Must Not Break: `task check` green

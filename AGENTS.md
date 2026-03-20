@@ -6,8 +6,11 @@
 - Use Task ([Taskfile.yml](Taskfile.yml)) as the default interface
 - `task build` / `task test` / `task lint` / `task fmt` / `task check` — primary workflow; `task check` runs formatting check, Clippy, tests, `cargo doc`, and build; `task check:fast` skips tests and docs (see [docs/tooling.md](docs/tooling.md))
 - Rust-native equivalents work without Task: `cargo build`, `cargo test`, `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (same as `task lint`; see [docs/tooling.md](docs/tooling.md) for Clippy policy details)
+- Run the CLI: `cargo run -p brewdock-cli -- <args>` (binary name: `bd`)
+- Focused test run: `cargo test -p brewdock-core -- layout`, `cargo test -p brewdock-formula -- types`, etc.
 - Prefer `cargo add` / editing `Cargo.toml` for dependencies; run `cargo build` or `task build` after manifest changes
-- `unsafe_code` is **forbidden** and `unwrap`/`expect`/`todo`/`dbg!` are **denied** via `Cargo.toml` `[lints]` — applies to all code including tests
+- `unsafe_code` is **forbidden** and `unwrap`/`expect`/`todo`/`dbg!` are **denied** via workspace `[lints]` — applies to all code including tests
+- 5-crate workspace: `brewdock-cli` (bin: `bd`), `brewdock-core`, `brewdock-formula`, `brewdock-bottle`, `brewdock-cellar` — see [docs/architecture.md](docs/architecture.md)
 
 ## Git Conventions
 
@@ -21,4 +24,5 @@
 - Read `docs/testing.md` before writing or modifying tests.
 - Read `docs/tooling.md` when working with build, CI, hooks, or adding tools.
 - Read `docs/review.md` when performing code review.
+- Read `docs/architecture.md` for crate boundaries, dependency graph, and tech decisions.
 - Read `docs/adr/` only when historical rationale matters.
