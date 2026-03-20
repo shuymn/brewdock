@@ -12,7 +12,7 @@ Rust CLI (`bd`) that installs Homebrew `homebrew/core` formulae to `/opt/homebre
 - Prefer stable bottle install; if no compatible bottle exists, allow a minimal generic source build fallback
 - `post_install` support is restricted to a fail-closed pipeline of `homebrew/core` Ruby source parse, AST lowering, and schema normalization; no arbitrary Ruby execution
 - No cask, external tap, Linux/Intel runtime
-- All tests must pass on Linux CI (`ubuntu-latest`)
+- All CI jobs run on macOS (`macos-latest`)
 - `formulae.brew.sh` JSON API (no tap clone)
 - Homebrew-compatible file layout, receipt, linking (`/opt/homebrew` paths always flow through `Layout`; Ruby API compatibility is non-goal)
 - `unsafe_code` forbidden; `unwrap`/`expect`/`todo`/`dbg!` denied
@@ -35,7 +35,7 @@ Layout lives in core. Lower crates receive paths as `&Path` arguments, never dep
 
 Each crate owns a `thiserror` error enum. Core aggregates with `#[from]`.
 
-Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir)` enables all tests to run on Linux CI.
+Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir)` enables tests to run without mutating the real Homebrew prefix on CI.
 
 ## Key Tech Decisions
 
