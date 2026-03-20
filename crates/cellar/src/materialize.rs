@@ -28,7 +28,7 @@ pub fn materialize(
     let version = keg_path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| CellarError::MissingParentDirectory {
+        .ok_or_else(|| CellarError::InvalidPathComponent {
             path: keg_path.to_owned(),
         })?;
     let temp_keg = keg_parent.join(format!(".{version}.brewdock-tmp"));
@@ -50,7 +50,7 @@ pub fn materialize(
     std::fs::create_dir_all(opt_dir)?;
     let opt_link = opt_dir.join(name);
     let rel_target = relative_from_to(opt_dir, keg_path);
-    atomic_symlink_replace(&rel_target, &opt_link, name)?;
+    atomic_symlink_replace(&rel_target, &opt_link)?;
 
     Ok(())
 }
@@ -63,15 +63,18 @@ pub fn materialize(
 /// # Errors
 ///
 /// Returns [`CellarError::MissingParentDirectory`] if `link_path` has no parent.
+/// Returns [`CellarError::InvalidPathComponent`] if `link_path` has no file name.
 /// Returns [`CellarError::Io`] on filesystem failure.
-pub fn atomic_symlink_replace(
-    target: &Path,
-    link_path: &Path,
-    name: &str,
-) -> Result<(), CellarError> {
+pub fn atomic_symlink_replace(target: &Path, link_path: &Path) -> Result<(), CellarError> {
     let link_dir = link_path
         .parent()
         .ok_or_else(|| CellarError::MissingParentDirectory {
+            path: link_path.to_owned(),
+        })?;
+    let name = link_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| CellarError::InvalidPathComponent {
             path: link_path.to_owned(),
         })?;
     let temp_link = link_dir.join(format!(".{name}.brewdock-tmp"));
@@ -167,7 +170,7 @@ mod tests {
         std::fs::create_dir_all(&target)?;
         let link_path = dir.path().join("link");
 
-        atomic_symlink_replace(&target, &link_path, "link")?;
+        atomic_symlink_replace(&target, &link_path)?;
 
         assert!(link_path.is_symlink());
         assert_eq!(std::fs::read_link(&link_path)?, target);
@@ -187,7 +190,7 @@ mod tests {
         std::os::unix::fs::symlink(&old_target, &link_path)?;
         assert_eq!(std::fs::read_link(&link_path)?, old_target);
 
-        atomic_symlink_replace(&new_target, &link_path, "link")?;
+        atomic_symlink_replace(&new_target, &link_path)?;
 
         assert!(link_path.is_symlink());
         assert_eq!(std::fs::read_link(&link_path)?, new_target);
@@ -206,7 +209,7 @@ mod tests {
         std::os::unix::fs::symlink(Path::new("/nonexistent"), &stale_temp)?;
         assert!(stale_temp.symlink_metadata().is_ok());
 
-        atomic_symlink_replace(&target, &link_path, "link")?;
+        atomic_symlink_replace(&target, &link_path)?;
 
         assert!(link_path.is_symlink());
         assert!(stale_temp.symlink_metadata().is_err());

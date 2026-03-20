@@ -21,6 +21,13 @@ pub enum CellarError {
         path: PathBuf,
     },
 
+    /// A path has no usable file name component (e.g., root or trailing `..`).
+    #[error("invalid path component in {path}")]
+    InvalidPathComponent {
+        /// Path with no file name component.
+        path: PathBuf,
+    },
+
     /// A `SQLite` database operation failed.
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),

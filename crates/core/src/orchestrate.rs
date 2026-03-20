@@ -575,25 +575,27 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     fn resolve_install_method(&self, formula: &Formula) -> Result<InstallMethod, BrewdockError> {
         let selected = select_bottle(formula, self.host_tag.as_str());
 
-        if let Some(ref bottle) = selected {
+        if let Some(bottle) = selected {
             if bottle.cellar.is_compatible(&self.layout.cellar()) {
-                return Ok(InstallMethod::Bottle(bottle.clone()));
+                return Ok(InstallMethod::Bottle(bottle));
             }
             tracing::warn!(
                 name = formula.name,
                 cellar = %bottle.cellar,
                 "bottle requires incompatible cellar path, trying source fallback"
             );
-        }
 
-        if formula.urls.stable.is_none() {
-            let reason = match selected {
-                Some(bottle) => UnsupportedReason::IncompatibleCellar(bottle.cellar.to_string()),
-                None => UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
-            };
+            if formula.urls.stable.is_none() {
+                return Err(FormulaError::Unsupported {
+                    name: formula.name.clone(),
+                    reason: UnsupportedReason::IncompatibleCellar(bottle.cellar.to_string()),
+                }
+                .into());
+            }
+        } else if formula.urls.stable.is_none() {
             return Err(FormulaError::Unsupported {
                 name: formula.name.clone(),
-                reason,
+                reason: UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
             }
             .into());
         }
@@ -991,7 +993,7 @@ fn refresh_opt_link(
 ) -> Result<(), BrewdockError> {
     std::fs::create_dir_all(opt_dir)?;
     let opt_link = opt_dir.join(formula_name);
-    atomic_symlink_replace(keg_path, &opt_link, formula_name)?;
+    atomic_symlink_replace(keg_path, &opt_link)?;
     Ok(())
 }
 
