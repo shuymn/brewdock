@@ -91,6 +91,24 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(to_install)
     }
 
+    /// Fetches the formula index and caches it locally.
+    ///
+    /// Returns the number of formulae cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if the fetch or file write fails.
+    pub async fn update(&self) -> Result<usize, BrewdockError> {
+        let formulae = self.repo.get_all_formulae().await?;
+        let count = formulae.len();
+        let json = serde_json::to_vec(&formulae).map_err(FormulaError::from)?;
+        let cache_dir = self.layout.cache_dir();
+        std::fs::create_dir_all(&cache_dir)?;
+        std::fs::write(cache_dir.join("formula.json"), json)?;
+        tracing::info!(count, "formula index cached");
+        Ok(count)
+    }
+
     /// Upgrades installed formulae to their latest versions.
     ///
     /// If `names` is empty, upgrades all installed formulae. Otherwise,
@@ -721,6 +739,36 @@ mod tests {
         // Nothing upgraded.
         assert!(upgraded.is_empty());
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    // --- Update tests ---
+
+    #[tokio::test]
+    async fn test_update_caches_formula_index() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let formula_a = make_formula("a", "1.0", &[], "sha_a");
+        let formula_b = make_formula("b", "2.0", &[], "sha_b");
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator =
+            make_orchestrator(vec![formula_a, formula_b], vec![], counter, layout.clone());
+
+        let count = orchestrator.update().await?;
+        assert_eq!(count, 2);
+
+        let cache_path = layout.cache_dir().join("formula.json");
+        assert!(cache_path.exists());
+
+        let data = std::fs::read_to_string(&cache_path)?;
+        let cached: Vec<Formula> = serde_json::from_str(&data)?;
+        assert_eq!(cached.len(), 2);
+
+        let names: std::collections::HashSet<String> = cached.into_iter().map(|f| f.name).collect();
+        assert!(names.contains("a"));
+        assert!(names.contains("b"));
         Ok(())
     }
 }

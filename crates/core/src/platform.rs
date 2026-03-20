@@ -55,6 +55,16 @@ impl HostTag {
         let codename = macos_codename(version.major)?;
         format!("{arch}_{codename}").parse()
     }
+
+    /// Returns [`PlatformError::Unsupported`] on non-macOS platforms.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`PlatformError::Unsupported`].
+    #[cfg(not(target_os = "macos"))]
+    pub fn detect() -> Result<Self, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
 }
 
 impl FromStr for HostTag {
