@@ -12,8 +12,8 @@ use brewdock_cellar::{
     relocate_keg, run_post_install, unlink, write_receipt,
 };
 use brewdock_formula::{
-    Formula, FormulaCache, FormulaError, FormulaRepository, Requirement, SelectedBottle,
-    UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
+    CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
+    SelectedBottle, UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
 };
 
 use crate::{BrewdockError, HostTag, Layout, error::SourceBuildError, lock::FileLock};
@@ -513,7 +513,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 let source = extract_dir.join(&formula.name).join(&version_str);
                 let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
                 materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
-                relocate_keg(&keg_path, self.layout.prefix())?;
+                if !matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
+                    relocate_keg(&keg_path, self.layout.prefix())?;
+                }
                 Ok(keg_path)
             }
             InstallMethod::Source(plan) => self.install_source_formula(formula, plan).await,
@@ -571,14 +573,27 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     }
 
     fn resolve_install_method(&self, formula: &Formula) -> Result<InstallMethod, BrewdockError> {
-        if let Some(selected) = select_bottle(formula, self.host_tag.as_str()) {
-            return Ok(InstallMethod::Bottle(selected));
+        let selected = select_bottle(formula, self.host_tag.as_str());
+
+        if let Some(ref bottle) = selected {
+            if bottle.cellar.is_compatible(&self.layout.cellar()) {
+                return Ok(InstallMethod::Bottle(bottle.clone()));
+            }
+            tracing::warn!(
+                name = formula.name,
+                cellar = %bottle.cellar,
+                "bottle requires incompatible cellar path, trying source fallback"
+            );
         }
 
         if formula.urls.stable.is_none() {
+            let reason = match selected {
+                Some(bottle) => UnsupportedReason::IncompatibleCellar(bottle.cellar.to_string()),
+                None => UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
+            };
             return Err(FormulaError::Unsupported {
                 name: formula.name.clone(),
-                reason: UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
+                reason,
             }
             .into());
         }
@@ -2340,6 +2355,95 @@ install:
         let names: std::collections::HashSet<String> = cached.into_iter().map(|f| f.name).collect();
         assert!(names.contains("a"));
         assert!(names.contains("b"));
+        Ok(())
+    }
+
+    /// Sets the cellar type on the host bottle of a formula.
+    fn set_bottle_cellar(formula: &mut Formula, cellar: CellarType) {
+        if let Some(ref mut stable) = formula.bottle.stable
+            && let Some(file) = stable.files.get_mut(HOST_TAG)
+        {
+            file.cellar = cellar;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_incompatible_cellar_bottle_without_source_fallback_returns_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+        // Set a cellar path that won't match the tempdir-based layout.
+        set_bottle_cellar(
+            &mut formula,
+            CellarType::Path("/usr/local/Cellar".to_owned()),
+        );
+        // Remove source URL so there is no fallback.
+        formula.urls.stable = None;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
+
+        let result = orchestrator.plan_install(&["a"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::Formula(FormulaError::Unsupported {
+                reason: UnsupportedReason::IncompatibleCellar(_),
+                ..
+            }))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resolve_incompatible_cellar_bottle_falls_back_to_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+        set_bottle_cellar(
+            &mut formula,
+            CellarType::Path("/usr/local/Cellar".to_owned()),
+        );
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
+
+        let plan = orchestrator.plan_install(&["a"]).await?;
+        let entry = plan.first().ok_or("expected install plan entry")?;
+        assert!(matches!(&entry.method, InstallMethod::Source(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_any_skip_relocation_bottle_skips_relocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "abababababababababababababababababababababababababababababababab";
+        let mut formula = make_formula("skip-reloc", "1.0", &[], sha);
+        set_bottle_cellar(&mut formula, CellarType::AnySkipRelocation);
+
+        let tar =
+            create_bottle_tar_gz("skip-reloc", "1.0", &[("bin/tool", b"#!/bin/sh\necho ok")])?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![(sha, tar)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["skip-reloc"]).await?;
+
+        assert_eq!(installed, vec!["skip-reloc"]);
+        assert!(layout.cellar().join("skip-reloc/1.0/bin/tool").exists());
+        assert!(layout.opt_dir().join("skip-reloc").is_symlink());
         Ok(())
     }
 }

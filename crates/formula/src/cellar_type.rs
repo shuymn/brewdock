@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, path::Path};
 
 use serde::{
     Deserialize, Serialize,
@@ -20,6 +20,20 @@ pub enum CellarType {
     AnySkipRelocation,
     /// Bottle must be installed to a specific Cellar path.
     Path(String),
+}
+
+impl CellarType {
+    /// Returns whether this cellar type is compatible with the given cellar path.
+    ///
+    /// - [`CellarType::Any`] and [`CellarType::AnySkipRelocation`] are compatible with any path.
+    /// - [`CellarType::Path`] is compatible only when the embedded path matches exactly.
+    #[must_use]
+    pub fn is_compatible(&self, cellar_path: &Path) -> bool {
+        match self {
+            Self::Any | Self::AnySkipRelocation => true,
+            Self::Path(p) => Path::new(p) == cellar_path,
+        }
+    }
 }
 
 impl Serialize for CellarType {
@@ -95,6 +109,30 @@ mod tests {
             CellarType::Path("/opt/homebrew/Cellar".to_owned()).to_string(),
             "/opt/homebrew/Cellar"
         );
+    }
+
+    #[test]
+    fn test_is_compatible_any() {
+        assert!(CellarType::Any.is_compatible(Path::new("/opt/homebrew/Cellar")));
+        assert!(CellarType::Any.is_compatible(Path::new("/usr/local/Cellar")));
+    }
+
+    #[test]
+    fn test_is_compatible_any_skip_relocation() {
+        assert!(CellarType::AnySkipRelocation.is_compatible(Path::new("/opt/homebrew/Cellar")));
+        assert!(CellarType::AnySkipRelocation.is_compatible(Path::new("/usr/local/Cellar")));
+    }
+
+    #[test]
+    fn test_is_compatible_matching_path() {
+        let ct = CellarType::Path("/opt/homebrew/Cellar".to_owned());
+        assert!(ct.is_compatible(Path::new("/opt/homebrew/Cellar")));
+    }
+
+    #[test]
+    fn test_is_compatible_mismatching_path() {
+        let ct = CellarType::Path("/usr/local/Cellar".to_owned());
+        assert!(!ct.is_compatible(Path::new("/opt/homebrew/Cellar")));
     }
 
     #[test]

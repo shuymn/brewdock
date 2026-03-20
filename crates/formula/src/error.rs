@@ -58,6 +58,10 @@ pub enum UnsupportedReason {
     /// The formula requires source fallback execution.
     #[error("requires source build")]
     SourceBuildRequired,
+
+    /// The bottle requires a cellar path incompatible with the current layout.
+    #[error("incompatible cellar {0}")]
+    IncompatibleCellar(String),
 }
 
 /// A dependency cycle represented as a list of formula names.
@@ -118,6 +122,14 @@ mod tests {
         assert_eq!(
             UnsupportedReason::SourceBuildRequired.to_string(),
             "requires source build"
+        );
+    }
+
+    #[test]
+    fn test_incompatible_cellar_display() {
+        assert_eq!(
+            UnsupportedReason::IncompatibleCellar("/usr/local/Cellar".to_owned()).to_string(),
+            "incompatible cellar /usr/local/Cellar"
         );
     }
 }
