@@ -23,7 +23,7 @@ None.
   - Why not split vertically further?: Layout・platform・error は相互参照する基盤型; 分割すると中間状態で compile 不可
   - Escalate if: workspace lint 設定が crate 間で衝突する場合
 
-- [ ] Theme: Formula types + API client
+- [x] Theme: Formula types + API client
   - Outcome: Homebrew JSON API レスポンスを型付き parse; supportability check と dep resolve が動作
   - Goal: brewdock-formula crate 実装（types, API client, supportability, resolve）
   - Must Not Break: `task check` green; 既存 crate の public API 不変
