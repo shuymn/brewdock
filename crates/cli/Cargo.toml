@@ -26,9 +26,9 @@ brewdock-formula = { path = "../formula" }
 brewdock-bottle = { path = "../bottle" }
 brewdock-cellar = { path = "../cellar" }
 serde_json.workspace = true
-tempfile = "3"
-flate2 = "1"
-tar = "0.4"
+tempfile = "=3.27.0"
+flate2 = "=1.1.9"
+tar = "=0.4.45"
 
 [lints]
 workspace = true

@@ -18,7 +18,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ruby-prism = "1.9.0"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

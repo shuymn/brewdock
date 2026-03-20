@@ -19,9 +19,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde_json.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
-httpmock = "0.7"
-tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = "=3.27.0"
+httpmock = "=0.7.0"
+tokio = { version = "=1.50.0", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
