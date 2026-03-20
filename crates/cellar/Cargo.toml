@@ -11,6 +11,7 @@ description = "Cellar materialization, receipt, linking, and state management fo
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }

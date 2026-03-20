@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::error::CellarError;
+use crate::{error::CellarError, util};
 
 /// Directories in a keg that are linked into the Homebrew prefix.
 const LINKABLE_DIRS: &[&str] = &["bin", "sbin", "lib", "include", "share", "etc"];
@@ -22,7 +22,7 @@ pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             continue;
         }
 
-        let files = walk_files(&keg_subdir)?;
+        let files = util::walk_files(&keg_subdir)?;
         for file in files {
             let relative = file
                 .strip_prefix(&keg_subdir)
@@ -68,7 +68,7 @@ pub fn unlink(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             continue;
         }
 
-        let files = walk_files(&keg_subdir)?;
+        let files = util::walk_files(&keg_subdir)?;
         for file in files {
             let relative = file
                 .strip_prefix(&keg_subdir)
@@ -154,26 +154,6 @@ fn check_link_collision(link_path: &Path, keg_path: &Path) -> Result<(), CellarE
     Err(CellarError::LinkCollision {
         path: link_path.to_path_buf(),
     })
-}
-
-/// Recursively collects all file paths under `dir`.
-fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-    let mut files = Vec::new();
-    walk_files_inner(dir, &mut files)?;
-    Ok(files)
-}
-
-fn walk_files_inner(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            walk_files_inner(&path, files)?;
-        } else {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Removes empty parent directories up to (but not including) `stop_at`.

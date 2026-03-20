@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{error::CellarError, link::relative_from_to};
+use crate::{error::CellarError, link::relative_from_to, util};
 
 /// Copies extracted bottle contents to the Cellar and creates the `opt/<name>` symlink.
 ///
@@ -35,6 +35,9 @@ pub fn materialize(
 }
 
 /// Recursively copies a directory tree from `src` to `dst`.
+///
+/// If the destination file already exists and is read-only (e.g., from a
+/// previous bottle pour), it is made writable before overwriting.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -44,6 +47,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
+            util::make_writable(&dst_path)?;
             std::fs::copy(&src_path, &dst_path)?;
         }
     }

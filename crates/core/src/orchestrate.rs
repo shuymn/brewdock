@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
     InstallReceipt, InstallRecord, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
-    StateDb, link, materialize, unlink, write_receipt,
+    StateDb, link, materialize, relocate_keg, unlink, write_receipt,
 };
 use brewdock_formula::{
     Formula, FormulaCache, FormulaError, FormulaRepository, error::UnsupportedReason,
@@ -366,6 +366,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let source = extract_dir.join(&formula.name).join(&version_str);
         let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
         materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
+        relocate_keg(&keg_path, self.layout.prefix())?;
 
         if !formula.keg_only {
             link(&keg_path, self.layout.prefix())?;
