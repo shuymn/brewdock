@@ -15,6 +15,7 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+ruby-prism = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3"
