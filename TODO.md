@@ -4,7 +4,14 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
 
 ## Open Questions
 
-None.
+- Question: Homebrew-visible install state compatibility を閉じる前に、bottle materialization / link / relocate が keg 内 symlink を保持したまま動作する必要があるか
+  - Class: `risk-bearing`
+  - Resolution: `decision`
+  - Status: `resolved`
+- Question: `agent-browser` と `vim` の失敗を install-state compatibility Theme に含めるべきか、それとも `post_install` 依存 formula の別 Theme に切り出すべきか
+  - Class: `risk-bearing`
+  - Resolution: `decision`
+  - Status: `resolved`
 
 ## Theme Backlog
 
@@ -181,3 +188,51 @@ None.
   - Executable doc: `cargo test -p brewdock-core -- source_fallback`; `cargo test -p brewdock-core -- upgrade`; `./tests/vm-smoke-test.sh --formula jq --formula portable-libffi`
   - Why not split vertically further?: planning と build execution を分けると fallback contract の本体である auto-switch と cleanup 条件が閉じない
   - Escalate if: generic driver で対象 formula を通せず、Ruby formula DSL 互換を導入しないと Goal を満たせない場合
+
+- [ ] Theme: Homebrew-visible install state for `bd install` and `bd upgrade`
+  - Outcome: `bd install` した formula が Homebrew から installed formula として認識され、`brew outdated` / `brew upgrade` と `bd upgrade` が同じ on-disk install state を前提に動作する
+  - Goal: install state の正本を brewdock 専用 DB ではなく Homebrew-visible filesystem state に寄せ、`bd upgrade` の対象判定もその state から行う
+  - Must Not Break: `/opt/homebrew` 配下の layout を維持する; 既存の bottle/source install 成功系を壊さない; unsupported formula は fail-closed のままにする; `task check` green
+  - Non-goals: Homebrew Formula DSL 全面互換; cask/tap/Linux/Intel 対応; `brew install` の全挙動再実装; pin/rename/analytics など今回の upgrade 対象判定に不要な周辺機能; `node` / `ruby` 依存の広い `post_install` 対応
+  - Acceptance (EARS):
+    - When `bd install <formula>` completes successfully, the system shall write and link enough Homebrew-compatible install state that Homebrew can observe the formula as installed from the filesystem alone
+    - When `brew list`, `brew outdated`, or `brew upgrade` evaluates a formula previously installed by `bd`, the system shall treat that formula as a normal installed formula rather than an unknown keg
+    - When `bd upgrade` is executed with no explicit names, the system shall derive upgrade candidates from Homebrew-visible install state rather than `brewdock.db`
+    - When a formula is installed by Homebrew first and then `bd install <formula>` is executed, the system shall adopt the existing install state without breaking the working formula
+    - If Homebrew-visible install state is missing, inconsistent, or unsupported for a keg, the system shall fail explicitly or skip safely without mutating receipts or links
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula jq --formula ripgrep --formula bat; oracle=core/cellar tests cover install-state discovery and upgrade candidate selection, and VM replay covers installability, usability, bd->brew recognition/upgrade, and brew->bd takeover on a disposable macOS VM without requiring `brewdock.db` as the source of truth; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task test plus VM cross-compatibility replay; notes=the current smoke script is a strong system gate because it already exercises `bd -> brew` and `brew -> bd`; remaining gaps are that parts of the script still assert `brewdock.db` directly and fake upgrades via DB mutation, and that `agent-browser`/`vim` are excluded from closure because their dependency chains require broader `post_install` support`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-cellar -- receipt`; `cargo test -p brewdock-core -- upgrade`; `./tests/vm-smoke-test.sh --formula jq --formula ripgrep --formula bat`
+  - Why not split vertically further?: install metadata 互換だけ先に入れても `bd upgrade` が別の state DB を見続けると user-visible contract が閉じず、逆に candidate selection だけ変えても `bd -> brew` / `brew -> bd` の往復 replay が通らなければ Goal を満たさない; ただし broader `post_install` support は別 contract に切り出す
+  - Escalate if: Homebrew が認識する installed state に追加 metadata や linked-keg semantics が必要で、現行 VM script だけでは `bd -> brew` / `brew -> bd` の closure を判定できない場合
+
+- [ ] Theme: Preserve symlinks in bottle materialization and linking
+  - Outcome: symlink-heavy な bottle を materialize / relocate / link しても keg 構造と runtime が壊れず、`certifi` を含む Python formula が既知の symlink 破壊で落ちなくなる
+  - Goal: keg 内 symlink を保持したコピー、symlink を含む link/unlink 走査、relocate の対象判定を Homebrew bottle の実レイアウトに合わせる
+  - Must Not Break: 既存の file-only bottle install 成功系を壊さない; relative symlink の link 互換を維持する; `task check` green
+  - Non-goals: arbitrary post-install support; Homebrew install-state adoption; source fallback 拡張
+  - Acceptance (EARS):
+    - When a bottle contains internal symlinks, the system shall preserve those symlinks in the keg instead of dereferencing them into copied regular files
+    - When link or unlink traverses a keg with symlinked entries, the system shall maintain Homebrew-compatible prefix links without skipping required artifacts
+    - When `certifi` and a dependent Python formula such as `httpie` or `semgrep` are installed, the resulting formula shall remain executable without manual repair of symlinked certificate or virtualenv paths
+    - If a symlink points outside the supported install boundary and cannot be represented safely, the system shall fail explicitly before writing receipt or state
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula httpie --formula semgrep; oracle=cellar tests assert symlink-preserving materialization/linking, and VM replay shows the known `certifi`-adjacent failures no longer reproduce for representative Python formulae; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task test plus targeted VM replay; notes=investigation on 2026-03-21 indicates current failures are consistent with symlink loss in materialize/link/relocate rather than planning-time unsupported metadata`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-cellar -- materialize`; `cargo test -p brewdock-cellar -- link`; `cargo test -p brewdock-core -- install`; `./tests/vm-smoke-test.sh --formula httpie --formula semgrep`
+  - Why not split vertically further?: materialize だけ直しても link/unlink/relocate が symlink を無視すると Python and Node style bottle layoutsで contract が閉じない
+  - Escalate if: Homebrew bottles rely on symlink semantics that require a broader cellar model than the current file-walk based implementation can represent safely
+
+- [ ] Theme: Expand restricted `post_install` support for dependency-critical formulae
+  - Outcome: `node` と `ruby` のような依存の中核になる formula の `post_install` が restricted runtime で通り、`agent-browser` と `vim` の依存 chain が known blocker から外れる
+  - Goal: dependency-critical formulae の `post_install` を調査し、現在の restricted lowering / schema normalization に収まる最小拡張で `node` と `ruby` を通す
+  - Must Not Break: fail-closed policy を崩さない; unsupported runtime branch は明示失敗のままにする; receipt/state cleanup は成功時のみ更新する; `task check` green
+  - Non-goals: arbitrary Ruby execution; Formula DSL 全面互換; formula-specific builtin の再導入; install-state compatibility Theme の closure 条件拡張
+  - Acceptance (EARS):
+    - When `node` or `ruby` `post_install` logic stays within the allowed restricted semantics, the system shall execute the reachable filesystem effects without manual formula-specific patches
+    - When `agent-browser` or `vim` is installed through its normal dependency chain, the system shall no longer fail solely because `node` or `ruby` post-install is unsupported
+    - If a dependency-critical `post_install` requires semantics outside the allowed subset, the system shall fail explicitly before receipt or state mutation
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula agent-browser --formula vim; oracle=post_install parser/executor tests cover the new restricted shapes, and VM replay shows the known dependency-chain failures no longer reproduce for representative Node and Ruby dependents; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task test plus targeted VM replay; notes=investigation on 2026-03-21 indicates `agent-browser` is blocked by `node` post_install and `vim` by `ruby` post_install rather than by unsupported formula metadata`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-cellar -- post_install`; `cargo test -p brewdock-core -- post_install`; `./tests/vm-smoke-test.sh --formula agent-browser --formula vim`
+  - Why not split vertically further?: `node` と `ruby` を別々に閉じても VM 上の user-visible contract は依存 chain 単位でしか確認できず、known blocker の解消判定が揺れる
+  - Escalate if: `node` または `ruby` の reachable runtime semantics が schema normalization では吸収できず、formula-specific behavior か arbitrary Ruby execution を要求する場合
