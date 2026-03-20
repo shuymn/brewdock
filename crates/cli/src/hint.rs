@@ -29,6 +29,9 @@ const fn hint_for_bottle(err: &BottleError) -> Option<&'static str> {
             Some("run `bd update` to refresh the formula index, then retry")
         }
         BottleError::Download(_) => Some("check your internet connection"),
+        BottleError::Auth(_) => {
+            Some("registry authentication failed; check your internet connection")
+        }
         BottleError::Io(_) => None,
     }
 }

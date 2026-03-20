@@ -14,6 +14,10 @@ pub enum BottleError {
     #[error("download failed: {0}")]
     Download(#[from] reqwest::Error),
 
+    /// Registry authentication failed.
+    #[error("registry auth failed: {0}")]
+    Auth(String),
+
     /// A filesystem I/O operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
