@@ -2,14 +2,14 @@
 
 //! Bottle download, verification, and extraction for brewdock.
 
-pub mod download;
+mod download;
 pub mod error;
-pub mod extract;
-pub mod store;
-pub mod verify;
+mod extract;
+mod store;
+mod verify;
 
 pub use download::{BottleDownloader, HttpBottleDownloader};
-pub use error::BottleError;
+pub use error::{BottleError, Sha256Hex};
 pub use extract::extract_tar_gz;
 pub use store::BlobStore;
 pub use verify::{StreamVerifier, verify_sha256};

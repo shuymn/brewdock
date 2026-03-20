@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use crate::error::BottleError;
+use crate::error::{BottleError, Sha256Hex};
 
 /// Verifies that data matches the expected SHA256 hex digest.
 ///
@@ -8,7 +8,7 @@ use crate::error::BottleError;
 ///
 /// Returns [`BottleError::ChecksumMismatch`] if the computed digest differs from `expected_hex`.
 pub fn verify_sha256(data: &[u8], expected_hex: &str) -> Result<(), BottleError> {
-    let mut v = StreamVerifier::new(expected_hex);
+    let mut v = StreamVerifier::new(expected_hex)?;
     v.update(data);
     v.finish()
 }
@@ -17,19 +17,23 @@ pub fn verify_sha256(data: &[u8], expected_hex: &str) -> Result<(), BottleError>
 ///
 /// Computes the hash over data received in chunks (e.g., during download)
 /// and verifies the final digest against an expected value.
+#[derive(Debug)]
 pub struct StreamVerifier {
     hasher: Sha256,
-    expected: String,
+    expected: Sha256Hex,
 }
 
 impl StreamVerifier {
     /// Creates a new verifier expecting the given hex digest.
-    #[must_use]
-    pub fn new(expected_sha256: &str) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BottleError::InvalidSha256`] if `expected_sha256` is not a valid digest.
+    pub fn new(expected_sha256: &str) -> Result<Self, BottleError> {
+        Ok(Self {
             hasher: Sha256::new(),
-            expected: expected_sha256.to_owned(),
-        }
+            expected: Sha256Hex::parse(expected_sha256)?,
+        })
     }
 
     /// Feeds a chunk of data into the hasher.
@@ -44,7 +48,7 @@ impl StreamVerifier {
     /// Returns [`BottleError::ChecksumMismatch`] if the computed digest differs from the expected value.
     pub fn finish(self) -> Result<(), BottleError> {
         let result = self.hasher.finalize();
-        let actual = format!("{result:x}");
+        let actual = Sha256Hex::parse(&format!("{result:x}"))?;
         if actual != self.expected {
             return Err(BottleError::ChecksumMismatch {
                 expected: self.expected,
@@ -86,20 +90,20 @@ mod tests {
             );
             return;
         };
-        assert_eq!(expected, wrong);
-        assert_eq!(actual, HELLO_SHA256);
+        assert_eq!(expected.as_str(), wrong);
+        assert_eq!(actual.as_str(), HELLO_SHA256);
     }
 
     #[test]
     fn test_stream_verifier_single_chunk() -> Result<(), BottleError> {
-        let mut v = StreamVerifier::new(HELLO_SHA256);
+        let mut v = StreamVerifier::new(HELLO_SHA256)?;
         v.update(b"hello world");
         v.finish()
     }
 
     #[test]
     fn test_stream_verifier_multiple_chunks() -> Result<(), BottleError> {
-        let mut v = StreamVerifier::new(HELLO_SHA256);
+        let mut v = StreamVerifier::new(HELLO_SHA256)?;
         v.update(b"hello");
         v.update(b" ");
         v.update(b"world");
@@ -108,19 +112,20 @@ mod tests {
 
     #[test]
     fn test_stream_verifier_empty_data() -> Result<(), BottleError> {
-        let v = StreamVerifier::new(EMPTY_SHA256);
+        let v = StreamVerifier::new(EMPTY_SHA256)?;
         v.finish()
     }
 
     #[test]
-    fn test_stream_verifier_mismatch() {
+    fn test_stream_verifier_mismatch() -> Result<(), BottleError> {
         let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
-        let mut v = StreamVerifier::new(wrong);
+        let mut v = StreamVerifier::new(wrong)?;
         v.update(b"hello world");
         assert!(matches!(
             v.finish(),
             Err(BottleError::ChecksumMismatch { .. })
         ));
+        Ok(())
     }
 
     #[test]
@@ -129,9 +134,15 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(data));
         verify_sha256(data, &hash)?;
 
-        let mut v = StreamVerifier::new(&hash);
+        let mut v = StreamVerifier::new(&hash)?;
         v.update(&data[..10]);
         v.update(&data[10..]);
         v.finish()
+    }
+
+    #[test]
+    fn test_stream_verifier_rejects_invalid_expected_digest() {
+        let result = StreamVerifier::new("short");
+        assert!(matches!(result, Err(BottleError::InvalidSha256 { .. })));
     }
 }
