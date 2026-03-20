@@ -1,8 +1,9 @@
 use std::fmt;
 
 use serde::{
-    Deserialize,
+    Deserialize, Serialize,
     de::{self, Deserializer},
+    ser::Serializer,
 };
 
 /// Cellar type for a bottle, controlling how the bottle is installed.
@@ -19,6 +20,19 @@ pub enum CellarType {
     AnySkipRelocation,
     /// Bottle must be installed to a specific Cellar path.
     Path(String),
+}
+
+impl Serialize for CellarType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Any => serializer.serialize_str(":any"),
+            Self::AnySkipRelocation => serializer.serialize_str(":any_skip_relocation"),
+            Self::Path(p) => serializer.serialize_str(p),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for CellarType {

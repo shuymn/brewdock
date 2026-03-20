@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cellar_type::CellarType;
 
@@ -8,7 +8,7 @@ use crate::cellar_type::CellarType;
 ///
 /// Only fields needed for bottle installation are included.
 /// Unknown fields in the JSON are silently ignored by serde.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Formula {
     /// Formula name (e.g., `jq`).
     pub name: String,
@@ -48,7 +48,7 @@ pub struct Formula {
 }
 
 /// Version information for a formula.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Versions {
     /// Stable version string.
     pub stable: String,
@@ -62,14 +62,14 @@ pub struct Versions {
 }
 
 /// Wrapper for bottle specifications.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BottleSpec {
     /// Stable bottle specification.
     pub stable: Option<BottleStable>,
 }
 
 /// Stable bottle details.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BottleStable {
     /// Rebuild counter.
     #[serde(default)]
@@ -84,7 +84,7 @@ pub struct BottleStable {
 }
 
 /// A single bottle file for a specific platform.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BottleFile {
     /// Cellar type controlling installation path.
     pub cellar: CellarType,
