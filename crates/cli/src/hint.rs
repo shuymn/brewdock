@@ -10,7 +10,7 @@ pub fn for_error(err: &anyhow::Error) -> Option<&'static str> {
         BrewdockError::Formula(formula_err) => hint_for_formula(formula_err),
         BrewdockError::Bottle(bottle_err) => hint_for_bottle(bottle_err),
         BrewdockError::Platform(_) => Some("brewdock currently supports macOS only"),
-        BrewdockError::Io(_) | BrewdockError::Cellar(_) => None,
+        BrewdockError::Io(_) | BrewdockError::Cellar(_) | BrewdockError::SourceBuild(_) => None,
     }
 }
 

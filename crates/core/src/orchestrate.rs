@@ -1,6 +1,8 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    ffi::OsStr,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
@@ -10,11 +12,11 @@ use brewdock_cellar::{
     relocate_keg, run_post_install, unlink, write_receipt,
 };
 use brewdock_formula::{
-    Formula, FormulaCache, FormulaError, FormulaRepository, SelectedBottle, UnsupportedReason,
-    check_supportability, resolve_install_order, select_bottle,
+    Formula, FormulaCache, FormulaError, FormulaRepository, Requirement, SelectedBottle,
+    UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
 };
 
-use crate::{BrewdockError, HostTag, Layout, lock::FileLock};
+use crate::{BrewdockError, HostTag, Layout, error::SourceBuildError, lock::FileLock};
 
 /// Default tap name for receipt source metadata.
 const TAP_NAME: &str = "homebrew/core";
@@ -247,22 +249,27 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 unlink(&old_keg, self.layout.prefix())?;
             }
 
-            // Install new version. Only the formula itself is fetched; new
-            // transitive dependencies introduced by the new version are not
-            // resolved or installed here (see Non-goals: partial failure recovery).
-            let cache = {
-                let mut c = FormulaCache::new();
-                c.insert(candidate.formula);
-                c
-            };
-            // Preserve the original installed_on_request status from the record.
             let requested: HashSet<&str> = if candidate.record.installed_on_request {
                 std::iter::once(candidate.record.name.as_str()).collect()
             } else {
                 HashSet::new()
             };
-            self.install_single(&candidate.record.name, &cache, &requested, &blob_store)
-                .await?;
+
+            if matches!(candidate.method, InstallMethod::Source(_)) {
+                let (to_install, cache) = self.resolve_upgrade_install_list(&candidate).await?;
+                for name in &to_install {
+                    self.install_single(name, &cache, &requested, &blob_store)
+                        .await?;
+                }
+            } else {
+                let cache = {
+                    let mut c = FormulaCache::new();
+                    c.insert(candidate.formula);
+                    c
+                };
+                self.install_single(&candidate.record.name, &cache, &requested, &blob_store)
+                    .await?;
+            }
 
             upgraded.push(candidate.record.name);
         }
@@ -303,7 +310,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             check_supportability(formula, host_tag)?;
         }
 
-        let order = resolve_install_order(cache.all(), names)?;
+        let order = resolve_install_order(&self.build_install_graph(&cache)?, names)?;
 
         let to_install = {
             let state_db = StateDb::open(&self.layout.db_path())?;
@@ -334,9 +341,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 continue;
             }
             let formula = self.repo.get_formula(&name).await?;
-            for dep in &formula.dependencies {
-                if cache.get(dep).is_none() {
-                    queue.push_back(dep.clone());
+            for dep in self.plan_dependencies(&formula)? {
+                if cache.get(&dep).is_none() {
+                    queue.push_back(dep);
                 }
             }
             cache.insert(formula);
@@ -376,6 +383,32 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(candidates)
     }
 
+    async fn resolve_upgrade_install_list(
+        &self,
+        candidate: &UpgradeCandidate,
+    ) -> Result<(Vec<String>, FormulaCache), BrewdockError> {
+        let cache = self
+            .fetch_with_deps(&[candidate.record.name.as_str()])
+            .await?;
+        let host_tag = self.host_tag.as_str();
+        for formula in cache.all().values() {
+            check_supportability(formula, host_tag)?;
+        }
+
+        let order = resolve_install_order(
+            &self.build_install_graph(&cache)?,
+            &[candidate.record.name.as_str()],
+        )?;
+        let state_db = StateDb::open(&self.layout.db_path())?;
+        let mut to_install = Vec::new();
+        for name in order {
+            if name == candidate.record.name || state_db.get(&name)?.is_none() {
+                to_install.push(name);
+            }
+        }
+        Ok((to_install, cache))
+    }
+
     /// Installs a single formula (download → extract → materialize → link → receipt → state).
     ///
     /// `StateDb` is opened after the download completes to avoid holding a non-`Send`
@@ -394,41 +427,26 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         tracing::info!(name, "installing formula");
 
-        let selected_bottle = match method {
-            InstallMethod::Bottle(selected) => selected,
-            InstallMethod::Source(_) => {
-                return Err(FormulaError::Unsupported {
-                    name: name.to_owned(),
-                    reason: UnsupportedReason::SourceBuildRequired,
-                }
-                .into());
-            }
-        };
-
-        // Download (async).
-        let data = self
-            .downloader
-            .download_verified(&selected_bottle.url, &selected_bottle.sha256)
-            .await?;
-
-        // All operations below are sync. StateDb is opened here, after the
-        // last .await, so the future remains Send.
-        blob_store.put(&selected_bottle.sha256, &data)?;
-
-        let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
-        let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
-        extract_tar_gz(&blob_path, &extract_dir)?;
-
-        let version_str = pkg_version(&formula.versions.stable, formula.revision);
-        let source = extract_dir.join(&formula.name).join(&version_str);
-        let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
-        materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
-        relocate_keg(&keg_path, self.layout.prefix())?;
+        let keg_path = self
+            .install_payload(formula, &method, blob_store)
+            .await
+            .inspect_err(|_| {
+                let _ = cleanup_failed_install(
+                    &self
+                        .layout
+                        .cellar()
+                        .join(&formula.name)
+                        .join(pkg_version(&formula.versions.stable, formula.revision)),
+                    self.layout.prefix(),
+                    &self.layout.opt_dir(),
+                    &formula.name,
+                );
+            })?;
         let post_install_transaction = self
             .execute_post_install(name, formula, &keg_path)
             .await
             .inspect_err(|_| {
-                let _ = cleanup_failed_post_install(
+                let _ = cleanup_failed_install(
                     &keg_path,
                     self.layout.prefix(),
                     &self.layout.opt_dir(),
@@ -436,14 +454,26 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 );
             })?;
 
+        let is_requested = requested.contains(formula.name.as_str());
+        let receipt = build_receipt(
+            &method,
+            if is_requested {
+                InstallReason::OnRequest
+            } else {
+                InstallReason::AsDependency
+            },
+            Some(unix_timestamp_f64()),
+            build_receipt_deps(formula, cache),
+            build_receipt_source(formula),
+        );
         let finalize_install =
-            self.finalize_installed_formula(formula, cache, requested, &keg_path);
+            self.finalize_installed_formula(formula, &keg_path, &receipt, is_requested);
 
         if let Err(error) = finalize_install {
             if let Some(transaction) = post_install_transaction {
                 transaction.rollback()?;
             }
-            cleanup_failed_post_install(
+            cleanup_failed_install(
                 &keg_path,
                 self.layout.prefix(),
                 &self.layout.opt_dir(),
@@ -458,6 +488,36 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         tracing::info!(name, "installation complete");
         Ok(())
+    }
+
+    async fn install_payload(
+        &self,
+        formula: &Formula,
+        method: &InstallMethod,
+        blob_store: &BlobStore,
+    ) -> Result<PathBuf, BrewdockError> {
+        match method {
+            InstallMethod::Bottle(selected_bottle) => {
+                let data = self
+                    .downloader
+                    .download_verified(&selected_bottle.url, &selected_bottle.sha256)
+                    .await?;
+
+                blob_store.put(&selected_bottle.sha256, &data)?;
+
+                let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
+                let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
+                extract_tar_gz(&blob_path, &extract_dir)?;
+
+                let version_str = pkg_version(&formula.versions.stable, formula.revision);
+                let source = extract_dir.join(&formula.name).join(&version_str);
+                let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
+                materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
+                relocate_keg(&keg_path, self.layout.prefix())?;
+                Ok(keg_path)
+            }
+            InstallMethod::Source(plan) => self.install_source_formula(formula, plan).await,
+        }
     }
 
     async fn execute_post_install(
@@ -489,28 +549,15 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     fn finalize_installed_formula(
         &self,
         formula: &Formula,
-        cache: &FormulaCache,
-        requested: &HashSet<&str>,
         keg_path: &Path,
+        receipt: &InstallReceipt,
+        is_requested: bool,
     ) -> Result<(), BrewdockError> {
         if !formula.keg_only {
             link(keg_path, self.layout.prefix())?;
         }
 
-        let is_requested = requested.contains(formula.name.as_str());
-        let receipt_deps = build_receipt_deps(formula, cache);
-        let receipt_source = build_receipt_source(formula);
-        let receipt = InstallReceipt::for_bottle(
-            if is_requested {
-                InstallReason::OnRequest
-            } else {
-                InstallReason::AsDependency
-            },
-            Some(unix_timestamp_f64()),
-            receipt_deps,
-            receipt_source,
-        );
-        write_receipt(keg_path, &receipt)?;
+        write_receipt(keg_path, receipt)?;
 
         let state_db = StateDb::open(&self.layout.db_path())?;
         state_db.insert(&InstallRecord {
@@ -523,28 +570,82 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(())
     }
 
-    fn resolve_install_method(&self, formula: &Formula) -> Result<InstallMethod, FormulaError> {
+    fn resolve_install_method(&self, formula: &Formula) -> Result<InstallMethod, BrewdockError> {
         if let Some(selected) = select_bottle(formula, self.host_tag.as_str()) {
             return Ok(InstallMethod::Bottle(selected));
         }
 
-        build_source_plan(formula, &self.layout)
-            .map(InstallMethod::Source)
-            .ok_or_else(|| FormulaError::Unsupported {
+        if formula.urls.stable.is_none() {
+            return Err(FormulaError::Unsupported {
                 name: formula.name.clone(),
                 reason: UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
+            }
+            .into());
+        }
+
+        Ok(InstallMethod::Source(build_source_plan(
+            formula,
+            &self.layout,
+        )?))
+    }
+
+    fn plan_dependencies(&self, formula: &Formula) -> Result<Vec<String>, BrewdockError> {
+        let mut dependencies = formula.dependencies.clone();
+        if matches!(
+            self.resolve_install_method(formula)?,
+            InstallMethod::Source(_)
+        ) {
+            dependencies.extend(formula.build_dependencies.iter().cloned());
+        }
+        Ok(dependencies)
+    }
+
+    fn build_install_graph(
+        &self,
+        cache: &FormulaCache,
+    ) -> Result<HashMap<String, Formula>, BrewdockError> {
+        cache
+            .all()
+            .iter()
+            .map(|(name, formula)| {
+                let mut entry = formula.clone();
+                entry.dependencies = self.plan_dependencies(formula)?;
+                Ok((name.clone(), entry))
             })
+            .collect()
     }
 }
 
-fn build_source_plan(formula: &Formula, layout: &Layout) -> Option<SourceBuildPlan> {
-    let stable = formula.urls.stable.as_ref()?;
+fn build_source_plan(
+    formula: &Formula,
+    layout: &Layout,
+) -> Result<SourceBuildPlan, SourceBuildError> {
+    if let Some(requirement) = formula.requirements.first() {
+        return Err(SourceBuildError::UnsupportedRequirement(
+            requirement_name(requirement).to_owned(),
+        ));
+    }
+
+    let stable = formula
+        .urls
+        .stable
+        .as_ref()
+        .ok_or_else(|| SourceBuildError::UnsupportedSourceArchive(formula.name.clone()))?;
+    let source_checksum = stable
+        .checksum
+        .clone()
+        .ok_or_else(|| SourceBuildError::MissingSourceChecksum(formula.name.clone()))?;
+    if source_archive_kind(&stable.url).is_none() {
+        return Err(SourceBuildError::UnsupportedSourceArchive(
+            stable.url.clone(),
+        ));
+    }
     let version = pkg_version(&formula.versions.stable, formula.revision);
-    Some(SourceBuildPlan {
+    Ok(SourceBuildPlan {
         formula_name: formula.name.clone(),
         version: version.clone(),
         source_url: stable.url.clone(),
-        source_checksum: stable.checksum.clone(),
+        source_checksum: Some(source_checksum),
         build_dependencies: formula.build_dependencies.clone(),
         runtime_dependencies: formula.dependencies.clone(),
         prefix: layout.prefix().to_path_buf(),
@@ -552,7 +653,337 @@ fn build_source_plan(formula: &Formula, layout: &Layout) -> Option<SourceBuildPl
     })
 }
 
-fn cleanup_failed_post_install(
+fn build_receipt(
+    method: &InstallMethod,
+    install_reason: InstallReason,
+    time: Option<f64>,
+    runtime_dependencies: Vec<ReceiptDependency>,
+    source: ReceiptSource,
+) -> InstallReceipt {
+    match method {
+        InstallMethod::Bottle(_) => {
+            InstallReceipt::for_bottle(install_reason, time, runtime_dependencies, source)
+        }
+        InstallMethod::Source(_) => {
+            InstallReceipt::for_source(install_reason, time, runtime_dependencies, source)
+        }
+    }
+}
+
+fn requirement_name(requirement: &Requirement) -> &str {
+    match requirement {
+        Requirement::Name(name) => name,
+        Requirement::Detailed(detail) => &detail.name,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceArchiveKind {
+    TarGz,
+}
+
+impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
+    async fn install_source_formula(
+        &self,
+        _formula: &Formula,
+        plan: &SourceBuildPlan,
+    ) -> Result<PathBuf, BrewdockError> {
+        let checksum = plan
+            .source_checksum
+            .as_deref()
+            .ok_or_else(|| SourceBuildError::MissingSourceChecksum(plan.formula_name.clone()))?;
+        let data = self
+            .downloader
+            .download_verified(&plan.source_url, checksum)
+            .await?;
+
+        let parent = self.layout.cache_dir().join("sources");
+        std::fs::create_dir_all(&parent)?;
+        let tempdir = tempfile::tempdir_in(parent)?;
+        let archive_path = tempdir
+            .path()
+            .join(source_archive_filename(&plan.source_url).unwrap_or("source.tar.gz"));
+        std::fs::write(&archive_path, data)?;
+
+        let source_root = extract_source_archive(&archive_path, tempdir.path())?;
+        run_source_build(&source_root, plan, self.layout.prefix())?;
+        refresh_opt_link(
+            &plan.cellar_path,
+            &self.layout.opt_dir(),
+            &plan.formula_name,
+        )?;
+        Ok(plan.cellar_path.clone())
+    }
+}
+
+fn source_archive_filename(url: &str) -> Option<&str> {
+    let trimmed = url.split('?').next().unwrap_or(url);
+    trimmed.rsplit('/').next()
+}
+
+fn source_archive_kind(url: &str) -> Option<SourceArchiveKind> {
+    let filename = source_archive_filename(url)?.to_ascii_lowercase();
+    if filename.ends_with(".tar.gz")
+        || Path::new(&filename)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tgz"))
+    {
+        Some(SourceArchiveKind::TarGz)
+    } else {
+        None
+    }
+}
+
+fn extract_source_archive(
+    archive_path: &Path,
+    tempdir_root: &Path,
+) -> Result<PathBuf, BrewdockError> {
+    let kind = source_archive_kind(
+        archive_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default(),
+    )
+    .ok_or_else(|| {
+        SourceBuildError::UnsupportedSourceArchive(archive_path.display().to_string())
+    })?;
+
+    let extract_dir = tempdir_root.join("extract");
+    match kind {
+        SourceArchiveKind::TarGz => extract_tar_gz(archive_path, &extract_dir)?,
+    }
+    discover_source_root(&extract_dir)
+}
+
+fn discover_source_root(extract_dir: &Path) -> Result<PathBuf, BrewdockError> {
+    let entries: Vec<PathBuf> = std::fs::read_dir(extract_dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect();
+
+    if entries.len() == 1 && entries[0].is_dir() {
+        Ok(entries[0].clone())
+    } else if entries.is_empty() {
+        Err(SourceBuildError::MissingSourceRoot(extract_dir.display().to_string()).into())
+    } else {
+        Ok(extract_dir.to_path_buf())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceBuildSystem {
+    Configure,
+    Cmake,
+    Meson,
+    PerlMakeMaker,
+    Make,
+}
+
+fn run_source_build(
+    source_root: &Path,
+    plan: &SourceBuildPlan,
+    prefix: &Path,
+) -> Result<(), BrewdockError> {
+    std::fs::create_dir_all(&plan.cellar_path)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let joined_path = std::env::join_paths(
+        std::iter::once(prefix.join("bin")).chain(std::env::split_paths(&path)),
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let build_system = detect_build_system(source_root)?;
+    let prefix_arg = format!("--prefix={}", plan.cellar_path.display());
+
+    match build_system {
+        SourceBuildSystem::Configure => {
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "./configure",
+                &[&prefix_arg],
+            )?;
+            run_build_command(source_root, prefix, &joined_path, "make", &[])?;
+            run_build_command(source_root, prefix, &joined_path, "make", &["install"])?;
+        }
+        SourceBuildSystem::Cmake => {
+            let build_dir = source_root.join("build");
+            let configure_args = cmake_configure_args(source_root, &build_dir, &plan.cellar_path);
+            let configure_arg_refs = configure_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "cmake",
+                &configure_arg_refs,
+            )?;
+            let build_arg = build_dir.display().to_string();
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "cmake",
+                &["--build", &build_arg],
+            )?;
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "cmake",
+                &["--install", &build_arg],
+            )?;
+        }
+        SourceBuildSystem::Meson => {
+            let build_dir = source_root.join("build");
+            let build_arg = build_dir.display().to_string();
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "meson",
+                &["setup", &build_arg, &prefix_arg],
+            )?;
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "ninja",
+                &["-C", &build_arg],
+            )?;
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "ninja",
+                &["-C", &build_arg, "install"],
+            )?;
+        }
+        SourceBuildSystem::PerlMakeMaker => {
+            let install_base = format!("INSTALL_BASE={}", plan.cellar_path.display());
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "perl",
+                &["Makefile.PL", &install_base],
+            )?;
+            run_build_command(source_root, prefix, &joined_path, "make", &[])?;
+            run_build_command(source_root, prefix, &joined_path, "make", &["install"])?;
+        }
+        SourceBuildSystem::Make => {
+            let prefix_value = plan.cellar_path.display().to_string();
+            run_build_command(source_root, prefix, &joined_path, "make", &[])?;
+            run_build_command(
+                source_root,
+                prefix,
+                &joined_path,
+                "make",
+                &[
+                    "install",
+                    &format!("PREFIX={prefix_value}"),
+                    &format!("prefix={prefix_value}"),
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn cmake_configure_args(source_root: &Path, build_dir: &Path, cellar_path: &Path) -> Vec<String> {
+    vec![
+        "-S".to_owned(),
+        source_root.display().to_string(),
+        "-B".to_owned(),
+        build_dir.display().to_string(),
+        format!("-DCMAKE_INSTALL_PREFIX={}", cellar_path.display()),
+    ]
+}
+
+fn detect_build_system(source_root: &Path) -> Result<SourceBuildSystem, BrewdockError> {
+    let candidates = [
+        ("Makefile.PL", SourceBuildSystem::PerlMakeMaker),
+        ("CMakeLists.txt", SourceBuildSystem::Cmake),
+        ("meson.build", SourceBuildSystem::Meson),
+        ("configure", SourceBuildSystem::Configure),
+        ("Makefile", SourceBuildSystem::Make),
+        ("makefile", SourceBuildSystem::Make),
+    ];
+
+    candidates
+        .iter()
+        .find(|(name, _)| source_root.join(name).exists())
+        .map(|(_, build_system)| *build_system)
+        .ok_or_else(|| {
+            SourceBuildError::UnsupportedBuildSystem(source_root.display().to_string()).into()
+        })
+}
+
+fn run_build_command(
+    source_root: &Path,
+    prefix: &Path,
+    path: &OsStr,
+    program: &str,
+    args: &[&str],
+) -> Result<(), BrewdockError> {
+    let output = Command::new(program)
+        .current_dir(source_root)
+        .env("PATH", path)
+        .env("HOMEBREW_PREFIX", prefix)
+        .args(args)
+        .output()
+        .map_err(|error| SourceBuildError::CommandFailed {
+            command: format_command(program, args),
+            stderr: error.to_string(),
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Err(SourceBuildError::CommandFailed {
+        command: format_command(program, args),
+        stderr: if detail.is_empty() {
+            output.status.code().map_or_else(
+                || "terminated by signal".to_owned(),
+                |code| code.to_string(),
+            )
+        } else {
+            detail
+        },
+    }
+    .into())
+}
+
+fn format_command(program: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        program.to_owned()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn refresh_opt_link(
+    keg_path: &Path,
+    opt_dir: &Path,
+    formula_name: &str,
+) -> Result<(), BrewdockError> {
+    std::fs::create_dir_all(opt_dir)?;
+    let opt_link = opt_dir.join(formula_name);
+    if opt_link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&opt_link)?;
+    }
+    std::os::unix::fs::symlink(keg_path, &opt_link)?;
+    Ok(())
+}
+
+fn cleanup_failed_install(
     keg_path: &Path,
     prefix: &Path,
     opt_dir: &Path,
@@ -803,6 +1234,52 @@ mod tests {
         Ok(compressed)
     }
 
+    fn create_source_tar_gz(
+        root: &str,
+        files: &[(&str, &[u8])],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use flate2::{Compression, write::GzEncoder};
+
+        let buf = Vec::new();
+        let encoder = GzEncoder::new(buf, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        for &(path, contents) in files {
+            let full_path = format!("{root}/{path}");
+            let mut header = tar::Header::new_gnu();
+            header.set_path(&full_path)?;
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, contents)?;
+        }
+
+        let encoder = builder.into_inner()?;
+        let compressed = encoder.finish()?;
+        Ok(compressed)
+    }
+
+    #[test]
+    fn test_cmake_configure_args_use_cmake_install_prefix() {
+        let source_root = Path::new("/tmp/source");
+        let build_dir = Path::new("/tmp/source/build");
+        let cellar_path = Path::new("/opt/homebrew/Cellar/demo/1.0");
+
+        let args = cmake_configure_args(source_root, build_dir, cellar_path);
+
+        assert!(args.iter().any(|arg| arg == "-S"));
+        assert!(args.iter().any(|arg| arg == "-B"));
+        assert!(
+            args.iter()
+                .any(|arg| { arg == "-DCMAKE_INSTALL_PREFIX=/opt/homebrew/Cellar/demo/1.0" })
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--prefix=/opt/homebrew/Cellar/demo/1.0")
+        );
+    }
+
     fn make_orchestrator(
         formulae: Vec<Formula>,
         bottles: Vec<(&str, Vec<u8>)>,
@@ -978,12 +1455,22 @@ mod tests {
         formula.versions.bottle = false;
         formula.bottle.stable = None;
         formula.build_dependencies = vec!["pkgconf".to_owned()];
+        let pkgconf = make_formula(
+            "pkgconf",
+            "2.0",
+            &[],
+            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        );
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
+        let orchestrator =
+            make_orchestrator(vec![formula, pkgconf], vec![], counter, layout.clone())?;
 
         let plan = orchestrator.plan_install(&["a"]).await?;
-        let entry = plan.first().ok_or("expected install plan entry")?;
+        let entry = plan
+            .iter()
+            .find(|entry| entry.name == "a")
+            .ok_or("expected install plan entry")?;
         assert!(matches!(
             &entry.method,
             InstallMethod::Source(source)
@@ -1424,6 +1911,292 @@ end
         assert_eq!(
             std::fs::read_to_string(layout.prefix().join("bin/tool"))?,
             "collision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_fallback_install_installs_build_dependency_closure_before_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let helper_runtime_sha = "5656565656565656565656565656565656565656565656565656565656565656";
+        let build_helper_sha = "6767676767676767676767676767676767676767676767676767676767676767";
+        let runtime_dep_sha = "7878787878787878787878787878787878787878787878787878787878787878";
+        let source_sha = "8989898989898989898989898989898989898989898989898989898989898989";
+
+        let helper_runtime = make_formula("helper-runtime", "1.0", &[], helper_runtime_sha);
+        let build_helper =
+            make_formula("build-helper", "1.0", &["helper-runtime"], build_helper_sha);
+        let runtime_dep = make_formula("runtime-dep", "1.0", &[], runtime_dep_sha);
+        let mut target = make_formula("target", "1.0", &["runtime-dep"], source_sha);
+        target.versions.bottle = false;
+        target.bottle.stable = None;
+        target.build_dependencies = vec!["build-helper".to_owned()];
+
+        let bottles = vec![
+            (
+                helper_runtime_sha,
+                create_bottle_tar_gz(
+                    "helper-runtime",
+                    "1.0",
+                    &[("share/runtime.txt", b"runtime")],
+                )?,
+            ),
+            (
+                build_helper_sha,
+                create_bottle_tar_gz(
+                    "build-helper",
+                    "1.0",
+                    &[("bin/helper-tool", b"helper-dependency\n")],
+                )?,
+            ),
+            (
+                runtime_dep_sha,
+                create_bottle_tar_gz("runtime-dep", "1.0", &[("lib/libdep.txt", b"dep")])?,
+            ),
+            (
+                source_sha,
+                create_source_tar_gz(
+                    "target-1.0",
+                    &[(
+                        "Makefile",
+                        br#"all:
+	printf "source-built\n" > target.sh
+	cat "$$HOMEBREW_PREFIX/bin/helper-tool" > generated.txt
+
+install:
+	mkdir -p "$(PREFIX)/bin"
+	cp target.sh "$(PREFIX)/bin/target"
+	cp generated.txt "$(PREFIX)/generated.txt"
+"#,
+                    )],
+                )?,
+            ),
+        ];
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![target, build_helper, helper_runtime, runtime_dep],
+            bottles,
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["target"]).await?;
+
+        let pos = |name: &str| installed.iter().position(|entry| entry == name);
+        assert!(pos("helper-runtime") < pos("build-helper"));
+        assert!(pos("build-helper") < pos("target"));
+        assert!(pos("runtime-dep") < pos("target"));
+        assert_eq!(
+            std::fs::read_to_string(layout.cellar().join("target/1.0/generated.txt"))?,
+            "helper-dependency\n"
+        );
+        assert!(layout.prefix().join("bin/target").is_symlink());
+
+        let receipt: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            layout.cellar().join("target/1.0/INSTALL_RECEIPT.json"),
+        )?)?;
+        assert_eq!(receipt["built_as_bottle"].as_bool(), Some(false));
+        assert_eq!(receipt["poured_from_bottle"].as_bool(), Some(false));
+        assert!(StateDb::open(&layout.db_path())?.get("target")?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_fallback_rejects_unsupported_requirement_during_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+        formula.versions.bottle = false;
+        formula.bottle.stable = None;
+        formula.requirements = vec![Requirement::Name("xcode".to_owned())];
+
+        let orchestrator =
+            make_orchestrator(vec![formula], vec![], Arc::new(AtomicUsize::new(0)), layout)?;
+        let result = orchestrator.plan_install(&["a"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::SourceBuild(
+                SourceBuildError::UnsupportedRequirement(requirement)
+            )) if requirement == "xcode"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_fallback_cleans_up_failed_build_without_receipt_or_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("broken", "1.0", &[], PLAN_SHA);
+        formula.versions.bottle = false;
+        formula.bottle.stable = None;
+
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![(
+                PLAN_SHA,
+                create_source_tar_gz(
+                    "broken-1.0",
+                    &[(
+                        "Makefile",
+                        br#"all:
+	printf "broken\n" > tool
+
+install:
+	mkdir -p "$(PREFIX)/bin"
+	cp tool "$(PREFIX)/bin/broken"
+	exit 1
+"#,
+                    )],
+                )?,
+            )],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["broken"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::SourceBuild(
+                SourceBuildError::CommandFailed { .. }
+            ))
+        ));
+        assert!(!layout.cellar().join("broken/1.0").exists());
+        assert!(layout.opt_dir().join("broken").symlink_metadata().is_err());
+        assert!(
+            !layout
+                .cellar()
+                .join("broken/1.0/INSTALL_RECEIPT.json")
+                .exists()
+        );
+        assert!(StateDb::open(&layout.db_path())?.get("broken")?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_fallback_plan_upgrade_reuses_source_method_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let state_db = StateDb::open(&layout.db_path())?;
+        state_db.insert(&InstallRecord {
+            name: "portable".to_owned(),
+            version: "1.0".to_owned(),
+            revision: 0,
+            installed_on_request: true,
+            installed_at: "1000".to_owned(),
+        })?;
+        drop(state_db);
+
+        let mut formula = make_formula("portable", "2.0", &[], PLAN_SHA);
+        formula.versions.bottle = false;
+        formula.bottle.stable = None;
+
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let plan = orchestrator.plan_upgrade(&["portable"]).await?;
+        let entry = plan.first().ok_or("expected upgrade plan entry")?;
+        assert!(matches!(
+            &entry.method,
+            InstallMethod::Source(source)
+                if source.formula_name == "portable"
+                    && source.cellar_path == layout.cellar().join("portable/2.0")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_fallback_upgrade_installs_missing_build_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let state_db = StateDb::open(&layout.db_path())?;
+        state_db.insert(&InstallRecord {
+            name: "target".to_owned(),
+            version: "1.0".to_owned(),
+            revision: 0,
+            installed_on_request: true,
+            installed_at: "1000".to_owned(),
+        })?;
+        drop(state_db);
+
+        let helper_sha = "9090909090909090909090909090909090909090909090909090909090909090";
+        let source_sha = "9191919191919191919191919191919191919191919191919191919191919191";
+
+        let helper = make_formula("build-helper", "1.0", &[], helper_sha);
+        let mut target = make_formula("target", "2.0", &[], source_sha);
+        target.versions.bottle = false;
+        target.bottle.stable = None;
+        target.build_dependencies = vec!["build-helper".to_owned()];
+
+        let orchestrator = make_orchestrator(
+            vec![target, helper],
+            vec![
+                (
+                    helper_sha,
+                    create_bottle_tar_gz(
+                        "build-helper",
+                        "1.0",
+                        &[("bin/helper-tool", b"helper-upgrade\n")],
+                    )?,
+                ),
+                (
+                    source_sha,
+                    create_source_tar_gz(
+                        "target-2.0",
+                        &[(
+                            "Makefile",
+                            br#"all:
+	cat "$$HOMEBREW_PREFIX/bin/helper-tool" > generated.txt
+	printf "target\n" > target
+
+install:
+	mkdir -p "$(PREFIX)/bin"
+	cp target "$(PREFIX)/bin/target"
+	cp generated.txt "$(PREFIX)/generated.txt"
+"#,
+                        )],
+                    )?,
+                ),
+            ],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let upgraded = orchestrator.upgrade(&["target"]).await?;
+
+        assert_eq!(upgraded, vec!["target"]);
+        assert_eq!(
+            std::fs::read_to_string(layout.cellar().join("target/2.0/generated.txt"))?,
+            "helper-upgrade\n"
+        );
+        assert!(
+            StateDb::open(&layout.db_path())?
+                .get("build-helper")?
+                .is_some()
+        );
+        assert_eq!(
+            StateDb::open(&layout.db_path())?
+                .get("target")?
+                .ok_or("expected upgraded target record")?
+                .version,
+            "2.0"
         );
         Ok(())
     }

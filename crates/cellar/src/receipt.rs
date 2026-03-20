@@ -63,14 +63,51 @@ impl InstallReceipt {
         runtime_dependencies: Vec<ReceiptDependency>,
         source: ReceiptSource,
     ) -> Self {
+        Self::new(
+            install_reason,
+            time,
+            runtime_dependencies,
+            source,
+            ReceiptKind::Bottle,
+        )
+    }
+
+    /// Creates a receipt for a source installation.
+    #[must_use]
+    pub fn for_source(
+        install_reason: InstallReason,
+        time: Option<f64>,
+        runtime_dependencies: Vec<ReceiptDependency>,
+        source: ReceiptSource,
+    ) -> Self {
+        Self::new(
+            install_reason,
+            time,
+            runtime_dependencies,
+            source,
+            ReceiptKind::Source,
+        )
+    }
+
+    fn new(
+        install_reason: InstallReason,
+        time: Option<f64>,
+        runtime_dependencies: Vec<ReceiptDependency>,
+        source: ReceiptSource,
+        receipt_kind: ReceiptKind,
+    ) -> Self {
         let installed_as_dependency = matches!(install_reason, InstallReason::AsDependency);
         let installed_on_request = matches!(install_reason, InstallReason::OnRequest);
+        let (built_as_bottle, poured_from_bottle) = match receipt_kind {
+            ReceiptKind::Bottle => (true, true),
+            ReceiptKind::Source => (false, false),
+        };
         Self {
             homebrew_version: format!("brewdock {}", env!("CARGO_PKG_VERSION")),
             used_options: Vec::new(),
             unused_options: Vec::new(),
-            built_as_bottle: true,
-            poured_from_bottle: true,
+            built_as_bottle,
+            poured_from_bottle,
             installed_as_dependency,
             installed_on_request,
             changed_files: Vec::new(),
@@ -83,6 +120,12 @@ impl InstallReceipt {
             arch: std::env::consts::ARCH.to_owned(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptKind {
+    Bottle,
+    Source,
 }
 
 /// A runtime dependency entry in the install receipt.

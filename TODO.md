@@ -167,7 +167,7 @@ None.
   - Why not split vertically further?: parser backend だけ先に入れても formula-specific builtin が残る限り user-visible contract が閉じない
   - Escalate if: upstream formula fixtures cannot be normalized into the fixed schemas without reintroducing formula-specific behavior or broader Ruby evaluation
 
-- [ ] Theme: Generic source fallback build driver
+- [x] Theme: Generic source fallback build driver
   - Outcome: 互換 bottle がない formula は generic build driver で source install を試行し、対応外 requirements は明示エラーで止まる
   - Goal: `BuildPlan` 導入、build dependency closure install、tarball/git source fetch、build root extraction、generic builder 実装、install method 自動 fallback
   - Must Not Break: source build に Ruby DSL 互換は持ち込まない; `uses_from_macos` は install 対象外; unsupported requirement は fail-closed
@@ -176,8 +176,8 @@ None.
     - When no compatible bottle exists and source metadata is available, the system shall resolve `InstallMethod::Source` and install into the keg path
     - When build dependencies are declared, the system shall install their dependency closure before building the target formula
     - If the build system or requirements are unsupported, the system shall fail explicitly and cleanup without writing receipt or state DB records
-  - Evidence: `run=task test; oracle=source plan selection tests, build success/failure cleanup tests, upgrade method reuse tests, representative source fallback VM smoke tests; visibility=independent; controls=[context]; missing=[]; companion=none; notes=initial acceptance formula is wakeonlan or sqlmap, final stop condition is 14 failing formulas green in VM smoke`
+  - Evidence: `run=task test; oracle=source plan selection tests, build success/failure cleanup tests, upgrade method reuse tests, representative source fallback VM smoke tests; visibility=independent; controls=[context]; missing=[]; companion=none; notes=as of 2026-03-20 wakeonlan/sqlmap both ship all-bottle metadata, so the targeted source fallback smoke uses portable-libffi while jq remains the control formula in the VM script`
   - Gates: `static`, `integration`, `system`
-  - Executable doc: `cargo test -p brewdock-core -- source_fallback`; `cargo test -p brewdock-core -- upgrade`; `tests/vm-smoke-test.sh wakeonlan`
+  - Executable doc: `cargo test -p brewdock-core -- source_fallback`; `cargo test -p brewdock-core -- upgrade`; `./tests/vm-smoke-test.sh --formula jq --formula portable-libffi`
   - Why not split vertically further?: planning と build execution を分けると fallback contract の本体である auto-switch と cleanup 条件が閉じない
   - Escalate if: generic driver で対象 formula を通せず、Ruby formula DSL 互換を導入しないと Goal を満たせない場合
