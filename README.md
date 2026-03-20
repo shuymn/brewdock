@@ -1,18 +1,68 @@
 # brewdock
 
+`brewdock` is an experimental Rust CLI (`bd`) for installing Homebrew `homebrew/core` formulae into `/opt/homebrew` on Apple Silicon macOS. It prefers stable bottles and falls back to a minimal source build path when needed.
 
-This repository was initialized from a Rust project template.
+> [!WARNING]
+> This is a hobby project.
+> It may break, desynchronize, or otherwise damage your Homebrew environment.
+> Do not use it for practical, production, or machine-critical purposes.
+> If you care about keeping your Homebrew installation healthy, use Homebrew itself.
 
-Replace this README with project-specific documentation once the repository has a clear purpose, setup flow, and release process.
+## Status
 
-## Local Setup
+- Target platform: Apple Silicon macOS with `/opt/homebrew`
+- Scope: `homebrew/core` formulae only
+- Non-goals: casks, external taps, Linux runtime, Intel Mac runtime, compatibility with full Homebrew Formula DSL
 
-Install [Rust](https://www.rust-lang.org/tools/install) (rustup). This repo pins **nightly** in `rust-toolchain.toml` (run `rustup show` in the repo root after clone — rustup should install it automatically). Optional: [Task](https://taskfile.dev/installation/) and [Lefthook](https://github.com/evilmartians/lefthook).
+## Usage
 
-Primary entrypoint:
+Once `bd` is available on your `PATH`, use it directly:
 
 ```bash
-task
+bd --help
+```
+
+Main commands:
+
+```bash
+# Update formula index
+bd update
+
+# Install formulae
+bd install jq wget
+
+# Upgrade everything currently installed by brewdock
+bd upgrade
+
+# Upgrade specific formulae
+bd upgrade jq
+```
+
+Useful global flags:
+
+```bash
+# Preview actions without executing
+bd --dry-run install jq
+
+# More logs
+bd --verbose install jq
+
+# Errors only
+bd --quiet install jq
+```
+
+## Local Development
+
+This repository uses the toolchain pinned in `rust-toolchain.toml`.
+
+For development, run the CLI via Task or Cargo:
+
+```bash
+task run -- --help
+cargo run -p brewdock-cli -- --help
+```
+
+```bash
 task build
 task test
 task lint
@@ -20,45 +70,33 @@ task fmt
 task check
 ```
 
-After installing Lefthook, enable hooks:
+Rust-native equivalents:
+
+```bash
+cargo build --workspace --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo doc --workspace --no-deps
+```
+
+Optional: install [Lefthook](https://github.com/evilmartians/lefthook) and enable git hooks.
 
 ```bash
 lefthook install
 ```
 
-Rust-native equivalents (same nightly toolchain as `rust-toolchain.toml`):
+## Repository Layout
 
-```bash
-cargo build
-cargo test
-cargo fmt --all -- --check   # uses nightly rustfmt + rustfmt.toml
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-```
+- `crates/cli`: CLI entrypoint
+- `crates/core`: orchestration, layout, install flow
+- `crates/formula`: formula metadata and resolution
+- `crates/bottle`: bottle download, verification, extraction
+- `crates/cellar`: cellar materialization, linking, receipts, state
 
-## Initial Customization
+## Docs
 
-Before treating this as a real project, update the repository-specific parts:
-
-1. Run template initialization from the repository root. This rewrites template placeholders, removes the template-only README section, deletes `.taskfiles/`, and creates a local commit.
-
-```bash
-task -t .taskfiles/template.yml init
-```
-
-2. Replace [`src/main.rs`](src/main.rs) and any starter code with your actual application.
-3. Rewrite this README with your project's purpose, setup, development workflow, and release information.
-4. Review [`AGENTS.md`](AGENTS.md) and [`docs/`](docs/) and keep only the rules and guidance you want in this repository.
-5. Run `task check` before your first project-specific commit (requires Lefthook on PATH for the `install:lefthook` dependency, or run `task fmt:check`, `task lint`, `task test`, `task doc`, and `task build` individually).
-
-## Suggested README Sections
-
-When you rewrite this file, include only the sections your project actually needs, for example:
-
-- Project overview
-- Requirements
-- Setup
-- Local development commands
-- Testing
-- Deployment or release process
-- Repository layout
-- Links to deeper docs if needed
+- [docs/architecture.md](docs/architecture.md)
+- [docs/coding.md](docs/coding.md)
+- [docs/testing.md](docs/testing.md)
+- [docs/tooling.md](docs/tooling.md)
