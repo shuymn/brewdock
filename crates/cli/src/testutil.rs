@@ -20,12 +20,16 @@ pub const SHA_C: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 
 pub struct MockRepo {
     pub formulae: HashMap<String, Formula>,
+    pub ruby_sources: HashMap<String, String>,
 }
 
 impl MockRepo {
     pub fn new(list: Vec<Formula>) -> Self {
         let formulae = list.into_iter().map(|f| (f.name.clone(), f)).collect();
-        Self { formulae }
+        Self {
+            formulae,
+            ruby_sources: HashMap::new(),
+        }
     }
 }
 
@@ -41,6 +45,15 @@ impl FormulaRepository for MockRepo {
 
     async fn get_all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
         Ok(self.formulae.values().cloned().collect())
+    }
+
+    async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
+        self.ruby_sources
+            .get(ruby_source_path)
+            .cloned()
+            .ok_or_else(|| FormulaError::NotFound {
+                name: ruby_source_path.to_owned(),
+            })
     }
 }
 

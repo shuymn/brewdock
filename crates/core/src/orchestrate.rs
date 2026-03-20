@@ -1,12 +1,13 @@
 use std::{
     collections::{HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
-    InstallReason, InstallReceipt, InstallRecord, ReceiptDependency, ReceiptSource,
-    ReceiptSourceVersions, StateDb, link, materialize, relocate_keg, unlink, write_receipt,
+    InstallReason, InstallReceipt, InstallRecord, PostInstallContext, PostInstallTransaction,
+    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, StateDb, link, materialize,
+    relocate_keg, run_post_install, unlink, write_receipt,
 };
 use brewdock_formula::{
     Formula, FormulaCache, FormulaError, FormulaRepository, SelectedBottle, UnsupportedReason,
@@ -391,14 +392,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         })?;
         let method = self.resolve_install_method(formula)?;
 
-        if formula.post_install_defined {
-            return Err(FormulaError::Unsupported {
-                name: name.to_owned(),
-                reason: UnsupportedReason::PostInstallDefined,
-            }
-            .into());
-        }
-
         tracing::info!(name, "installing formula");
 
         let selected_bottle = match method {
@@ -431,12 +424,80 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
         materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
         relocate_keg(&keg_path, self.layout.prefix())?;
+        let post_install_transaction = self
+            .execute_post_install(name, formula, &keg_path)
+            .await
+            .inspect_err(|_| {
+                let _ = cleanup_failed_post_install(
+                    &keg_path,
+                    self.layout.prefix(),
+                    &self.layout.opt_dir(),
+                    &formula.name,
+                );
+            })?;
 
-        if !formula.keg_only {
-            link(&keg_path, self.layout.prefix())?;
+        let finalize_install =
+            self.finalize_installed_formula(formula, cache, requested, &keg_path);
+
+        if let Err(error) = finalize_install {
+            if let Some(transaction) = post_install_transaction {
+                transaction.rollback()?;
+            }
+            cleanup_failed_post_install(
+                &keg_path,
+                self.layout.prefix(),
+                &self.layout.opt_dir(),
+                &formula.name,
+            )?;
+            return Err(error);
         }
 
-        let is_requested = requested.contains(name);
+        if let Some(transaction) = post_install_transaction {
+            transaction.commit()?;
+        }
+
+        tracing::info!(name, "installation complete");
+        Ok(())
+    }
+
+    async fn execute_post_install(
+        &self,
+        name: &str,
+        formula: &Formula,
+        keg_path: &Path,
+    ) -> Result<Option<PostInstallTransaction>, BrewdockError> {
+        if !formula.post_install_defined {
+            return Ok(None);
+        }
+
+        let ruby_source_path =
+            formula
+                .ruby_source_path
+                .as_deref()
+                .ok_or_else(|| FormulaError::Unsupported {
+                    name: name.to_owned(),
+                    reason: UnsupportedReason::PostInstallDefined,
+                })?;
+        let ruby_source = self.repo.get_ruby_source(ruby_source_path).await?;
+        let transaction = run_post_install(
+            &ruby_source,
+            &PostInstallContext::new(self.layout.prefix(), keg_path),
+        )?;
+        Ok(Some(transaction))
+    }
+
+    fn finalize_installed_formula(
+        &self,
+        formula: &Formula,
+        cache: &FormulaCache,
+        requested: &HashSet<&str>,
+        keg_path: &Path,
+    ) -> Result<(), BrewdockError> {
+        if !formula.keg_only {
+            link(keg_path, self.layout.prefix())?;
+        }
+
+        let is_requested = requested.contains(formula.name.as_str());
         let receipt_deps = build_receipt_deps(formula, cache);
         let receipt_source = build_receipt_source(formula);
         let receipt = InstallReceipt::for_bottle(
@@ -449,7 +510,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             receipt_deps,
             receipt_source,
         );
-        write_receipt(&keg_path, &receipt)?;
+        write_receipt(keg_path, &receipt)?;
 
         let state_db = StateDb::open(&self.layout.db_path())?;
         state_db.insert(&InstallRecord {
@@ -459,8 +520,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             installed_on_request: is_requested,
             installed_at: unix_timestamp_string(),
         })?;
-
-        tracing::info!(name, "installation complete");
         Ok(())
     }
 
@@ -491,6 +550,25 @@ fn build_source_plan(formula: &Formula, layout: &Layout) -> Option<SourceBuildPl
         prefix: layout.prefix().to_path_buf(),
         cellar_path: layout.cellar().join(&formula.name).join(version),
     })
+}
+
+fn cleanup_failed_post_install(
+    keg_path: &Path,
+    prefix: &Path,
+    opt_dir: &Path,
+    formula_name: &str,
+) -> Result<(), BrewdockError> {
+    let _ = unlink(keg_path, prefix);
+    let opt_link = opt_dir.join(formula_name);
+    if opt_link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&opt_link)?;
+    }
+
+    if keg_path.exists() {
+        std::fs::remove_dir_all(keg_path)?;
+    }
+
+    Ok(())
 }
 
 /// Creates the package version string used in Cellar paths.
@@ -575,12 +653,24 @@ mod tests {
 
     struct MockRepo {
         formulae: HashMap<String, Formula>,
+        ruby_sources: HashMap<String, String>,
     }
 
     impl MockRepo {
         fn new(list: Vec<Formula>) -> Self {
             let formulae = list.into_iter().map(|f| (f.name.clone(), f)).collect();
-            Self { formulae }
+            Self {
+                formulae,
+                ruby_sources: HashMap::new(),
+            }
+        }
+
+        fn with_sources(list: Vec<Formula>, ruby_sources: HashMap<String, String>) -> Self {
+            let formulae = list.into_iter().map(|f| (f.name.clone(), f)).collect();
+            Self {
+                formulae,
+                ruby_sources,
+            }
         }
     }
 
@@ -596,6 +686,15 @@ mod tests {
 
         async fn get_all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
             Ok(self.formulae.values().cloned().collect())
+        }
+
+        async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
+            self.ruby_sources
+                .get(ruby_source_path)
+                .cloned()
+                .ok_or_else(|| FormulaError::NotFound {
+                    name: ruby_source_path.to_owned(),
+                })
         }
     }
 
@@ -712,6 +811,19 @@ mod tests {
     ) -> Result<Orchestrator<MockRepo, MockDownloader>, BrewdockError> {
         let host_tag: HostTag = HOST_TAG.parse()?;
         let repo = MockRepo::new(formulae);
+        let downloader = MockDownloader::new(bottles, counter);
+        Ok(Orchestrator::new(repo, downloader, layout, host_tag))
+    }
+
+    fn make_orchestrator_with_sources(
+        formulae: Vec<Formula>,
+        ruby_sources: HashMap<String, String>,
+        bottles: Vec<(&str, Vec<u8>)>,
+        counter: Arc<AtomicUsize>,
+        layout: Layout,
+    ) -> Result<Orchestrator<MockRepo, MockDownloader>, BrewdockError> {
+        let host_tag: HostTag = HOST_TAG.parse()?;
+        let repo = MockRepo::with_sources(formulae, ruby_sources);
         let downloader = MockDownloader::new(bottles, counter);
         Ok(Orchestrator::new(repo, downloader, layout, host_tag))
     }
@@ -959,6 +1071,360 @@ mod tests {
 
         // No Cellar directory should exist.
         assert!(!layout.cellar().join("disabled_pkg").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_runs_post_install_before_link_and_persists_receipt_and_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let mut formula = make_formula("demo", "1.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz(
+            "demo",
+            "1.0",
+            &[
+                (
+                    "bin/write-flag",
+                    b"#!/bin/sh\nprintf '%s' \"$1\" > \"$2\"\n",
+                ),
+                ("share/src.txt", b"payload"),
+            ],
+        )?;
+
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (var/"demo").mkpath
+    cp share/"src.txt", var/"demo/copied.txt"
+    system "/bin/sh", bin/"write-flag", "done", var/"demo/result.txt"
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/demo.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["demo"]).await?;
+
+        assert_eq!(installed, vec!["demo"]);
+        assert_eq!(
+            std::fs::read_to_string(layout.prefix().join("var/demo/copied.txt"))?,
+            "payload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.prefix().join("var/demo/result.txt"))?,
+            "done"
+        );
+        assert!(layout.prefix().join("bin/write-flag").is_symlink());
+        assert!(
+            layout
+                .cellar()
+                .join("demo/1.0/INSTALL_RECEIPT.json")
+                .exists()
+        );
+        assert!(StateDb::open(&layout.db_path())?.get("demo")?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_cleans_up_failed_post_install_without_receipt_or_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let mut formula = make_formula("demo", "1.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz("demo", "1.0", &[("share/src.txt", b"payload")])?;
+        let source = r#"
+class Demo < Formula
+  def post_install
+    unsupported_call "boom"
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/demo.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["demo"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::Cellar(
+                brewdock_cellar::CellarError::UnsupportedPostInstallSyntax { .. }
+            ))
+        ));
+        assert!(!layout.cellar().join("demo/1.0").exists());
+        assert!(layout.opt_dir().join("demo").symlink_metadata().is_err());
+        assert!(
+            !layout
+                .cellar()
+                .join("demo/1.0/INSTALL_RECEIPT.json")
+                .exists()
+        );
+        assert!(StateDb::open(&layout.db_path())?.get("demo")?.is_none());
+        assert!(!layout.prefix().join("bin").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_cleans_up_when_ruby_source_fetch_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "1212121212121212121212121212121212121212121212121212121212121212";
+        let mut formula = make_formula("demo", "1.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![(
+                sha,
+                create_bottle_tar_gz("demo", "1.0", &[("bin/demo", b"binary")])?,
+            )],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["demo"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::Formula(FormulaError::NotFound { .. }))
+        ));
+        assert!(!layout.cellar().join("demo/1.0").exists());
+        assert!(layout.opt_dir().join("demo").symlink_metadata().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_bootstraps_certificate_bundle_post_install_pattern()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let mut formula = make_formula("ca-certificates", "1.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz(
+            "ca-certificates",
+            "1.0",
+            &[("share/ca-certificates/cacert.pem", b"bundle")],
+        )?;
+        let source = r#"
+class CaCertificates < Formula
+  def post_install
+    if OS.mac?
+      macos_post_install
+    else
+      linux_post_install
+    end
+  end
+
+  def macos_post_install
+    ohai "Regenerating CA certificate bundle from keychain, this may take a while..."
+    pkgetc.mkpath
+    (pkgetc/"cert.pem").atomic_write("ignored")
+  end
+
+  def linux_post_install
+    cp pkgshare/"cacert.pem", pkgetc/"cert.pem"
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/ca-certificates.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["ca-certificates"]).await?;
+
+        assert_eq!(installed, vec!["ca-certificates"]);
+        assert_eq!(
+            std::fs::read_to_string(layout.prefix().join("etc/ca-certificates/cert.pem"))?,
+            "bundle"
+        );
+        assert!(
+            layout
+                .cellar()
+                .join("ca-certificates/1.0/INSTALL_RECEIPT.json")
+                .exists()
+        );
+        assert!(
+            StateDb::open(&layout.db_path())?
+                .get("ca-certificates")?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_bootstraps_openssl_cert_symlink_post_install_pattern()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_ca = "1111111111111111111111111111111111111111111111111111111111111111";
+        let sha_ssl = "2222222222222222222222222222222222222222222222222222222222222222";
+
+        let mut ca_formula = make_formula("ca-certificates", "1.0", &[], sha_ca);
+        ca_formula.post_install_defined = true;
+        let mut ssl_formula = make_formula("openssl@3", "1.0", &["ca-certificates"], sha_ssl);
+        ssl_formula.post_install_defined = true;
+
+        let ca_source = r#"
+class CaCertificates < Formula
+  def post_install
+    if OS.mac?
+      macos_post_install
+    else
+      linux_post_install
+    end
+  end
+
+  def macos_post_install
+    pkgetc.mkpath
+    (pkgetc/"cert.pem").atomic_write("ignored")
+  end
+
+  def linux_post_install
+    cp pkgshare/"cacert.pem", pkgetc/"cert.pem"
+  end
+end
+"#;
+        let ssl_source = r#"
+class OpensslAT3 < Formula
+  def openssldir
+    etc/"openssl@3"
+  end
+
+  def post_install
+    rm(openssldir/"cert.pem") if (openssldir/"cert.pem").exist?
+    openssldir.install_symlink Formula["ca-certificates"].pkgetc/"cert.pem"
+  end
+end
+"#;
+
+        let orchestrator = make_orchestrator_with_sources(
+            vec![ssl_formula, ca_formula],
+            HashMap::from([
+                (
+                    "Formula/ca-certificates.rb".to_owned(),
+                    ca_source.to_owned(),
+                ),
+                ("Formula/openssl@3.rb".to_owned(), ssl_source.to_owned()),
+            ]),
+            vec![
+                (
+                    sha_ca,
+                    create_bottle_tar_gz(
+                        "ca-certificates",
+                        "1.0",
+                        &[("share/ca-certificates/cacert.pem", b"bundle")],
+                    )?,
+                ),
+                (
+                    sha_ssl,
+                    create_bottle_tar_gz("openssl@3", "1.0", &[("bin/openssl", b"binary")])?,
+                ),
+            ],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["openssl@3"]).await?;
+
+        assert_eq!(installed, vec!["ca-certificates", "openssl@3"]);
+        assert!(
+            layout
+                .prefix()
+                .join("etc/ca-certificates/cert.pem")
+                .exists()
+        );
+        let cert_link = layout.prefix().join("etc/openssl@3/cert.pem");
+        assert!(cert_link.is_symlink());
+        assert_eq!(std::fs::read_to_string(cert_link)?, "bundle");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_rolls_back_post_install_state_when_link_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        std::fs::create_dir_all(layout.prefix().join("bin"))?;
+        std::fs::write(layout.prefix().join("bin/tool"), "collision")?;
+
+        let sha = "3434343434343434343434343434343434343434343434343434343434343434";
+        let mut formula = make_formula("demo", "1.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (var/"demo").mkpath
+    cp share/"src.txt", var/"demo/copied.txt"
+  end
+end
+"#;
+
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/demo.rb".to_owned(), source.to_owned())]),
+            vec![(
+                sha,
+                create_bottle_tar_gz(
+                    "demo",
+                    "1.0",
+                    &[("share/src.txt", b"payload"), ("bin/tool", b"tool")],
+                )?,
+            )],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["demo"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::Cellar(
+                brewdock_cellar::CellarError::LinkCollision { .. }
+            ))
+        ));
+        assert!(!layout.cellar().join("demo/1.0").exists());
+        assert!(layout.opt_dir().join("demo").symlink_metadata().is_err());
+        assert!(!layout.prefix().join("var/demo").exists());
+        assert_eq!(
+            std::fs::read_to_string(layout.prefix().join("bin/tool"))?,
+            "collision"
+        );
         Ok(())
     }
 

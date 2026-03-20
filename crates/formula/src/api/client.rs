@@ -1,5 +1,9 @@
 use crate::{error::FormulaError, types::Formula};
 
+const DEFAULT_API_BASE_URL: &str = "https://formulae.brew.sh/api";
+const DEFAULT_CORE_RAW_BASE_URL: &str =
+    "https://raw.githubusercontent.com/Homebrew/homebrew-core/HEAD";
+
 /// Repository for fetching formula metadata.
 ///
 /// Implemented by [`HttpFormulaRepository`] for production use.
@@ -24,6 +28,16 @@ pub trait FormulaRepository: Send + Sync {
     fn get_all_formulae(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<Formula>, FormulaError>> + Send;
+
+    /// Fetches the raw Ruby formula source from `homebrew/core`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormulaError::Network`] on HTTP failure.
+    fn get_ruby_source(
+        &self,
+        ruby_source_path: &str,
+    ) -> impl std::future::Future<Output = Result<String, FormulaError>> + Send;
 }
 
 /// HTTP-based formula repository using the Homebrew JSON API.
@@ -31,24 +45,32 @@ pub trait FormulaRepository: Send + Sync {
 pub struct HttpFormulaRepository {
     client: reqwest::Client,
     base_url: String,
+    core_raw_base_url: String,
 }
 
 impl HttpFormulaRepository {
     /// Creates a repository pointing at the default Homebrew API.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: "https://formulae.brew.sh/api".to_owned(),
-        }
+        Self::with_urls(
+            DEFAULT_API_BASE_URL.to_owned(),
+            DEFAULT_CORE_RAW_BASE_URL.to_owned(),
+        )
     }
 
     /// Creates a repository with a custom base URL.
     #[must_use]
     pub fn with_base_url(base_url: String) -> Self {
+        Self::with_urls(base_url, DEFAULT_CORE_RAW_BASE_URL.to_owned())
+    }
+
+    /// Creates a repository with custom API and raw-source base URLs.
+    #[must_use]
+    pub fn with_urls(base_url: String, core_raw_base_url: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url,
+            core_raw_base_url,
         }
     }
 }
@@ -82,6 +104,14 @@ impl FormulaRepository for HttpFormulaRepository {
         let formulae: Vec<Formula> = response.json().await?;
         Ok(formulae)
     }
+
+    async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
+        let path = ruby_source_path.trim_start_matches('/');
+        let url = format!("{}/{}", self.core_raw_base_url, path);
+        let response = self.client.get(&url).send().await?;
+        let response = response.error_for_status()?;
+        response.text().await.map_err(FormulaError::from)
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +126,7 @@ mod tests {
         include_str!("../../tests/fixtures/formula/zsh-completions.json");
 
     fn make_repo(server: &MockServer) -> HttpFormulaRepository {
-        HttpFormulaRepository::with_base_url(server.base_url())
+        HttpFormulaRepository::with_urls(server.base_url(), server.base_url())
     }
 
     #[tokio::test]
@@ -234,5 +264,23 @@ mod tests {
         let result = repo.get_all_formulae().await;
 
         assert!(matches!(result, Err(FormulaError::Network(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_ruby_source_success() -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start();
+        let source = server.mock(|when, then| {
+            when.method(GET).path("/Formula/t/test.rb");
+            then.status(200)
+                .header("content-type", "text/plain")
+                .body("class Test < Formula\nend\n");
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.get_ruby_source("Formula/t/test.rb").await?;
+
+        source.assert();
+        assert!(result.contains("class Test < Formula"));
+        Ok(())
     }
 }

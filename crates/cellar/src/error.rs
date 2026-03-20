@@ -28,4 +28,18 @@ pub enum CellarError {
     /// JSON serialization or deserialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A `post_install` block could not be parsed or contains unsupported syntax.
+    #[error("unsupported post_install syntax: {message}")]
+    UnsupportedPostInstallSyntax {
+        /// Human-readable parser failure detail.
+        message: String,
+    },
+
+    /// Executing a `post_install` command failed.
+    #[error("post_install command failed: {message}")]
+    PostInstallCommandFailed {
+        /// Human-readable command failure detail.
+        message: String,
+    },
 }
