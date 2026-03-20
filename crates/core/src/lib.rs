@@ -13,5 +13,5 @@ pub use brewdock_formula::{FormulaRepository, HttpFormulaRepository};
 pub use error::BrewdockError;
 pub use layout::Layout;
 pub use lock::FileLock;
-pub use orchestrate::Orchestrator;
+pub use orchestrate::{Orchestrator, PlanEntry, UpgradePlanEntry};
 pub use platform::HostTag;

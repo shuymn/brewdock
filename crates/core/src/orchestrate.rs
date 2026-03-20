@@ -18,6 +18,26 @@ const TAP_NAME: &str = "homebrew/core";
 /// Prefix for formula source paths in receipt metadata.
 const FORMULA_PATH_PREFIX: &str = "@@HOMEBREW_PREFIX@@/Library/Taps/homebrew/homebrew-core/Formula";
 
+/// Entry in an install plan.
+#[derive(Debug, Clone)]
+pub struct PlanEntry {
+    /// Formula name.
+    pub name: String,
+    /// Version to install.
+    pub version: String,
+}
+
+/// Entry in an upgrade plan.
+#[derive(Debug, Clone)]
+pub struct UpgradePlanEntry {
+    /// Formula name.
+    pub name: String,
+    /// Currently installed version.
+    pub from_version: String,
+    /// Version to upgrade to.
+    pub to_version: String,
+}
+
 /// Orchestrates formula installation and upgrade operations.
 ///
 /// Generic over `R` (formula repository) and `D` (bottle downloader) for
@@ -45,6 +65,32 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         }
     }
 
+    /// Returns the install plan without executing it.
+    ///
+    /// Resolves dependencies, checks supportability, and filters
+    /// already-installed formulae.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if resolution or validation fails.
+    pub async fn plan_install(&self, names: &[String]) -> Result<Vec<PlanEntry>, BrewdockError> {
+        let _lock = self.acquire_lock()?;
+        let (to_install, cache) = self.resolve_install_list(names).await?;
+        let entries = to_install
+            .iter()
+            .map(|name| {
+                let f = cache
+                    .get(name)
+                    .ok_or_else(|| FormulaError::NotFound { name: name.clone() })?;
+                Ok(PlanEntry {
+                    name: name.clone(),
+                    version: pkg_version(&f.versions.stable, f.revision),
+                })
+            })
+            .collect::<Result<Vec<_>, BrewdockError>>()?;
+        Ok(entries)
+    }
+
     /// Installs the requested formulae and all their dependencies.
     ///
     /// Returns the names of formulae actually installed (excludes already-installed).
@@ -55,30 +101,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// rejected before any download begins.
     pub async fn install(&self, names: &[String]) -> Result<Vec<String>, BrewdockError> {
         let _lock = self.acquire_lock()?;
-
-        // Fetch all formulae + transitive deps.
-        let cache = self.fetch_with_deps(names).await?;
-
-        // Check supportability for ALL before any download.
-        let host_tag = self.host_tag.as_str();
-        for formula in cache.all().values() {
-            check_supportability(formula, host_tag)?;
-        }
-
-        // Resolve topological install order.
-        let order = resolve_install_order(cache.all(), names)?;
-
-        // Filter already-installed. StateDb is dropped before the async loop.
-        let to_install = {
-            let state_db = StateDb::open(&self.layout.db_path())?;
-            let mut pending = Vec::new();
-            for name in order {
-                if state_db.get(&name)?.is_none() {
-                    pending.push(name);
-                }
-            }
-            pending
-        };
+        let (to_install, cache) = self.resolve_install_list(names).await?;
 
         // Install each in order.
         let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -109,6 +132,40 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(count)
     }
 
+    /// Returns the upgrade plan without executing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if resolution or validation fails.
+    pub async fn plan_upgrade(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<UpgradePlanEntry>, BrewdockError> {
+        let _lock = self.acquire_lock()?;
+        let installed = self.fetch_installed_records(names)?;
+        let host_tag = self.host_tag.as_str();
+
+        let mut entries = Vec::new();
+        for record in &installed {
+            let formula = self.repo.get_formula(&record.name).await?;
+            check_supportability(&formula, host_tag)?;
+
+            let current_version = pkg_version(&record.version, record.revision);
+            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
+            if current_version == latest_version {
+                continue;
+            }
+
+            entries.push(UpgradePlanEntry {
+                name: record.name.clone(),
+                from_version: current_version,
+                to_version: latest_version,
+            });
+        }
+
+        Ok(entries)
+    }
+
     /// Upgrades installed formulae to their latest versions.
     ///
     /// If `names` is empty, upgrades all installed formulae. Otherwise,
@@ -121,29 +178,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Returns [`BrewdockError`] if any step fails.
     pub async fn upgrade(&self, names: &[String]) -> Result<Vec<String>, BrewdockError> {
         let _lock = self.acquire_lock()?;
-
-        // Get installed records. StateDb is dropped before the async loop.
-        let installed = {
-            let state_db = StateDb::open(&self.layout.db_path())?;
-            if names.is_empty() {
-                state_db.list()?
-            } else {
-                let mut records = Vec::new();
-                for name in names {
-                    if let Some(record) = state_db.get(name)? {
-                        records.push(record);
-                    }
-                }
-                records
-            }
-        };
+        let installed = self.fetch_installed_records(names)?;
+        let host_tag = self.host_tag.as_str();
 
         let mut upgraded = Vec::new();
         let blob_store = BlobStore::new(&self.layout.blob_dir());
 
         for record in &installed {
             let formula = self.repo.get_formula(&record.name).await?;
-            let host_tag = self.host_tag.as_str();
             check_supportability(&formula, host_tag)?;
 
             let current_version = pkg_version(&record.version, record.revision);
@@ -191,6 +233,58 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         }
 
         Ok(upgraded)
+    }
+
+    /// Fetches installed records from the state database.
+    ///
+    /// If `names` is empty, returns all installed records. Otherwise, returns
+    /// only records matching the given names. `StateDb` is opened and dropped
+    /// within this call to avoid holding it across `.await` boundaries.
+    fn fetch_installed_records(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<InstallRecord>, BrewdockError> {
+        let state_db = StateDb::open(&self.layout.db_path())?;
+        if names.is_empty() {
+            Ok(state_db.list()?)
+        } else {
+            let mut records = Vec::new();
+            for name in names {
+                if let Some(record) = state_db.get(name)? {
+                    records.push(record);
+                }
+            }
+            Ok(records)
+        }
+    }
+
+    /// Resolves the install list: fetch, check supportability, resolve order,
+    /// and filter already-installed.
+    async fn resolve_install_list(
+        &self,
+        names: &[String],
+    ) -> Result<(Vec<String>, FormulaCache), BrewdockError> {
+        let cache = self.fetch_with_deps(names).await?;
+
+        let host_tag = self.host_tag.as_str();
+        for formula in cache.all().values() {
+            check_supportability(formula, host_tag)?;
+        }
+
+        let order = resolve_install_order(cache.all(), names)?;
+
+        let to_install = {
+            let state_db = StateDb::open(&self.layout.db_path())?;
+            let mut pending = Vec::new();
+            for name in order {
+                if state_db.get(&name)?.is_none() {
+                    pending.push(name);
+                }
+            }
+            pending
+        };
+
+        Ok((to_install, cache))
     }
 
     /// Acquires the brewdock file lock.
