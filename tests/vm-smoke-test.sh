@@ -76,6 +76,11 @@ readonly DEFAULT_FORMULAE=(
 readonly PRIMARY_FORMULA="jq"
 readonly DRY_RUN_FORMULA="ripgrep"
 
+# Formulae for cross-compatibility tests (bd ↔ brew).
+# Kept small for speed; chosen for simplicity and reliable bottles.
+readonly CROSS_TEST_BD_TO_BREW=(jq ripgrep bat)
+readonly CROSS_TEST_BREW_TO_BD=(tree figlet)
+
 VM_NAME="brewdock-smoke-$$"
 BASE_IMAGE="ghcr.io/cirruslabs/macos-sequoia-base:latest"
 BD_BINARY="$PROJECT_ROOT/target/release/bd"
@@ -87,6 +92,10 @@ SSH_KEY=""
 FORMULAE=()
 INSTALL_RESULTS=()
 FAILED_FORMULAE=()
+USABILITY_RESULTS=()
+USABILITY_FAILURES=()
+CROSS_RESULTS=()
+CROSS_FAILURES=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -129,6 +138,126 @@ record_install_result() {
   if [ "$status" != "PASS" ]; then
     FAILED_FORMULAE+=("$formula")
   fi
+}
+
+record_cross_result() {
+  local label=$1
+  local status=$2
+  local detail=$3
+
+  CROSS_RESULTS+=("$label:$status:$detail")
+  if [ "$status" != "PASS" ]; then
+    CROSS_FAILURES+=("$label")
+  fi
+}
+
+# Returns the verification command for a formula, or empty string if none.
+# Commands are expected to exit 0 on success. PATH is set by the caller.
+get_verify_command() {
+  case "$1" in
+    actionlint)                    echo "actionlint -version" ;;
+    agent-browser)                 echo "agent-browser --version" ;;
+    ast-grep)                      echo "sg --version" ;;
+    atuin)                         echo "atuin --version" ;;
+    bash)                          echo "bash --version" ;;
+    bat)                           echo "bat --version" ;;
+    curl)                          echo "curl --version" ;;
+    direnv)                        echo "direnv version" ;;
+    eza)                           echo "eza --version" ;;
+    fd)                            echo "fd --version" ;;
+    fnm)                           echo "fnm --version" ;;
+    fzf)                           echo "fzf --version" ;;
+    gh)                            echo "gh --version" ;;
+    ghalint)                       echo "ghalint --version" ;;
+    ghq)                           echo "ghq --version" ;;
+    git)                           echo "git --version" ;;
+    git-delta)                     echo "delta --version" ;;
+    git-secrets)                   echo "test -x /opt/homebrew/bin/git-secrets" ;;
+    gitleaks)                      echo "gitleaks version" ;;
+    glow)                          echo "glow --version" ;;
+    gnu-sed)                       echo "gsed --version" ;;
+    go-task)                       echo "task --version" ;;
+    httpie)                        echo "http --version" ;;
+    htop)                          echo "htop --version" ;;
+    figlet)                        echo "figlet -v" ;;
+    pv)                            echo "pv --version" ;;
+    jq)                            echo "jq --version" ;;
+    neovim)                        echo "nvim --version" ;;
+    pinact)                        echo "pinact version" ;;
+    ripgrep)                       echo "rg --version" ;;
+    rtk)                           echo "rtk --version" ;;
+    sd)                            echo "sd --version" ;;
+    semgrep)                       echo "semgrep --version" ;;
+    shellcheck)                    echo "shellcheck --version" ;;
+    shfmt)                         echo "shfmt --version" ;;
+    sops)                          echo "sops --version" ;;
+    sqlmap)                        echo "test -x /opt/homebrew/bin/sqlmap" ;;
+    starship)                      echo "starship --version" ;;
+    topgrade)                      echo "topgrade --version" ;;
+    toxiproxy)                     echo "toxiproxy-cli --version" ;;
+    tree)                          echo "tree --version" ;;
+    vim)                           echo "vim --version" ;;
+    wakeonlan)                     echo "test -x /opt/homebrew/bin/wakeonlan" ;;
+    wget)                          echo "wget --version" ;;
+    yq)                            echo "yq --version" ;;
+    zoxide)                        echo "zoxide --version" ;;
+    zsh-completions)               echo "test -d /opt/homebrew/share/zsh/site-functions" ;;
+    zsh-fast-syntax-highlighting)  echo "test -f /opt/homebrew/share/zsh-fast-syntax-highlighting/fast-syntax-highlighting.plugin.zsh" ;;
+    *)                             echo "" ;;
+  esac
+}
+
+run_usability_check() {
+  local formula=$1
+  local verify_cmd=""
+
+  verify_cmd=$(get_verify_command "$formula")
+  if [ -z "$verify_cmd" ]; then
+    USABILITY_RESULTS+=("$formula:SKIP:no verification command")
+    return
+  fi
+
+  local output=""
+  if output=$(vm_ssh "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\" && $verify_cmd" 2>&1); then
+    USABILITY_RESULTS+=("$formula:PASS:$(echo "$output" | head -1)")
+  else
+    USABILITY_RESULTS+=("$formula:FAIL:exit $?")
+    USABILITY_FAILURES+=("$formula")
+  fi
+}
+
+print_usability_summary() {
+  local result=""
+  local formula=""
+  local status=""
+  local detail=""
+
+  echo ""
+  log "Usability summary"
+  for result in "${USABILITY_RESULTS[@]}"; do
+    formula=${result%%:*}
+    status=${result#*:}
+    detail=${status#*:}
+    status=${status%%:*}
+    printf '  %-30s %s (%s)\n' "$formula" "$status" "$detail"
+  done
+}
+
+print_cross_summary() {
+  local result=""
+  local label=""
+  local status=""
+  local detail=""
+
+  echo ""
+  log "Cross-compatibility summary"
+  for result in "${CROSS_RESULTS[@]}"; do
+    label=${result%%:*}
+    status=${result#*:}
+    detail=${status#*:}
+    status=${status%%:*}
+    printf '  %-40s %s (%s)\n' "$label" "$status" "$detail"
+  done
 }
 
 cleanup() {
@@ -339,6 +468,24 @@ if [ "${#FAILED_FORMULAE[@]}" -gt 0 ]; then
   log "Failed formulae: ${FAILED_FORMULAE[*]}"
 fi
 
+# --- Test: usability verification --------------------------------------------
+
+log "Usability verification"
+for formula in "${FORMULAE[@]}"; do
+  if printf '%s\n' "${FAILED_FORMULAE[@]}" | grep -qx "$formula"; then
+    USABILITY_RESULTS+=("$formula:SKIP:install failed")
+    continue
+  fi
+  run_usability_check "$formula"
+done
+
+print_usability_summary
+
+if [ "${#USABILITY_FAILURES[@]}" -gt 0 ]; then
+  echo ""
+  log "Usability failures: ${USABILITY_FAILURES[*]}"
+fi
+
 # --- Test: jq deep verification ----------------------------------------------
 
 if printf '%s\n' "${FAILED_FORMULAE[@]}" | grep -qx "$PRIMARY_FORMULA"; then
@@ -432,11 +579,138 @@ if [ "$DRY_RUN_FORMULA" = "ripgrep" ]; then
   pass "dry-run output checked against $DRY_RUN_FORMULA"
 fi
 
+# --- Cross-test: Install Homebrew --------------------------------------------
+
+log "Installing Homebrew for cross-compatibility tests..."
+vm_ssh "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" \
+  || fail "Homebrew installation failed"
+pass "Homebrew installed"
+
+log "Running: brew update"
+vm_ssh "/opt/homebrew/bin/brew update" || fail "brew update failed"
+pass "brew update"
+
+# --- Cross-test: bd → brew upgrade ------------------------------------------
+#
+# Verifies that packages installed by bd are recognized by brew and survive
+# a brew upgrade cycle.
+
+log "Cross-test: bd → brew upgrade"
+for formula in "${CROSS_TEST_BD_TO_BREW[@]}"; do
+  if printf '%s\n' "${FAILED_FORMULAE[@]}" | grep -qx "$formula"; then
+    record_cross_result "bd→brew:$formula" "SKIP" "install failed"
+    continue
+  fi
+
+  log "  brew list $formula"
+  if ! vm_ssh "/opt/homebrew/bin/brew list $formula" >/dev/null 2>&1; then
+    record_cross_result "bd→brew:$formula" "FAIL" "brew does not recognize"
+    continue
+  fi
+  pass "brew recognizes $formula"
+
+  log "  brew upgrade $formula"
+  brew_upgrade_output=$(vm_ssh "/opt/homebrew/bin/brew upgrade $formula" 2>&1 || true)
+  echo "$brew_upgrade_output"
+  pass "brew upgrade $formula completed"
+
+  verify_cmd=$(get_verify_command "$formula")
+  if [ -n "$verify_cmd" ]; then
+    if vm_ssh "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\" && $verify_cmd" >/dev/null 2>&1; then
+      record_cross_result "bd→brew:$formula" "PASS" "works after brew upgrade"
+    else
+      record_cross_result "bd→brew:$formula" "FAIL" "broken after brew upgrade"
+    fi
+  else
+    record_cross_result "bd→brew:$formula" "PASS" "brew upgrade completed"
+  fi
+done
+
+# --- Cross-test: brew → bd install ------------------------------------------
+#
+# Verifies that packages installed by brew can be taken over by bd install,
+# and that bd upgrade works after the takeover.
+
+log "Cross-test: brew install → bd install/upgrade"
+for formula in "${CROSS_TEST_BREW_TO_BD[@]}"; do
+  log "  brew install $formula"
+  if ! vm_ssh "/opt/homebrew/bin/brew install $formula" 2>&1; then
+    record_cross_result "brew→bd:$formula" "FAIL" "brew install failed"
+    continue
+  fi
+  pass "brew installed $formula"
+
+  # Verify it works after brew install
+  verify_cmd=$(get_verify_command "$formula")
+  if [ -n "$verify_cmd" ]; then
+    if ! vm_ssh "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\" && $verify_cmd" >/dev/null 2>&1; then
+      record_cross_result "brew→bd:$formula" "FAIL" "broken after brew install"
+      continue
+    fi
+    pass "$formula works after brew install"
+  fi
+
+  # bd install (takeover): formula is in Cellar but not in bd's state DB
+  log "  bd install $formula (takeover)"
+  bd_install_output=$(vm_ssh "/tmp/bd install $formula" 2>&1 || true)
+  echo "$bd_install_output"
+
+  if [ -n "$verify_cmd" ]; then
+    if ! vm_ssh "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\" && $verify_cmd" >/dev/null 2>&1; then
+      record_cross_result "brew→bd:$formula" "FAIL" "broken after bd install"
+      continue
+    fi
+    pass "$formula works after bd install"
+  fi
+
+  # Verify bd state DB has the record now
+  db_version=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='$formula'\"" 2>/dev/null || true)
+  if [ -z "$db_version" ]; then
+    record_cross_result "brew→bd:$formula" "FAIL" "state DB record missing after bd install"
+    continue
+  fi
+  pass "$formula in state DB ($db_version)"
+
+  # bd upgrade (should work now that formula is in state DB)
+  log "  bd upgrade $formula"
+  bd_upgrade_output=$(vm_ssh "/tmp/bd upgrade $formula" 2>&1 || true)
+  echo "$bd_upgrade_output"
+
+  if [ -n "$verify_cmd" ]; then
+    if vm_ssh "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\" && $verify_cmd" >/dev/null 2>&1; then
+      record_cross_result "brew→bd:$formula" "PASS" "works after full cycle"
+    else
+      record_cross_result "brew→bd:$formula" "FAIL" "broken after bd upgrade"
+    fi
+  else
+    record_cross_result "brew→bd:$formula" "PASS" "full cycle completed"
+  fi
+done
+
+print_cross_summary
+
 # --- Summary -----------------------------------------------------------------
 
 echo ""
+FAILURES=()
+
 if [ "${#FAILED_FORMULAE[@]}" -gt 0 ]; then
-  fail "installability sweep found failures: ${FAILED_FORMULAE[*]}"
+  FAILURES+=("install: ${FAILED_FORMULAE[*]}")
+fi
+
+if [ "${#USABILITY_FAILURES[@]}" -gt 0 ]; then
+  FAILURES+=("usability: ${USABILITY_FAILURES[*]}")
+fi
+
+if [ "${#CROSS_FAILURES[@]}" -gt 0 ]; then
+  FAILURES+=("cross-test: ${CROSS_FAILURES[*]}")
+fi
+
+if [ "${#FAILURES[@]}" -gt 0 ]; then
+  for f in "${FAILURES[@]}"; do
+    log "FAILED — $f"
+  done
+  fail "smoke tests found failures"
 fi
 
 log "All smoke tests passed!"
