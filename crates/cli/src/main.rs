@@ -1,9 +1,13 @@
 #![warn(clippy::pedantic, clippy::nursery)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use brewdock_core::{HostTag, HttpBottleDownloader, HttpFormulaRepository, Layout, Orchestrator};
 use clap::Parser;
 
 mod commands;
+
+#[cfg(test)]
+mod testutil;
 
 /// Fast Homebrew bottle installer.
 #[derive(Parser)]
@@ -30,15 +34,26 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     // Intentionally discard: fails harmlessly if a subscriber is already set (e.g., in tests).
     let _ = tracing_subscriber::fmt::try_init();
 
     let cli = Cli::parse();
+
+    let layout = Layout::production();
+    let host_tag = HostTag::detect().context("platform detection failed")?;
+    let orchestrator = Orchestrator::new(
+        HttpFormulaRepository::new(),
+        HttpBottleDownloader::new(),
+        layout,
+        host_tag,
+    );
+
     match cli.command {
-        Commands::Install { formulae } => commands::install::run(&formulae),
-        Commands::Update => commands::update::run(),
-        Commands::Upgrade { formulae } => commands::upgrade::run(&formulae),
+        Commands::Install { formulae } => commands::install::run(&orchestrator, &formulae).await,
+        Commands::Update => commands::update::run(&orchestrator).await,
+        Commands::Upgrade { formulae } => commands::upgrade::run(&orchestrator, &formulae).await,
     }
 }
 

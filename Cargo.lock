@@ -141,8 +141,16 @@ name = "brewdock-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brewdock-bottle",
+ "brewdock-cellar",
  "brewdock-core",
+ "brewdock-formula",
  "clap",
+ "flate2",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -156,6 +164,7 @@ dependencies = [
  "brewdock-formula",
  "flate2",
  "fs2",
+ "serde_json",
  "tar",
  "tempfile",
  "thiserror",
