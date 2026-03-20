@@ -18,8 +18,35 @@ pub fn materialize(
     opt_dir: &Path,
     name: &str,
 ) -> Result<(), CellarError> {
-    copy_dir_recursive(source, keg_path)?;
+    let keg_parent = keg_path
+        .parent()
+        .ok_or_else(|| CellarError::MissingParentDirectory {
+            path: keg_path.to_owned(),
+        })?;
+    std::fs::create_dir_all(keg_parent)?;
 
+    let version = keg_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| CellarError::MissingParentDirectory {
+            path: keg_path.to_owned(),
+        })?;
+    let temp_keg = keg_parent.join(format!(".{version}.brewdock-tmp"));
+
+    // Clean up stale temp dir from a previous crash.
+    if temp_keg.exists() {
+        std::fs::remove_dir_all(&temp_keg)?;
+    }
+
+    copy_dir_recursive(source, &temp_keg)?;
+
+    // Idempotent: remove existing keg before atomic rename.
+    if keg_path.exists() {
+        std::fs::remove_dir_all(keg_path)?;
+    }
+    std::fs::rename(&temp_keg, keg_path)?;
+
+    // Atomic opt symlink.
     std::fs::create_dir_all(opt_dir)?;
     let opt_link = opt_dir.join(name);
     let rel_target = relative_from_to(opt_dir, keg_path);
@@ -183,6 +210,30 @@ mod tests {
 
         assert!(link_path.is_symlink());
         assert!(stale_temp.symlink_metadata().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_cleans_stale_temp_dir() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+        let opt_dir = prefix.join("opt");
+
+        std::fs::create_dir_all(&source)?;
+        std::fs::write(source.join("file.txt"), "data")?;
+
+        // Create a stale temp keg directory.
+        let stale_temp = prefix.join("Cellar/formula/.1.0.brewdock-tmp");
+        std::fs::create_dir_all(&stale_temp)?;
+        std::fs::write(stale_temp.join("stale.txt"), "old")?;
+
+        materialize(&source, &keg_path, &opt_dir, "formula")?;
+
+        assert!(keg_path.join("file.txt").exists());
+        assert!(!stale_temp.exists());
+        assert!(opt_dir.join("formula").is_symlink());
         Ok(())
     }
 

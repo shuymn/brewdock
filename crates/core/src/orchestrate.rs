@@ -1011,6 +1011,16 @@ fn cleanup_failed_install(
         std::fs::remove_dir_all(keg_path)?;
     }
 
+    // Clean up temp keg left by an interrupted atomic materialize.
+    if let Some(parent) = keg_path.parent()
+        && let Some(version) = keg_path.file_name().and_then(|n| n.to_str())
+    {
+        let temp_keg = parent.join(format!(".{version}.brewdock-tmp"));
+        if temp_keg.exists() {
+            std::fs::remove_dir_all(&temp_keg)?;
+        }
+    }
+
     Ok(())
 }
 
