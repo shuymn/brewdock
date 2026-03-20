@@ -120,3 +120,48 @@ None.
   - Executable doc: `cargo test -p brewdock-cli -- dry_run`; `cargo test -p brewdock-cli -- verbose`
   - Why not split vertically further?: dry-run・verbose・quiet・error hint は同一 UX layer; 個別 PR にする価値が薄い
   - Escalate if: tracing-subscriber の構成が verbose/quiet の要件と合わない場合
+
+- [ ] Theme: Compatible bottle selection + install method planning
+  - Outcome: `install` / `upgrade` / `--dry-run` が exact host tag だけでなく互換 bottle tag も選べるようになり、formula ごとに `Bottle` か `Source` の install method を一貫して解決できる
+  - Goal: bottle selector 導入、`SelectedBottle` と `InstallMethod` 追加、supportability 判定を method planning 前提へ切り替える
+  - Must Not Break: `/opt/homebrew` 前提と `Layout` 経由の path 解決を維持する; 既存 bottle install 成功系を壊さない; `task check` green
+  - Non-goals: `post_install` 実行; source build 実行; tap/cask 対応
+  - Acceptance (EARS):
+    - When the host tag has no exact bottle and an older compatible bottle or `all` bottle exists, the system shall select the highest-priority compatible bottle
+    - When a formula has `post_install_defined=true`, the system shall remain plannable if an install method can still be resolved
+    - If neither a compatible bottle nor a source build plan can be resolved, the system shall return unsupported
+  - Evidence: `run=task test; oracle=selector exact/compatible/all tests, added formula JSON field deserialization tests, install/upgrade/dry-run method planning tests; visibility=independent; controls=[context]; missing=[]; companion=none; notes=CLI and core must show the same resolved method`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-formula -- selector`; `cargo test -p brewdock-formula -- supportability`; `cargo test -p brewdock-core -- install_method`; `cargo test -p brewdock-cli -- dry_run`
+  - Why not split vertically further?: selector だけ先に入れても install/upgrade/dry-run が別経路のままだと user-visible contract が閉じない
+  - Escalate if: Homebrew JSON API の追加 field が想定より不安定で source planning の contract を固定できない場合
+
+- [ ] Theme: Restricted `post_install` execution without Ruby runtime
+  - Outcome: 対応済み DSL だけを使う bottle formula は Ruby 実行環境なしで `post_install` を完了でき、失敗時は keg/receipt/state が残らない
+  - Goal: homebrew-core Ruby source 取得、`def post_install ... end` 抽出、限定 DSL parser/executor、orchestrator への安全な実行タイミング統合
+  - Must Not Break: unsupported syntax は fail-closed; receipt/state DB は成功時のみ更新; cleanup は失敗時に必須
+  - Non-goals: 任意 Ruby 実行; control flow 対応; helper method 呼び出し; tap formula 対応
+  - Acceptance (EARS):
+    - When `post_install_defined` is false, the system shall skip hook execution
+    - When a supported `post_install` block is present, the system shall execute it after `relocate_keg` and before `link`
+    - If unsupported syntax or command failure occurs, the system shall cleanup the keg and shall not write receipt or state DB records
+  - Evidence: `run=task test; oracle=post_install block extraction tests, supported DSL/path expression tests, success-path receipt/state persistence tests, failure-path cleanup tests; visibility=independent; controls=[context]; missing=[]; companion=none; notes=initial acceptance formulas are bat, curl, wget`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-cellar -- post_install`; `cargo test -p brewdock-core -- post_install`; `tests/vm-smoke-test.sh bat curl wget`
+  - Why not split vertically further?: parser 単体では安全性の主契約である cleanup と receipt/state 境界を検証できない
+  - Escalate if: 初期対象 formula の `post_install` が列挙済み DSL を超え、subset を広げないと acceptance formula を通せない場合
+
+- [ ] Theme: Generic source fallback build driver
+  - Outcome: 互換 bottle がない formula は generic build driver で source install を試行し、対応外 requirements は明示エラーで止まる
+  - Goal: `BuildPlan` 導入、build dependency closure install、tarball/git source fetch、build root extraction、generic builder 実装、install method 自動 fallback
+  - Must Not Break: source build に Ruby DSL 互換は持ち込まない; `uses_from_macos` は install 対象外; unsupported requirement は fail-closed
+  - Non-goals: patch/resource/vendor virtualenv; Linux/Intel; tap/cask; Homebrew DSL 全面互換
+  - Acceptance (EARS):
+    - When no compatible bottle exists and source metadata is available, the system shall resolve `InstallMethod::Source` and install into the keg path
+    - When build dependencies are declared, the system shall install their dependency closure before building the target formula
+    - If the build system or requirements are unsupported, the system shall fail explicitly and cleanup without writing receipt or state DB records
+  - Evidence: `run=task test; oracle=source plan selection tests, build success/failure cleanup tests, upgrade method reuse tests, representative source fallback VM smoke tests; visibility=independent; controls=[context]; missing=[]; companion=none; notes=initial acceptance formula is wakeonlan or sqlmap, final stop condition is 14 failing formulas green in VM smoke`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- source_fallback`; `cargo test -p brewdock-core -- upgrade`; `tests/vm-smoke-test.sh wakeonlan`
+  - Why not split vertically further?: planning と build execution を分けると fallback contract の本体である auto-switch と cleanup 条件が閉じない
+  - Escalate if: generic driver で対象 formula を通せず、Ruby formula DSL 互換を導入しないと Goal を満たせない場合
