@@ -39,7 +39,7 @@ None.
   - Why not split vertically further?: types・API・supportability・resolve は install の最小 consumer 単位; types だけ分離すると実データ検証不可
   - Escalate if: Homebrew JSON API のスキーマが想定と大幅に異なる場合
 
-- [ ] Theme: Bottle download + verify + extract
+- [x] Theme: Bottle download + verify + extract
   - Outcome: bottle の DL → SHA256 verify → gzip+tar 展開 → CAS store が動作
   - Goal: brewdock-bottle crate 実装（download, verify, extract, store）
   - Must Not Break: `task check` green; brewdock-formula の public API 不変
