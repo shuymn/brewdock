@@ -6,6 +6,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod commands;
+mod hint;
 
 #[cfg(test)]
 mod testutil;
@@ -62,7 +63,7 @@ async fn main() -> Result<()> {
         host_tag,
     );
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Install { formulae } => {
             commands::install::run(&orchestrator, &formulae, cli.dry_run, cli.quiet).await
         }
@@ -70,7 +71,15 @@ async fn main() -> Result<()> {
         Commands::Upgrade { formulae } => {
             commands::upgrade::run(&orchestrator, &formulae, cli.dry_run, cli.quiet).await
         }
+    };
+
+    if let Err(err) = &result
+        && let Some(hint) = hint::for_error(err)
+    {
+        eprintln!("hint: {hint}");
     }
+
+    result
 }
 
 /// Initializes the tracing subscriber based on verbosity flags.
