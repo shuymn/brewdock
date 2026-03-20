@@ -151,7 +151,7 @@ None.
   - Why not split vertically further?: parser 単体では安全性の主契約である cleanup と receipt/state 境界を検証できない
   - Escalate if: 初期対象 formula の `post_install` が列挙済み DSL を超え、subset を広げないと acceptance formula を通せない場合
 
-- [ ] Theme: Generalize post_install execution and remove formula-specific builtins
+- [x] Theme: Generalize post_install execution and remove formula-specific builtins
   - Outcome: formula 固有 builtin なしで実 formula の表記ゆれを吸収し、cert 系 acceptance を維持
   - Goal: `post_install` を full source AST parse + restricted lowering + schema normalization に置き換え、`ca-certificates` と `openssl@3` を generic path で installable にする
   - Must Not Break: runtime branch の unsupported は fail-closed; receipt/state DB は成功時のみ更新; rollback は `Mkpath` / `CopyFile` / `InstallSymlink` / `RemoveIfExists` を跨いで維持
@@ -161,7 +161,7 @@ None.
     - When `openssl@3.rb` is parsed and lowered under macOS runtime semantics, the system shall normalize the reachable filesystem effect into the dependent cert symlink schema without formula-name matching
     - If unsupported nodes remain in a runtime branch, the system shall fail explicitly before mutating receipt or state
     - If unsupported nodes exist only in a non-runtime branch such as `else` under `if OS.mac?`, the system shall not fail for that reason alone
-  - Evidence: `run=task check && cargo test -p brewdock-cellar post_install && cargo test -p brewdock-core post_install && ./tests/vm-smoke-test.sh --formula ca-certificates --formula openssl@3; oracle=fixture-based lowered operations and unsupported reasons plus targeted VM replay for cert formulas; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task check plus targeted VM smoke; notes=Prism-backed parser coverage must include helper resolution and runtime branch filtering`
+  - Evidence: `run=task check && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula jq --formula ca-certificates --formula openssl@3; oracle=fixture-based lowered operations and unsupported reasons plus targeted VM replay for cert formulas; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task check plus targeted VM smoke; notes=Prism-backed parser coverage includes helper resolution and runtime branch filtering; jq is included because the smoke script always performs jq deep verification`
   - Gates: `static`, `integration`, `system`
   - Executable doc: `cargo test -p brewdock-cellar -- post_install`; `cargo test -p brewdock-core -- post_install`; `./tests/vm-smoke-test.sh --formula ca-certificates --formula openssl@3`
   - Why not split vertically further?: parser backend だけ先に入れても formula-specific builtin が残る限り user-visible contract が閉じない
