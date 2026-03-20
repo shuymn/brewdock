@@ -1,5 +1,7 @@
 use std::{fmt, str::FromStr};
 
+use strum::{Display, EnumString};
+
 /// A platform identifier for Homebrew bottles (e.g., `arm64_sequoia`).
 ///
 /// Format: `{arch}_{codename}`.
@@ -50,7 +52,10 @@ impl HostTag {
         }
 
         let arch_str = String::from_utf8_lossy(&arch_output.stdout);
-        let arch: Arch = arch_str.trim().parse()?;
+        let arch: Arch = arch_str
+            .trim()
+            .parse()
+            .map_err(|_parse_error| PlatformError::Unsupported)?;
 
         let codename = macos_codename(version.major)?;
         format!("{arch}_{codename}").parse()
@@ -91,35 +96,11 @@ impl fmt::Display for HostTag {
 }
 
 /// CPU architecture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString)]
 pub enum Arch {
     /// 64-bit ARM (Apple Silicon).
+    #[strum(to_string = "arm64", serialize = "aarch64")]
     Arm64,
-}
-
-impl FromStr for Arch {
-    type Err = PlatformError;
-
-    /// Parses an architecture string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::Unsupported`] if the architecture is not
-    /// recognized.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "arm64" | "aarch64" => Ok(Self::Arm64),
-            _ => Err(PlatformError::Unsupported),
-        }
-    }
-}
-
-impl fmt::Display for Arch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Arm64 => f.write_str("arm64"),
-        }
-    }
 }
 
 /// macOS version.
@@ -254,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arch_arm64() -> Result<(), PlatformError> {
+    fn test_arch_arm64() -> Result<(), Box<dyn std::error::Error>> {
         let arch: Arch = "arm64".parse()?;
         assert_eq!(arch, Arch::Arm64);
         assert_eq!(arch.to_string(), "arm64");
@@ -262,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arch_aarch64_alias() -> Result<(), PlatformError> {
+    fn test_arch_aarch64_alias() -> Result<(), Box<dyn std::error::Error>> {
         let arch: Arch = "aarch64".parse()?;
         assert_eq!(arch, Arch::Arm64);
         Ok(())

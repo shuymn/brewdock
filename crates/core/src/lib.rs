@@ -8,7 +8,7 @@ pub mod lock;
 pub mod orchestrate;
 pub mod platform;
 
-pub use brewdock_bottle::{BottleDownloader, HttpBottleDownloader};
+pub use brewdock_bottle::{BottleDownloader, HttpBottleDownloader, Sha256Hex};
 pub use brewdock_formula::{FormulaRepository, HttpFormulaRepository};
 pub use error::BrewdockError;
 pub use layout::Layout;

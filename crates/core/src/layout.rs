@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// All paths are derived from a root directory. In production, the root is `/`,
 /// so the Homebrew prefix is `/opt/homebrew`. For testing, use [`Layout::with_root`]
 /// to isolate paths under a temporary directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[must_use]
 pub struct Layout {
     prefix: PathBuf,

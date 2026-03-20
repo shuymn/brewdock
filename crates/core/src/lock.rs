@@ -5,6 +5,7 @@ use fs2::FileExt;
 /// Advisory file lock for preventing concurrent brewdock operations.
 ///
 /// The lock is held for the lifetime of this value. Dropping releases the lock.
+#[derive(Debug)]
 pub struct FileLock {
     _file: std::fs::File,
 }

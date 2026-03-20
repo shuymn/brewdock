@@ -2,12 +2,12 @@ use std::collections::{HashSet, VecDeque};
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
-    InstallReceipt, InstallRecord, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
-    StateDb, link, materialize, relocate_keg, unlink, write_receipt,
+    InstallReason, InstallReceipt, InstallRecord, ReceiptDependency, ReceiptSource,
+    ReceiptSourceVersions, StateDb, link, materialize, relocate_keg, unlink, write_receipt,
 };
 use brewdock_formula::{
-    Formula, FormulaCache, FormulaError, FormulaRepository, error::UnsupportedReason,
-    resolve::resolve_install_order, supportability::check_supportability,
+    Formula, FormulaCache, FormulaError, FormulaRepository, UnsupportedReason,
+    check_supportability, resolve_install_order,
 };
 
 use crate::{BrewdockError, HostTag, Layout, lock::FileLock};
@@ -19,7 +19,7 @@ const TAP_NAME: &str = "homebrew/core";
 const FORMULA_PATH_PREFIX: &str = "@@HOMEBREW_PREFIX@@/Library/Taps/homebrew/homebrew-core/Formula";
 
 /// Entry in an install plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
     /// Formula name.
     pub name: String,
@@ -28,7 +28,7 @@ pub struct PlanEntry {
 }
 
 /// Entry in an upgrade plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradePlanEntry {
     /// Formula name.
     pub name: String,
@@ -53,6 +53,14 @@ pub struct Orchestrator<R, D> {
     host_tag: HostTag,
 }
 
+#[derive(Debug, Clone)]
+struct UpgradeCandidate {
+    record: InstallRecord,
+    formula: Formula,
+    current_version: String,
+    latest_version: String,
+}
+
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Creates a new orchestrator.
     #[must_use]
@@ -73,7 +81,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// # Errors
     ///
     /// Returns [`BrewdockError`] if resolution or validation fails.
-    pub async fn plan_install(&self, names: &[String]) -> Result<Vec<PlanEntry>, BrewdockError> {
+    pub async fn plan_install(&self, names: &[&str]) -> Result<Vec<PlanEntry>, BrewdockError> {
         let _lock = self.acquire_lock()?;
         let (to_install, cache) = self.resolve_install_list(names).await?;
         let entries = to_install
@@ -99,12 +107,12 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if any step fails. Unsupported formulae are
     /// rejected before any download begins.
-    pub async fn install(&self, names: &[String]) -> Result<Vec<String>, BrewdockError> {
+    pub async fn install(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
         let _lock = self.acquire_lock()?;
         let (to_install, cache) = self.resolve_install_list(names).await?;
 
         // Install each in order.
-        let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let requested: HashSet<&str> = names.iter().copied().collect();
         let blob_store = BlobStore::new(&self.layout.blob_dir());
         for name in &to_install {
             self.install_single(name, &cache, &requested, &blob_store)
@@ -139,31 +147,18 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Returns [`BrewdockError`] if resolution or validation fails.
     pub async fn plan_upgrade(
         &self,
-        names: &[String],
+        names: &[&str],
     ) -> Result<Vec<UpgradePlanEntry>, BrewdockError> {
         let _lock = self.acquire_lock()?;
-        let installed = self.fetch_installed_records(names)?;
-        let host_tag = self.host_tag.as_str();
-
-        let mut entries = Vec::new();
-        for record in &installed {
-            let formula = self.repo.get_formula(&record.name).await?;
-            check_supportability(&formula, host_tag)?;
-
-            let current_version = pkg_version(&record.version, record.revision);
-            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
-            if current_version == latest_version {
-                continue;
-            }
-
-            entries.push(UpgradePlanEntry {
-                name: record.name.clone(),
-                from_version: current_version,
-                to_version: latest_version,
-            });
-        }
-
-        Ok(entries)
+        let candidates = self.collect_upgrade_candidates(names).await?;
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| UpgradePlanEntry {
+                name: candidate.record.name,
+                from_version: candidate.current_version,
+                to_version: candidate.latest_version,
+            })
+            .collect())
     }
 
     /// Upgrades installed formulae to their latest versions.
@@ -176,28 +171,18 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// # Errors
     ///
     /// Returns [`BrewdockError`] if any step fails.
-    pub async fn upgrade(&self, names: &[String]) -> Result<Vec<String>, BrewdockError> {
+    pub async fn upgrade(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
         let _lock = self.acquire_lock()?;
-        let installed = self.fetch_installed_records(names)?;
-        let host_tag = self.host_tag.as_str();
+        let candidates = self.collect_upgrade_candidates(names).await?;
 
         let mut upgraded = Vec::new();
         let blob_store = BlobStore::new(&self.layout.blob_dir());
 
-        for record in &installed {
-            let formula = self.repo.get_formula(&record.name).await?;
-            check_supportability(&formula, host_tag)?;
-
-            let current_version = pkg_version(&record.version, record.revision);
-            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
-            if current_version == latest_version {
-                continue;
-            }
-
+        for candidate in candidates {
             tracing::info!(
-                name = record.name,
-                from = current_version,
-                to = latest_version,
+                name = candidate.record.name,
+                from = candidate.current_version,
+                to = candidate.latest_version,
                 "upgrading formula"
             );
 
@@ -206,8 +191,8 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             let old_keg = self
                 .layout
                 .cellar()
-                .join(&record.name)
-                .join(&current_version);
+                .join(&candidate.record.name)
+                .join(&candidate.current_version);
             if old_keg.exists() {
                 unlink(&old_keg, self.layout.prefix())?;
             }
@@ -217,19 +202,19 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             // resolved or installed here (see Non-goals: partial failure recovery).
             let cache = {
                 let mut c = FormulaCache::new();
-                c.insert(formula);
+                c.insert(candidate.formula);
                 c
             };
             // Preserve the original installed_on_request status from the record.
-            let requested: HashSet<&str> = if record.installed_on_request {
-                std::iter::once(record.name.as_str()).collect()
+            let requested: HashSet<&str> = if candidate.record.installed_on_request {
+                std::iter::once(candidate.record.name.as_str()).collect()
             } else {
                 HashSet::new()
             };
-            self.install_single(&record.name, &cache, &requested, &blob_store)
+            self.install_single(&candidate.record.name, &cache, &requested, &blob_store)
                 .await?;
 
-            upgraded.push(record.name.clone());
+            upgraded.push(candidate.record.name);
         }
 
         Ok(upgraded)
@@ -240,16 +225,13 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// If `names` is empty, returns all installed records. Otherwise, returns
     /// only records matching the given names. `StateDb` is opened and dropped
     /// within this call to avoid holding it across `.await` boundaries.
-    fn fetch_installed_records(
-        &self,
-        names: &[String],
-    ) -> Result<Vec<InstallRecord>, BrewdockError> {
+    fn fetch_installed_records(&self, names: &[&str]) -> Result<Vec<InstallRecord>, BrewdockError> {
         let state_db = StateDb::open(&self.layout.db_path())?;
         if names.is_empty() {
             Ok(state_db.list()?)
         } else {
             let mut records = Vec::new();
-            for name in names {
+            for &name in names {
                 if let Some(record) = state_db.get(name)? {
                     records.push(record);
                 }
@@ -262,7 +244,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// and filter already-installed.
     async fn resolve_install_list(
         &self,
-        names: &[String],
+        names: &[&str],
     ) -> Result<(Vec<String>, FormulaCache), BrewdockError> {
         let cache = self.fetch_with_deps(names).await?;
 
@@ -293,9 +275,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     }
 
     /// Fetches formulae and all transitive dependencies.
-    async fn fetch_with_deps(&self, names: &[String]) -> Result<FormulaCache, BrewdockError> {
+    async fn fetch_with_deps(&self, names: &[&str]) -> Result<FormulaCache, BrewdockError> {
         let mut cache = FormulaCache::new();
-        let mut queue: VecDeque<String> = names.iter().cloned().collect();
+        let mut queue: VecDeque<String> = names.iter().map(|name| (*name).to_owned()).collect();
 
         while let Some(name) = queue.pop_front() {
             if cache.get(&name).is_some() {
@@ -311,6 +293,35 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         }
 
         Ok(cache)
+    }
+
+    async fn collect_upgrade_candidates(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<UpgradeCandidate>, BrewdockError> {
+        let installed = self.fetch_installed_records(names)?;
+        let host_tag = self.host_tag.as_str();
+        let mut candidates = Vec::new();
+
+        for record in installed {
+            let formula = self.repo.get_formula(&record.name).await?;
+            check_supportability(&formula, host_tag)?;
+
+            let current_version = pkg_version(&record.version, record.revision);
+            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
+            if current_version == latest_version {
+                continue;
+            }
+
+            candidates.push(UpgradeCandidate {
+                record,
+                formula,
+                current_version,
+                latest_version,
+            });
+        }
+
+        Ok(candidates)
     }
 
     /// Installs a single formula (download → extract → materialize → link → receipt → state).
@@ -360,7 +371,8 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         blob_store.put(&bottle_file.sha256, &data)?;
 
         let extract_dir = self.layout.store_dir().join(&bottle_file.sha256);
-        extract_tar_gz(&blob_store.blob_path(&bottle_file.sha256), &extract_dir)?;
+        let blob_path = blob_store.blob_path(&bottle_file.sha256)?;
+        extract_tar_gz(&blob_path, &extract_dir)?;
 
         let version_str = pkg_version(&formula.versions.stable, formula.revision);
         let source = extract_dir.join(&formula.name).join(&version_str);
@@ -376,8 +388,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let receipt_deps = build_receipt_deps(formula, cache);
         let receipt_source = build_receipt_source(formula);
         let receipt = InstallReceipt::for_bottle(
-            !is_requested,
-            is_requested,
+            if is_requested {
+                InstallReason::OnRequest
+            } else {
+                InstallReason::AsDependency
+            },
             Some(unix_timestamp_f64()),
             receipt_deps,
             receipt_source,
@@ -467,10 +482,7 @@ mod tests {
     };
 
     use brewdock_bottle::BottleError;
-    use brewdock_formula::{
-        CellarType,
-        types::{BottleFile, BottleSpec, BottleStable, Versions},
-    };
+    use brewdock_formula::{BottleFile, BottleSpec, BottleStable, CellarType, Versions};
 
     use super::*;
 
@@ -604,13 +616,11 @@ mod tests {
         bottles: Vec<(&str, Vec<u8>)>,
         counter: Arc<AtomicUsize>,
         layout: Layout,
-    ) -> Orchestrator<MockRepo, MockDownloader> {
-        // SAFETY: HOST_TAG is a valid host tag constant.
-        #[expect(clippy::unwrap_used, reason = "test-only constant parsing")]
-        let host_tag: HostTag = HOST_TAG.parse().ok().unwrap();
+    ) -> Result<Orchestrator<MockRepo, MockDownloader>, BrewdockError> {
+        let host_tag: HostTag = HOST_TAG.parse()?;
         let repo = MockRepo::new(formulae);
         let downloader = MockDownloader::new(bottles, counter);
-        Orchestrator::new(repo, downloader, layout, host_tag)
+        Ok(Orchestrator::new(repo, downloader, layout, host_tag))
     }
 
     // --- Install tests ---
@@ -621,8 +631,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let sha_a = "sha256_a";
-        let sha_b = "sha256_b";
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let formula_a = make_formula("a", "1.0", &["b"], sha_a);
         let formula_b = make_formula("b", "2.0", &[], sha_b);
 
@@ -635,9 +645,9 @@ mod tests {
             vec![(sha_a, tar_a), (sha_b, tar_b)],
             counter.clone(),
             layout.clone(),
-        );
+        )?;
 
-        let installed = orchestrator.install(&["a".to_owned()]).await?;
+        let installed = orchestrator.install(&["a"]).await?;
 
         // "b" must be installed before "a" (topological order).
         assert_eq!(installed, vec!["b", "a"]);
@@ -678,8 +688,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let sha_a = "sha256_a";
-        let sha_b = "sha256_b";
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let formula_a = make_formula("a", "1.0", &["b"], sha_a);
         let formula_b = make_formula("b", "2.0", &[], sha_b);
 
@@ -703,9 +713,9 @@ mod tests {
             vec![(sha_a, tar_a), (sha_b, tar_b)],
             counter.clone(),
             layout.clone(),
-        );
+        )?;
 
-        let installed = orchestrator.install(&["a".to_owned()]).await?;
+        let installed = orchestrator.install(&["a"]).await?;
 
         // Only "a" should be installed; "b" is skipped.
         assert_eq!(installed, vec!["a"]);
@@ -721,14 +731,19 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let mut formula = make_formula("disabled_pkg", "1.0", &[], "sha_disabled");
+        let mut formula = make_formula(
+            "disabled_pkg",
+            "1.0",
+            &[],
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        );
         formula.disabled = true;
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator =
-            make_orchestrator(vec![formula], vec![], counter.clone(), layout.clone());
+            make_orchestrator(vec![formula], vec![], counter.clone(), layout.clone())?;
 
-        let result = orchestrator.install(&["disabled_pkg".to_owned()]).await;
+        let result = orchestrator.install(&["disabled_pkg"]).await;
 
         assert!(result.is_err());
 
@@ -771,7 +786,7 @@ mod tests {
         drop(state_db);
 
         // Mock repo returns v2.0.
-        let sha = "sha256_new";
+        let sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let formula = make_formula("a", "2.0", &[], sha);
         let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new_version")])?;
 
@@ -781,9 +796,9 @@ mod tests {
             vec![(sha, tar)],
             counter.clone(),
             layout.clone(),
-        );
+        )?;
 
-        let upgraded = orchestrator.upgrade(&["a".to_owned()]).await?;
+        let upgraded = orchestrator.upgrade(&["a"]).await?;
 
         assert_eq!(upgraded, vec!["a"]);
 
@@ -824,12 +839,17 @@ mod tests {
         })?;
         drop(state_db);
 
-        let formula = make_formula("a", "1.0", &[], "sha_same");
+        let formula = make_formula(
+            "a",
+            "1.0",
+            &[],
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        );
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator =
-            make_orchestrator(vec![formula], vec![], counter.clone(), layout.clone());
+            make_orchestrator(vec![formula], vec![], counter.clone(), layout.clone())?;
 
-        let upgraded = orchestrator.upgrade(&["a".to_owned()]).await?;
+        let upgraded = orchestrator.upgrade(&["a"]).await?;
 
         // Nothing upgraded.
         assert!(upgraded.is_empty());
@@ -844,12 +864,22 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let formula_a = make_formula("a", "1.0", &[], "sha_a");
-        let formula_b = make_formula("b", "2.0", &[], "sha_b");
+        let formula_a = make_formula(
+            "a",
+            "1.0",
+            &[],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let formula_b = make_formula(
+            "b",
+            "2.0",
+            &[],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator =
-            make_orchestrator(vec![formula_a, formula_b], vec![], counter, layout.clone());
+            make_orchestrator(vec![formula_a, formula_b], vec![], counter, layout.clone())?;
 
         let count = orchestrator.update().await?;
         assert_eq!(count, 2);
