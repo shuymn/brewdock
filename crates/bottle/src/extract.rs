@@ -14,6 +14,10 @@ pub fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), BottleError> {
     let file = std::fs::File::open(archive)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
+    // Homebrew bottles are built as root. Without this, tar tries to chown
+    // every entry, which fails as a non-root user (equivalent to tar's
+    // --no-same-owner flag).
+    archive.set_preserve_ownerships(false);
     archive.unpack(dest)?;
     Ok(())
 }
