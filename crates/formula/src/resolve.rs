@@ -16,7 +16,7 @@ use crate::{
 /// Returns [`FormulaError::NotFound`] if a dependency is missing from the map.
 pub fn resolve_install_order<S: ::std::hash::BuildHasher>(
     formulae: &HashMap<String, Formula, S>,
-    requested: &[String],
+    requested: &[&str],
 ) -> Result<Vec<String>, FormulaError> {
     let mut state: HashMap<&str, VisitState> = HashMap::new();
     let mut result = Vec::new();
@@ -76,7 +76,7 @@ fn visit<'a, S: ::std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::test_formula;
+    use crate::test_support::test_formula;
 
     fn make_map(formulae: Vec<Formula>) -> HashMap<String, Formula> {
         formulae.into_iter().map(|f| (f.name.clone(), f)).collect()
@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn test_resolve_no_deps() -> Result<(), FormulaError> {
         let formulae = make_map(vec![test_formula("a", &[])]);
-        let order = resolve_install_order(&formulae, &["a".to_owned()])?;
+        let order = resolve_install_order(&formulae, &["a"])?;
         assert_eq!(order, vec!["a"]);
         Ok(())
     }
@@ -98,7 +98,7 @@ mod tests {
             test_formula("b", &["c"]),
             test_formula("c", &[]),
         ]);
-        let order = resolve_install_order(&formulae, &["a".to_owned()])?;
+        let order = resolve_install_order(&formulae, &["a"])?;
         assert_eq!(order, vec!["c", "b", "a"]);
         Ok(())
     }
@@ -112,7 +112,7 @@ mod tests {
             test_formula("c", &["d"]),
             test_formula("d", &[]),
         ]);
-        let order = resolve_install_order(&formulae, &["a".to_owned()])?;
+        let order = resolve_install_order(&formulae, &["a"])?;
 
         // d must come before b and c; b and c before a
         let pos = |name: &str| order.iter().position(|n| n == name);
@@ -134,7 +134,7 @@ mod tests {
             test_formula("b", &["c"]),
             test_formula("c", &["a"]),
         ]);
-        let err = resolve_install_order(&formulae, &["a".to_owned()]);
+        let err = resolve_install_order(&formulae, &["a"]);
         assert!(matches!(err, Err(FormulaError::CyclicDependency(_))));
     }
 
@@ -142,14 +142,14 @@ mod tests {
     fn test_resolve_self_cycle() {
         // a -> a
         let formulae = make_map(vec![test_formula("a", &["a"])]);
-        let err = resolve_install_order(&formulae, &["a".to_owned()]);
+        let err = resolve_install_order(&formulae, &["a"]);
         assert!(matches!(err, Err(FormulaError::CyclicDependency(_))));
     }
 
     #[test]
     fn test_resolve_missing_dependency() {
         let formulae = make_map(vec![test_formula("a", &["missing"])]);
-        let err = resolve_install_order(&formulae, &["a".to_owned()]);
+        let err = resolve_install_order(&formulae, &["a"]);
         assert!(matches!(err, Err(FormulaError::NotFound { .. })));
     }
 
@@ -161,7 +161,7 @@ mod tests {
             test_formula("b", &["c"]),
             test_formula("c", &[]),
         ]);
-        let order = resolve_install_order(&formulae, &["a".to_owned(), "b".to_owned()])?;
+        let order = resolve_install_order(&formulae, &["a", "b"])?;
 
         // c appears once, before both a and b
         let pos = |name: &str| order.iter().position(|n| n == name);
@@ -175,7 +175,7 @@ mod tests {
     fn test_resolve_already_in_order() -> Result<(), FormulaError> {
         // Requesting a formula twice should not duplicate
         let formulae = make_map(vec![test_formula("a", &[])]);
-        let order = resolve_install_order(&formulae, &["a".to_owned(), "a".to_owned()])?;
+        let order = resolve_install_order(&formulae, &["a", "a"])?;
         assert_eq!(order, vec!["a"]);
         Ok(())
     }

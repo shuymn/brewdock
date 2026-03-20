@@ -57,7 +57,7 @@ impl FormulaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::test_formula;
+    use crate::test_support::test_formula;
 
     #[test]
     fn test_cache_empty_by_default() {

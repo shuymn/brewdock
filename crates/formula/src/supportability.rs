@@ -65,7 +65,7 @@ fn unsupported(name: &str, reason: UnsupportedReason) -> FormulaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{error::UnsupportedReason, types::test_formula};
+    use crate::{error::UnsupportedReason, test_support::test_formula};
 
     const TAG: &str = "arm64_sequoia";
 

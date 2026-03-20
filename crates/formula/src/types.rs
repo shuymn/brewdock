@@ -8,7 +8,7 @@ use crate::cellar_type::CellarType;
 ///
 /// Only fields needed for bottle installation are included.
 /// Unknown fields in the JSON are silently ignored by serde.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Formula {
     /// Formula name (e.g., `jq`).
     pub name: String,
@@ -48,7 +48,7 @@ pub struct Formula {
 }
 
 /// Version information for a formula.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Versions {
     /// Stable version string.
     pub stable: String,
@@ -62,14 +62,14 @@ pub struct Versions {
 }
 
 /// Wrapper for bottle specifications.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BottleSpec {
     /// Stable bottle specification.
     pub stable: Option<BottleStable>,
 }
 
 /// Stable bottle details.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottleStable {
     /// Rebuild counter.
     #[serde(default)]
@@ -84,7 +84,7 @@ pub struct BottleStable {
 }
 
 /// A single bottle file for a specific platform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottleFile {
     /// Cellar type controlling installation path.
     pub cellar: CellarType,
@@ -96,43 +96,10 @@ pub struct BottleFile {
     pub sha256: String,
 }
 
-/// Creates a minimal [`Formula`] for testing.
-#[cfg(test)]
-pub(crate) fn test_formula(name: &str, deps: &[&str]) -> Formula {
-    Formula {
-        name: name.to_owned(),
-        full_name: name.to_owned(),
-        versions: Versions {
-            stable: "1.0.0".to_owned(),
-            head: None,
-            bottle: true,
-        },
-        revision: 0,
-        bottle: BottleSpec {
-            stable: Some(BottleStable {
-                rebuild: 0,
-                root_url: "https://example.com".to_owned(),
-                files: HashMap::from([(
-                    "arm64_sequoia".to_owned(),
-                    BottleFile {
-                        cellar: CellarType::Any,
-                        url: "https://example.com/bottle.tar.gz".to_owned(),
-                        sha256: "deadbeef".to_owned(),
-                    },
-                )]),
-            }),
-        },
-        pour_bottle_only_if: None,
-        keg_only: false,
-        dependencies: deps.iter().map(|s| (*s).to_owned()).collect(),
-        disabled: false,
-        post_install_defined: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_formula;
 
     #[test]
     fn test_deserialize_jq_fixture() -> Result<(), Box<dyn std::error::Error>> {
