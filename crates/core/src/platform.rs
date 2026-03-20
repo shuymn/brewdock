@@ -67,7 +67,7 @@ impl HostTag {
     ///
     /// Always returns [`PlatformError::Unsupported`].
     #[cfg(not(target_os = "macos"))]
-    pub fn detect() -> Result<Self, PlatformError> {
+    pub const fn detect() -> Result<Self, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 }
