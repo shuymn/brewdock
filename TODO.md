@@ -73,7 +73,7 @@ None.
   - Why not split vertically further?: materialize → receipt → link → state は install 完了の最小単位; receipt なしの materialize は Homebrew 互換性を壊す
   - Escalate if: Homebrew の INSTALL_RECEIPT.json 形式が想定と大幅に異なる場合
 
-- [ ] Theme: Core orchestration + lock
+- [x] Theme: Core orchestration + lock
   - Outcome: mock API + tempdir で install/upgrade フロー全体が動作
   - Goal: brewdock-core に install/upgrade orchestrator と file lock を実装; 全 crate 統合
   - Must Not Break: `task check` green; 下位 crate の public API 不変
