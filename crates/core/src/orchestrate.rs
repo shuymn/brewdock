@@ -1,4 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+};
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
@@ -6,8 +9,8 @@ use brewdock_cellar::{
     ReceiptSourceVersions, StateDb, link, materialize, relocate_keg, unlink, write_receipt,
 };
 use brewdock_formula::{
-    Formula, FormulaCache, FormulaError, FormulaRepository, UnsupportedReason,
-    check_supportability, resolve_install_order,
+    Formula, FormulaCache, FormulaError, FormulaRepository, SelectedBottle, UnsupportedReason,
+    check_supportability, resolve_install_order, select_bottle,
 };
 
 use crate::{BrewdockError, HostTag, Layout, lock::FileLock};
@@ -25,6 +28,8 @@ pub struct PlanEntry {
     pub name: String,
     /// Version to install.
     pub version: String,
+    /// Resolved install method.
+    pub method: InstallMethod,
 }
 
 /// Entry in an upgrade plan.
@@ -36,6 +41,47 @@ pub struct UpgradePlanEntry {
     pub from_version: String,
     /// Version to upgrade to.
     pub to_version: String,
+    /// Resolved install method for the target version.
+    pub method: InstallMethod,
+}
+
+/// Resolved install method for a formula.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallMethod {
+    /// Install from a selected bottle.
+    Bottle(SelectedBottle),
+    /// Install from source using a generic build plan.
+    Source(SourceBuildPlan),
+}
+
+impl std::fmt::Display for InstallMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bottle(selected) => write!(f, "bottle:{tag}", tag = selected.tag),
+            Self::Source(_) => f.write_str("source"),
+        }
+    }
+}
+
+/// Minimal source build plan used for method planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBuildPlan {
+    /// Formula name.
+    pub formula_name: String,
+    /// Package version string.
+    pub version: String,
+    /// Source URL.
+    pub source_url: String,
+    /// Optional source checksum.
+    pub source_checksum: Option<String>,
+    /// Build dependencies for the source path.
+    pub build_dependencies: Vec<String>,
+    /// Runtime dependencies for the source path.
+    pub runtime_dependencies: Vec<String>,
+    /// Installation prefix.
+    pub prefix: PathBuf,
+    /// Target Cellar path.
+    pub cellar_path: PathBuf,
 }
 
 /// Orchestrates formula installation and upgrade operations.
@@ -59,6 +105,7 @@ struct UpgradeCandidate {
     formula: Formula,
     current_version: String,
     latest_version: String,
+    method: InstallMethod,
 }
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
@@ -93,6 +140,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 Ok(PlanEntry {
                     name: name.clone(),
                     version: pkg_version(&f.versions.stable, f.revision),
+                    method: self.resolve_install_method(f)?,
                 })
             })
             .collect::<Result<Vec<_>, BrewdockError>>()?;
@@ -157,6 +205,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 name: candidate.record.name,
                 from_version: candidate.current_version,
                 to_version: candidate.latest_version,
+                method: candidate.method,
             })
             .collect())
     }
@@ -306,6 +355,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         for record in installed {
             let formula = self.repo.get_formula(&record.name).await?;
             check_supportability(&formula, host_tag)?;
+            let method = self.resolve_install_method(&formula)?;
 
             let current_version = pkg_version(&record.version, record.revision);
             let latest_version = pkg_version(&formula.versions.stable, formula.revision);
@@ -318,6 +368,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 formula,
                 current_version,
                 latest_version,
+                method,
             });
         }
 
@@ -338,40 +389,41 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
             name: name.to_owned(),
         })?;
+        let method = self.resolve_install_method(formula)?;
 
-        let host_tag = self.host_tag.as_str();
-        let bottle_stable =
-            formula
-                .bottle
-                .stable
-                .as_ref()
-                .ok_or_else(|| FormulaError::Unsupported {
-                    name: name.to_owned(),
-                    reason: UnsupportedReason::NoBottle,
-                })?;
-        let bottle_file =
-            bottle_stable
-                .files
-                .get(host_tag)
-                .ok_or_else(|| FormulaError::Unsupported {
-                    name: name.to_owned(),
-                    reason: UnsupportedReason::NoBottleForTag(host_tag.to_owned()),
-                })?;
+        if formula.post_install_defined {
+            return Err(FormulaError::Unsupported {
+                name: name.to_owned(),
+                reason: UnsupportedReason::PostInstallDefined,
+            }
+            .into());
+        }
 
         tracing::info!(name, "installing formula");
+
+        let selected_bottle = match method {
+            InstallMethod::Bottle(selected) => selected,
+            InstallMethod::Source(_) => {
+                return Err(FormulaError::Unsupported {
+                    name: name.to_owned(),
+                    reason: UnsupportedReason::SourceBuildRequired,
+                }
+                .into());
+            }
+        };
 
         // Download (async).
         let data = self
             .downloader
-            .download_verified(&bottle_file.url, &bottle_file.sha256)
+            .download_verified(&selected_bottle.url, &selected_bottle.sha256)
             .await?;
 
         // All operations below are sync. StateDb is opened here, after the
         // last .await, so the future remains Send.
-        blob_store.put(&bottle_file.sha256, &data)?;
+        blob_store.put(&selected_bottle.sha256, &data)?;
 
-        let extract_dir = self.layout.store_dir().join(&bottle_file.sha256);
-        let blob_path = blob_store.blob_path(&bottle_file.sha256)?;
+        let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
+        let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
         extract_tar_gz(&blob_path, &extract_dir)?;
 
         let version_str = pkg_version(&formula.versions.stable, formula.revision);
@@ -411,6 +463,34 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         tracing::info!(name, "installation complete");
         Ok(())
     }
+
+    fn resolve_install_method(&self, formula: &Formula) -> Result<InstallMethod, FormulaError> {
+        if let Some(selected) = select_bottle(formula, self.host_tag.as_str()) {
+            return Ok(InstallMethod::Bottle(selected));
+        }
+
+        build_source_plan(formula, &self.layout)
+            .map(InstallMethod::Source)
+            .ok_or_else(|| FormulaError::Unsupported {
+                name: formula.name.clone(),
+                reason: UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
+            })
+    }
+}
+
+fn build_source_plan(formula: &Formula, layout: &Layout) -> Option<SourceBuildPlan> {
+    let stable = formula.urls.stable.as_ref()?;
+    let version = pkg_version(&formula.versions.stable, formula.revision);
+    Some(SourceBuildPlan {
+        formula_name: formula.name.clone(),
+        version: version.clone(),
+        source_url: stable.url.clone(),
+        source_checksum: stable.checksum.clone(),
+        build_dependencies: formula.build_dependencies.clone(),
+        runtime_dependencies: formula.dependencies.clone(),
+        prefix: layout.prefix().to_path_buf(),
+        cellar_path: layout.cellar().join(&formula.name).join(version),
+    })
 }
 
 /// Creates the package version string used in Cellar paths.
@@ -482,11 +562,14 @@ mod tests {
     };
 
     use brewdock_bottle::BottleError;
-    use brewdock_formula::{BottleFile, BottleSpec, BottleStable, CellarType, Versions};
+    use brewdock_formula::{
+        BottleFile, BottleSpec, BottleStable, CellarType, FormulaUrls, StableUrl, Versions,
+    };
 
     use super::*;
 
     const HOST_TAG: &str = "arm64_sequoia";
+    const PLAN_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     // --- Mock types ---
 
@@ -562,6 +645,7 @@ mod tests {
                 bottle: true,
             },
             revision: 0,
+            ruby_source_path: Some(format!("Formula/{name}.rb")),
             bottle: BottleSpec {
                 stable: Some(BottleStable {
                     rebuild: 0,
@@ -576,9 +660,18 @@ mod tests {
                     )]),
                 }),
             },
+            urls: FormulaUrls {
+                stable: Some(StableUrl {
+                    url: format!("https://example.com/{name}-{version}.tar.gz"),
+                    checksum: Some(sha256.to_owned()),
+                }),
+            },
             pour_bottle_only_if: None,
             keg_only: false,
             dependencies: deps.iter().map(|s| (*s).to_owned()).collect(),
+            build_dependencies: Vec::new(),
+            uses_from_macos: Vec::new(),
+            requirements: Vec::new(),
             disabled: false,
             post_install_defined: false,
         }
@@ -621,6 +714,23 @@ mod tests {
         let repo = MockRepo::new(formulae);
         let downloader = MockDownloader::new(bottles, counter);
         Ok(Orchestrator::new(repo, downloader, layout, host_tag))
+    }
+
+    fn move_host_bottle_to_tag(
+        formula: &mut Formula,
+        tag: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stable = formula
+            .bottle
+            .stable
+            .as_mut()
+            .ok_or("expected stable bottle metadata")?;
+        let bottle = stable
+            .files
+            .remove(HOST_TAG)
+            .ok_or("expected host bottle")?;
+        stable.files.insert(tag.to_owned(), bottle);
+        Ok(())
     }
 
     // --- Install tests ---
@@ -722,6 +832,103 @@ mod tests {
 
         // Only one download (for "a").
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_install_uses_compatible_bottle_method()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+        move_host_bottle_to_tag(&mut formula, "arm64_sonoma")?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
+
+        let plan = orchestrator.plan_install(&["a"]).await?;
+        let entry = plan.first().ok_or("expected install plan entry")?;
+        assert!(matches!(
+            &entry.method,
+            InstallMethod::Bottle(selected) if selected.tag == "arm64_sonoma"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_install_uses_source_method_when_bottle_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+        formula.versions.bottle = false;
+        formula.bottle.stable = None;
+        formula.build_dependencies = vec!["pkgconf".to_owned()];
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
+
+        let plan = orchestrator.plan_install(&["a"]).await?;
+        let entry = plan.first().ok_or("expected install plan entry")?;
+        assert!(matches!(
+            &entry.method,
+            InstallMethod::Source(source)
+                if source.formula_name == "a"
+                    && source.prefix == layout.prefix()
+                    && source.cellar_path == layout.cellar().join("a/1.0")
+                    && source.build_dependencies == vec!["pkgconf".to_owned()]
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_install_keeps_post_install_formula_plannable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+        formula.post_install_defined = true;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
+
+        let plan = orchestrator.plan_install(&["a"]).await?;
+        let entry = plan.first().ok_or("expected install plan entry")?;
+        assert!(matches!(&entry.method, InstallMethod::Bottle(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_upgrade_reuses_install_method_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let state_db = StateDb::open(&layout.db_path())?;
+        state_db.insert(&InstallRecord {
+            name: "a".to_owned(),
+            version: "1.0".to_owned(),
+            revision: 0,
+            installed_on_request: true,
+            installed_at: "1000".to_owned(),
+        })?;
+        drop(state_db);
+
+        let mut formula = make_formula("a", "2.0", &[], PLAN_SHA);
+        move_host_bottle_to_tag(&mut formula, "arm64_sonoma")?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
+
+        let plan = orchestrator.plan_upgrade(&["a"]).await?;
+        let entry = plan.first().ok_or("expected upgrade plan entry")?;
+        assert!(matches!(
+            &entry.method,
+            InstallMethod::Bottle(selected) if selected.tag == "arm64_sonoma"
+        ));
         Ok(())
     }
 

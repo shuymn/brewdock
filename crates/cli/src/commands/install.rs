@@ -1,5 +1,7 @@
+use std::fmt::Write;
+
 use anyhow::{Context, Result};
-use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
+use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator, PlanEntry};
 
 /// Runs the install command.
 ///
@@ -20,14 +22,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
             .await
             .context("install planning failed")?;
         if !quiet {
-            if plan.is_empty() {
-                println!("Nothing to install");
-            } else {
-                println!("Would install:");
-                for entry in &plan {
-                    println!("  {} {}", entry.name, entry.version);
-                }
-            }
+            print!("{}", render_install_plan(&plan));
         }
         return Ok(());
     }
@@ -44,11 +39,27 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     Ok(())
 }
 
+fn render_install_plan(plan: &[PlanEntry]) -> String {
+    if plan.is_empty() {
+        return "Nothing to install\n".to_owned();
+    }
+
+    let mut output = String::from("Would install:\n");
+    for entry in plan {
+        let _ = writeln!(
+            output,
+            "  {} {} [{}]",
+            entry.name, entry.version, entry.method
+        );
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, atomic::AtomicUsize};
 
-    use brewdock_core::Layout;
+    use brewdock_core::{InstallMethod, Layout, PlanEntry, SourceBuildPlan};
 
     use super::*;
     use crate::testutil::{SHA_A, SHA_B, create_bottle_tar_gz, make_formula, make_orchestrator};
@@ -148,5 +159,39 @@ mod tests {
         assert!(!layout.cellar().join("a").exists());
         assert!(!layout.cellar().join("b").exists());
         Ok(())
+    }
+
+    #[test]
+    fn test_render_install_plan_includes_method() {
+        let plan = vec![
+            PlanEntry {
+                name: "a".to_owned(),
+                version: "1.0".to_owned(),
+                method: InstallMethod::Bottle(brewdock_formula::SelectedBottle {
+                    tag: "arm64_sonoma".to_owned(),
+                    url: "https://example.com/a.tar.gz".to_owned(),
+                    sha256: SHA_A.to_owned(),
+                    cellar: brewdock_formula::CellarType::Any,
+                }),
+            },
+            PlanEntry {
+                name: "b".to_owned(),
+                version: "2.0".to_owned(),
+                method: InstallMethod::Source(SourceBuildPlan {
+                    formula_name: "b".to_owned(),
+                    version: "2.0".to_owned(),
+                    source_url: "https://example.com/b-2.0.tar.gz".to_owned(),
+                    source_checksum: Some(SHA_B.to_owned()),
+                    build_dependencies: Vec::new(),
+                    runtime_dependencies: Vec::new(),
+                    prefix: std::path::PathBuf::from("/opt/homebrew"),
+                    cellar_path: std::path::PathBuf::from("/opt/homebrew/Cellar/b/2.0"),
+                }),
+            },
+        ];
+
+        let rendered = render_install_plan(&plan);
+        assert!(rendered.contains("a 1.0 [bottle:arm64_sonoma]"));
+        assert!(rendered.contains("b 2.0 [source]"));
     }
 }

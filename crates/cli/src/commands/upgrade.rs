@@ -1,5 +1,7 @@
+use std::fmt::Write;
+
 use anyhow::{Context, Result};
-use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
+use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator, UpgradePlanEntry};
 
 /// Runs the upgrade command.
 ///
@@ -20,17 +22,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
             .await
             .context("upgrade planning failed")?;
         if !quiet {
-            if plan.is_empty() {
-                println!("Already up-to-date");
-            } else {
-                println!("Would upgrade:");
-                for entry in &plan {
-                    println!(
-                        "  {} {} -> {}",
-                        entry.name, entry.from_version, entry.to_version
-                    );
-                }
-            }
+            print!("{}", render_upgrade_plan(&plan));
         }
         return Ok(());
     }
@@ -51,12 +43,28 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     Ok(())
 }
 
+fn render_upgrade_plan(plan: &[UpgradePlanEntry]) -> String {
+    if plan.is_empty() {
+        return "Already up-to-date\n".to_owned();
+    }
+
+    let mut output = String::from("Would upgrade:\n");
+    for entry in plan {
+        let _ = writeln!(
+            output,
+            "  {} {} -> {} [{}]",
+            entry.name, entry.from_version, entry.to_version, entry.method
+        );
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, atomic::AtomicUsize};
 
     use brewdock_cellar::{InstallRecord, StateDb};
-    use brewdock_core::Layout;
+    use brewdock_core::{InstallMethod, Layout, SourceBuildPlan, UpgradePlanEntry};
 
     use super::*;
     use crate::testutil::{SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator};
@@ -157,5 +165,27 @@ mod tests {
         let record = state_db.get("a")?.ok_or("expected record")?;
         assert_eq!(record.version, "1.0");
         Ok(())
+    }
+
+    #[test]
+    fn test_render_upgrade_plan_includes_method() {
+        let plan = vec![UpgradePlanEntry {
+            name: "a".to_owned(),
+            from_version: "1.0".to_owned(),
+            to_version: "2.0".to_owned(),
+            method: InstallMethod::Source(SourceBuildPlan {
+                formula_name: "a".to_owned(),
+                version: "2.0".to_owned(),
+                source_url: "https://example.com/a-2.0.tar.gz".to_owned(),
+                source_checksum: Some(SHA_C.to_owned()),
+                build_dependencies: Vec::new(),
+                runtime_dependencies: Vec::new(),
+                prefix: std::path::PathBuf::from("/opt/homebrew"),
+                cellar_path: std::path::PathBuf::from("/opt/homebrew/Cellar/a/2.0"),
+            }),
+        }];
+
+        let rendered = render_upgrade_plan(&plan);
+        assert!(rendered.contains("a 1.0 -> 2.0 [source]"));
     }
 }

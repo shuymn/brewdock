@@ -9,7 +9,8 @@ use std::{
 use brewdock_bottle::BottleError;
 use brewdock_core::{BottleDownloader, FormulaRepository, HostTag, Layout, Orchestrator};
 use brewdock_formula::{
-    BottleFile, BottleSpec, BottleStable, CellarType, Formula, FormulaError, Versions,
+    BottleFile, BottleSpec, BottleStable, CellarType, Formula, FormulaError, FormulaUrls,
+    StableUrl, Versions,
 };
 
 pub const HOST_TAG: &str = "arm64_sequoia";
@@ -87,6 +88,7 @@ pub fn make_formula(name: &str, version: &str, deps: &[&str], sha256: &str) -> F
             bottle: true,
         },
         revision: 0,
+        ruby_source_path: Some(format!("Formula/{name}.rb")),
         bottle: BottleSpec {
             stable: Some(BottleStable {
                 rebuild: 0,
@@ -101,9 +103,18 @@ pub fn make_formula(name: &str, version: &str, deps: &[&str], sha256: &str) -> F
                 )]),
             }),
         },
+        urls: FormulaUrls {
+            stable: Some(StableUrl {
+                url: format!("https://example.com/{name}-{version}.tar.gz"),
+                checksum: Some(sha256.to_owned()),
+            }),
+        },
         pour_bottle_only_if: None,
         keg_only: false,
         dependencies: deps.iter().map(|s| (*s).to_owned()).collect(),
+        build_dependencies: Vec::new(),
+        uses_from_macos: Vec::new(),
+        requirements: Vec::new(),
         disabled: false,
         post_install_defined: false,
     }

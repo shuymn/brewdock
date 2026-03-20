@@ -121,7 +121,7 @@ None.
   - Why not split vertically further?: dry-run・verbose・quiet・error hint は同一 UX layer; 個別 PR にする価値が薄い
   - Escalate if: tracing-subscriber の構成が verbose/quiet の要件と合わない場合
 
-- [ ] Theme: Compatible bottle selection + install method planning
+- [x] Theme: Compatible bottle selection + install method planning
   - Outcome: `install` / `upgrade` / `--dry-run` が exact host tag だけでなく互換 bottle tag も選べるようになり、formula ごとに `Bottle` か `Source` の install method を一貫して解決できる
   - Goal: bottle selector 導入、`SelectedBottle` と `InstallMethod` 追加、supportability 判定を method planning 前提へ切り替える
   - Must Not Break: `/opt/homebrew` 前提と `Layout` 経由の path 解決を維持する; 既存 bottle install 成功系を壊さない; `task check` green
