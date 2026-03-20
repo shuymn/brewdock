@@ -188,10 +188,12 @@ pub enum PlatformError {
 #[cfg(target_os = "macos")]
 const fn macos_codename(major: u16) -> Result<&'static str, PlatformError> {
     match major {
+        26 => Ok("tahoe"),
         15 => Ok("sequoia"),
         14 => Ok("sonoma"),
         13 => Ok("ventura"),
         12 => Ok("monterey"),
+        11 => Ok("big_sur"),
         _ => Err(PlatformError::Unsupported),
     }
 }
@@ -229,6 +231,14 @@ mod tests {
     #[test]
     fn test_host_tag_round_trip() -> Result<(), PlatformError> {
         let original = "arm64_sonoma";
+        let tag: HostTag = original.parse()?;
+        assert_eq!(tag.to_string(), original);
+        Ok(())
+    }
+
+    #[test]
+    fn test_host_tag_round_trip_tahoe() -> Result<(), PlatformError> {
+        let original = "arm64_tahoe";
         let tag: HostTag = original.parse()?;
         assert_eq!(tag.to_string(), original);
         Ok(())

@@ -1,5 +1,9 @@
 use crate::{CellarType, Formula};
 
+const APPLE_SILICON_CODENAMES: &[&str] = &[
+    "tahoe", "sequoia", "sonoma", "ventura", "monterey", "big_sur",
+];
+
 /// A bottle selected for installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedBottle {
@@ -18,8 +22,8 @@ pub struct SelectedBottle {
 pub fn select_bottle(formula: &Formula, host_tag: &str) -> Option<SelectedBottle> {
     let stable = formula.bottle.stable.as_ref()?;
     bottle_candidates(host_tag).find_map(|candidate| {
-        stable.files.get(candidate).map(|file| SelectedBottle {
-            tag: candidate.to_owned(),
+        stable.files.get(&candidate).map(|file| SelectedBottle {
+            tag: candidate,
             url: file.url.clone(),
             sha256: file.sha256.clone(),
             cellar: file.cellar.clone(),
@@ -27,15 +31,33 @@ pub fn select_bottle(formula: &Formula, host_tag: &str) -> Option<SelectedBottle
     })
 }
 
-fn bottle_candidates(host_tag: &str) -> impl Iterator<Item = &str> {
-    let compatible = match host_tag {
-        "arm64_sequoia" => vec!["arm64_sequoia", "arm64_sonoma", "arm64_ventura", "all"],
-        "arm64_sonoma" => vec!["arm64_sonoma", "arm64_ventura", "all"],
-        "arm64_ventura" => vec!["arm64_ventura", "all"],
-        _ => vec![host_tag, "all"],
-    };
+fn bottle_candidates(host_tag: &str) -> impl Iterator<Item = String> {
+    let compatible =
+        apple_silicon_candidates(host_tag).unwrap_or_else(|| default_bottle_candidates(host_tag));
     compatible.into_iter()
 }
+
+fn apple_silicon_candidates(host_tag: &str) -> Option<Vec<String>> {
+    let codename = host_tag.strip_prefix("arm64_")?;
+    let index = APPLE_SILICON_CODENAMES
+        .iter()
+        .position(|candidate| *candidate == codename)?;
+    let mut candidates = APPLE_SILICON_CODENAMES[index..]
+        .iter()
+        .map(|candidate| format!("arm64_{candidate}"))
+        .collect::<Vec<_>>();
+    candidates.push("all".to_owned());
+    Some(candidates)
+}
+
+fn default_bottle_candidates(host_tag: &str) -> Vec<String> {
+    if host_tag == "all" {
+        vec!["all".to_owned()]
+    } else {
+        vec![host_tag.to_owned(), "all".to_owned()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +110,16 @@ mod tests {
         let selected =
             select_bottle(&formula, "arm64_sequoia").ok_or("expected all-tag fallback bottle")?;
         assert_eq!(selected.tag, "all");
+        Ok(())
+    }
+
+    #[test]
+    fn test_select_bottle_supports_future_arm64_tahoe_tag() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let formula = test_formula("jq", &[]);
+        let selected =
+            select_bottle(&formula, "arm64_tahoe").ok_or("expected tahoe fallback bottle")?;
+        assert_eq!(selected.tag, "arm64_sequoia");
         Ok(())
     }
 }
