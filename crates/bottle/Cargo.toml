@@ -11,6 +11,14 @@ description = "Bottle download, verification, and extraction for brewdock"
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
