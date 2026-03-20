@@ -90,7 +90,7 @@ None.
   - Why not split vertically further?: install orchestrator は formula → bottle → cellar の統合点; lock なしの install は data corruption リスク
   - Escalate if: 下位 crate の API が orchestrator の想定と合わない場合
 
-- [ ] Theme: CLI wiring
+- [x] Theme: CLI wiring
   - Outcome: `bd install <formula>` / `bd update` / `bd upgrade` が orchestrator 経由で動作
   - Goal: CLI コマンドを core の orchestrator に接続
   - Must Not Break: `task check` green; core の public API 不変
