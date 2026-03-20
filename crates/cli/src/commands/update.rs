@@ -32,19 +32,19 @@ mod tests {
     use brewdock_core::Layout;
 
     use super::*;
-    use crate::testutil::{make_formula, make_orchestrator};
+    use crate::testutil::{SHA_A, SHA_B, make_formula, make_orchestrator};
 
     #[tokio::test]
     async fn test_commands_update_caches_index() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let formula_a = make_formula("a", "1.0", &[], "sha_a");
-        let formula_b = make_formula("b", "2.0", &[], "sha_b");
+        let formula_a = make_formula("a", "1.0", &[], SHA_A);
+        let formula_b = make_formula("b", "2.0", &[], SHA_B);
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator =
-            make_orchestrator(vec![formula_a, formula_b], vec![], counter, layout.clone());
+            make_orchestrator(vec![formula_a, formula_b], vec![], counter, layout.clone())?;
 
         run(&orchestrator, false, false).await?;
 
@@ -62,9 +62,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let formula = make_formula("a", "1.0", &[], "sha_a");
+        let formula = make_formula("a", "1.0", &[], SHA_A);
         let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone());
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
 
         run(&orchestrator, true, false).await?;
 

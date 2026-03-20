@@ -12,9 +12,11 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
+    let formula_names: Vec<&str> = formulae.iter().map(String::as_str).collect();
+
     if dry_run {
         let plan = orchestrator
-            .plan_install(formulae)
+            .plan_install(&formula_names)
             .await
             .context("install planning failed")?;
         if !quiet {
@@ -31,7 +33,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     }
 
     let installed = orchestrator
-        .install(formulae)
+        .install(&formula_names)
         .await
         .context("install failed")?;
     if !quiet {
@@ -49,20 +51,19 @@ mod tests {
     use brewdock_core::Layout;
 
     use super::*;
-    use crate::testutil::{create_bottle_tar_gz, make_formula, make_orchestrator};
+    use crate::testutil::{SHA_A, SHA_B, create_bottle_tar_gz, make_formula, make_orchestrator};
 
     #[tokio::test]
     async fn test_commands_install_single_formula() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let sha = "sha_a";
-        let formula = make_formula("a", "1.0", &[], sha);
+        let formula = make_formula("a", "1.0", &[], SHA_A);
         let tar = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh\necho a")])?;
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator =
-            make_orchestrator(vec![formula], vec![(sha, tar)], counter, layout.clone());
+            make_orchestrator(vec![formula], vec![(SHA_A, tar)], counter, layout.clone())?;
 
         run(&orchestrator, &["a".to_owned()], false, false).await?;
 
@@ -76,10 +77,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let sha_a = "sha_a";
-        let sha_b = "sha_b";
-        let formula_a = make_formula("a", "1.0", &["b"], sha_a);
-        let formula_b = make_formula("b", "2.0", &[], sha_b);
+        let formula_a = make_formula("a", "1.0", &["b"], SHA_A);
+        let formula_b = make_formula("b", "2.0", &[], SHA_B);
 
         let tar_a = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh")])?;
         let tar_b = create_bottle_tar_gz("b", "2.0", &[("bin/b_tool", b"#!/bin/sh")])?;
@@ -87,10 +86,10 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator = make_orchestrator(
             vec![formula_a, formula_b],
-            vec![(sha_a, tar_a), (sha_b, tar_b)],
+            vec![(SHA_A, tar_a), (SHA_B, tar_b)],
             counter,
             layout.clone(),
-        );
+        )?;
 
         run(&orchestrator, &["a".to_owned()], false, false).await?;
 
@@ -104,17 +103,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let sha = "sha_a";
-        let formula = make_formula("a", "1.0", &[], sha);
+        let formula = make_formula("a", "1.0", &[], SHA_A);
         let tar = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh")])?;
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator = make_orchestrator(
             vec![formula],
-            vec![(sha, tar)],
+            vec![(SHA_A, tar)],
             counter.clone(),
             layout.clone(),
-        );
+        )?;
 
         run(&orchestrator, &["a".to_owned()], true, false).await?;
 
@@ -133,10 +131,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let sha_a = "sha_a";
-        let sha_b = "sha_b";
-        let formula_a = make_formula("a", "1.0", &["b"], sha_a);
-        let formula_b = make_formula("b", "2.0", &[], sha_b);
+        let formula_a = make_formula("a", "1.0", &["b"], SHA_A);
+        let formula_b = make_formula("b", "2.0", &[], SHA_B);
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator = make_orchestrator(
@@ -144,7 +140,7 @@ mod tests {
             vec![],
             counter.clone(),
             layout.clone(),
-        );
+        )?;
 
         run(&orchestrator, &["a".to_owned()], true, false).await?;
 

@@ -9,11 +9,13 @@ use std::{
 use brewdock_bottle::BottleError;
 use brewdock_core::{BottleDownloader, FormulaRepository, HostTag, Layout, Orchestrator};
 use brewdock_formula::{
-    CellarType, Formula, FormulaError,
-    types::{BottleFile, BottleSpec, BottleStable, Versions},
+    BottleFile, BottleSpec, BottleStable, CellarType, Formula, FormulaError, Versions,
 };
 
 pub const HOST_TAG: &str = "arm64_sequoia";
+pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 pub struct MockRepo {
     pub formulae: HashMap<String, Formula>,
@@ -139,10 +141,9 @@ pub fn make_orchestrator(
     bottles: Vec<(&str, Vec<u8>)>,
     counter: Arc<AtomicUsize>,
     layout: Layout,
-) -> Orchestrator<MockRepo, MockDownloader> {
-    #[expect(clippy::unwrap_used, reason = "test-only constant parsing")]
-    let host_tag: HostTag = HOST_TAG.parse().ok().unwrap();
+) -> Result<Orchestrator<MockRepo, MockDownloader>, brewdock_core::error::BrewdockError> {
+    let host_tag: HostTag = HOST_TAG.parse()?;
     let repo = MockRepo::new(formulae);
     let downloader = MockDownloader::new(bottles, counter);
-    Orchestrator::new(repo, downloader, layout, host_tag)
+    Ok(Orchestrator::new(repo, downloader, layout, host_tag))
 }

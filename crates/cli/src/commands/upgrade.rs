@@ -12,9 +12,11 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
+    let formula_names: Vec<&str> = formulae.iter().map(String::as_str).collect();
+
     if dry_run {
         let plan = orchestrator
-            .plan_upgrade(formulae)
+            .plan_upgrade(&formula_names)
             .await
             .context("upgrade planning failed")?;
         if !quiet {
@@ -34,7 +36,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     }
 
     let upgraded = orchestrator
-        .upgrade(formulae)
+        .upgrade(&formula_names)
         .await
         .context("upgrade failed")?;
     if !quiet {
@@ -57,7 +59,7 @@ mod tests {
     use brewdock_core::Layout;
 
     use super::*;
-    use crate::testutil::{create_bottle_tar_gz, make_formula, make_orchestrator};
+    use crate::testutil::{SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator};
 
     #[tokio::test]
     async fn test_commands_upgrade_installs_new_version() -> Result<(), Box<dyn std::error::Error>>
@@ -76,13 +78,12 @@ mod tests {
         })?;
         drop(state_db);
 
-        let sha = "sha_new";
-        let formula = make_formula("a", "2.0", &[], sha);
+        let formula = make_formula("a", "2.0", &[], SHA_C);
         let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator =
-            make_orchestrator(vec![formula], vec![(sha, tar)], counter, layout.clone());
+            make_orchestrator(vec![formula], vec![(SHA_C, tar)], counter, layout.clone())?;
 
         run(&orchestrator, &["a".to_owned()], false, false).await?;
 
@@ -105,9 +106,9 @@ mod tests {
         })?;
         drop(state_db);
 
-        let formula = make_formula("a", "1.0", &[], "sha_a");
+        let formula = make_formula("a", "1.0", &[], SHA_A);
         let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone());
+        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
 
         // Should succeed without error (nothing to upgrade).
         run(&orchestrator, &["a".to_owned()], false, false).await?;
@@ -130,17 +131,16 @@ mod tests {
         })?;
         drop(state_db);
 
-        let sha = "sha_new";
-        let formula = make_formula("a", "2.0", &[], sha);
+        let formula = make_formula("a", "2.0", &[], SHA_C);
         let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator = make_orchestrator(
             vec![formula],
-            vec![(sha, tar)],
+            vec![(SHA_C, tar)],
             counter.clone(),
             layout.clone(),
-        );
+        )?;
 
         run(&orchestrator, &["a".to_owned()], true, false).await?;
 

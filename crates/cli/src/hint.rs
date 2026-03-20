@@ -32,7 +32,7 @@ const fn hint_for_bottle(err: &BottleError) -> Option<&'static str> {
         BottleError::Auth(_) => {
             Some("registry authentication failed; check your internet connection")
         }
-        BottleError::Io(_) => None,
+        BottleError::InvalidSha256 { .. } | BottleError::Io(_) => None,
     }
 }
 
@@ -60,17 +60,21 @@ mod tests {
     }
 
     #[test]
-    fn test_hint_for_checksum_mismatch() {
-        let err: anyhow::Error = BrewdockError::Bottle(BottleError::ChecksumMismatch {
-            expected: "abc".to_owned(),
-            actual: "def".to_owned(),
-        })
-        .into();
+    fn test_hint_for_checksum_mismatch() -> Result<(), BottleError> {
+        let expected = brewdock_core::Sha256Hex::parse(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )?;
+        let actual = brewdock_core::Sha256Hex::parse(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )?;
+        let err: anyhow::Error =
+            BrewdockError::Bottle(BottleError::ChecksumMismatch { expected, actual }).into();
         let hint = for_error(&err);
         assert_eq!(
             hint,
             Some("run `bd update` to refresh the formula index, then retry")
         );
+        Ok(())
     }
 
     #[test]
