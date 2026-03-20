@@ -136,7 +136,7 @@ None.
   - Why not split vertically further?: selector だけ先に入れても install/upgrade/dry-run が別経路のままだと user-visible contract が閉じない
   - Escalate if: Homebrew JSON API の追加 field が想定より不安定で source planning の contract を固定できない場合
 
-- [ ] Theme: Restricted `post_install` execution without Ruby runtime
+- [x] Theme: Restricted `post_install` execution without Ruby runtime
   - Outcome: 対応済み DSL だけを使う bottle formula は Ruby 実行環境なしで `post_install` を完了でき、失敗時は keg/receipt/state が残らない
   - Goal: homebrew-core Ruby source 取得、`def post_install ... end` 抽出、限定 DSL parser/executor、orchestrator への安全な実行タイミング統合
   - Must Not Break: unsupported syntax は fail-closed; receipt/state DB は成功時のみ更新; cleanup は失敗時に必須
@@ -150,6 +150,22 @@ None.
   - Executable doc: `cargo test -p brewdock-cellar -- post_install`; `cargo test -p brewdock-core -- post_install`; `tests/vm-smoke-test.sh bat curl wget`
   - Why not split vertically further?: parser 単体では安全性の主契約である cleanup と receipt/state 境界を検証できない
   - Escalate if: 初期対象 formula の `post_install` が列挙済み DSL を超え、subset を広げないと acceptance formula を通せない場合
+
+- [ ] Theme: Generalize post_install execution and remove formula-specific builtins
+  - Outcome: formula 固有 builtin なしで実 formula の表記ゆれを吸収し、cert 系 acceptance を維持
+  - Goal: `post_install` を full source AST parse + restricted lowering + schema normalization に置き換え、`ca-certificates` と `openssl@3` を generic path で installable にする
+  - Must Not Break: runtime branch の unsupported は fail-closed; receipt/state DB は成功時のみ更新; rollback は `Mkpath` / `CopyFile` / `InstallSymlink` / `RemoveIfExists` を跨いで維持
+  - Non-goals: 任意 Ruby 実行; Linux runtime 対応; tree-sitter への切替; generic schema に落ちない `post_install` の support 拡大
+  - Acceptance (EARS):
+    - When `ca-certificates.rb` is parsed and lowered under macOS runtime semantics, the system shall normalize the reachable filesystem effect into the bundle bootstrap schema without formula-name matching
+    - When `openssl@3.rb` is parsed and lowered under macOS runtime semantics, the system shall normalize the reachable filesystem effect into the dependent cert symlink schema without formula-name matching
+    - If unsupported nodes remain in a runtime branch, the system shall fail explicitly before mutating receipt or state
+    - If unsupported nodes exist only in a non-runtime branch such as `else` under `if OS.mac?`, the system shall not fail for that reason alone
+  - Evidence: `run=task check && cargo test -p brewdock-cellar post_install && cargo test -p brewdock-core post_install && ./tests/vm-smoke-test.sh --formula ca-certificates --formula openssl@3; oracle=fixture-based lowered operations and unsupported reasons plus targeted VM replay for cert formulas; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task check plus targeted VM smoke; notes=Prism-backed parser coverage must include helper resolution and runtime branch filtering`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-cellar -- post_install`; `cargo test -p brewdock-core -- post_install`; `./tests/vm-smoke-test.sh --formula ca-certificates --formula openssl@3`
+  - Why not split vertically further?: parser backend だけ先に入れても formula-specific builtin が残る限り user-visible contract が閉じない
+  - Escalate if: upstream formula fixtures cannot be normalized into the fixed schemas without reintroducing formula-specific behavior or broader Ruby evaluation
 
 - [ ] Theme: Generic source fallback build driver
   - Outcome: 互換 bottle がない formula は generic build driver で source install を試行し、対応外 requirements は明示エラーで止まる
