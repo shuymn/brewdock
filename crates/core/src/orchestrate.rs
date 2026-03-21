@@ -23,7 +23,7 @@ use crate::{
     error::SourceBuildError,
     finalize::{
         build_receipt, build_receipt_deps, build_receipt_source, cleanup_failed_install,
-        materialize_and_relocate_bottle, materialize_prefetched_payload, refresh_opt_link,
+        materialize_prefetched_payload, refresh_opt_link,
     },
     lock::FileLock,
     source_build::{
@@ -283,12 +283,6 @@ struct InstallContext<'a, 'b> {
     blob_store: &'a BlobStore,
 }
 
-/// Bundles a resolved install method with its prefetched payload.
-struct ResolvedPayload {
-    method: InstallMethod,
-    payload: PrefetchedPayload,
-}
-
 /// Bundles a resolved install method with its materialized payload.
 struct MaterializedFormula {
     method: InstallMethod,
@@ -407,10 +401,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     pub async fn install(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
         Self::instrument_operation("install", names, async {
             let _lock = self.acquire_lock()?;
+            let label = request_label(names);
             let (to_install, cache) = Self::instrument_async_phase(
                 "install",
                 "resolve-install-list",
-                &request_label(names),
+                &label,
                 self.resolve_install_list(names),
             )
             .await?;
@@ -422,37 +417,8 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 requested: &requested,
                 blob_store: &blob_store,
             };
-
-            let execution_plan =
-                Self::instrument_phase("install", "plan-execution", &request_label(names), || {
-                    self.build_execution_plan(&to_install, &cache)
-                })?;
-
-            let payloads = self
-                .run_prefetch_stage(&execution_plan, &blob_store)
+            self.execute_install_plan(&label, &to_install, &cache, &install_context)
                 .await?;
-
-            let materialized = self
-                .run_local_prepare_stage(&execution_plan, payloads)
-                .await
-                .inspect_err(|_| self.cleanup_materialized_kegs(&execution_plan))?;
-
-            // Phase 3: Finalize in topological order (prefix-mutating).
-            for (entry, materialized_payload) in
-                execution_plan.entries.into_iter().zip(materialized)
-            {
-                self.finalize_materialized(
-                    entry.formula,
-                    &cache,
-                    &install_context,
-                    MaterializedFormula {
-                        method: entry.method,
-                        finalize: entry.finalize,
-                        materialized: materialized_payload,
-                    },
-                )
-                .await?;
-            }
 
             Ok(to_install)
         })
@@ -833,8 +799,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok((to_install, cache))
     }
 
-    /// Runs the install step of an upgrade: resolves deps for source builds,
-    /// then prefetches and finalizes each formula in order.
+    /// Runs the install step of an upgrade through the shared staged executor.
     async fn run_upgrade_install(
         &self,
         candidate: &UpgradeCandidate,
@@ -848,37 +813,8 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             (vec![candidate.name.clone()], cache)
         };
 
-        for name in to_install.iter().map(String::as_str) {
-            let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
-                name: FormulaName::from(name),
-            })?;
-            let method = Self::instrument_phase(
-                install_context.operation,
-                "resolve-install-method",
-                name,
-                || self.resolve_install_method(formula),
-            )?;
-            let payload = Self::instrument_async_phase(
-                install_context.operation,
-                "prefetch-payload",
-                name,
-                self.prefetch_payload(
-                    install_context.operation,
-                    formula,
-                    &method,
-                    install_context.blob_store,
-                ),
-            )
-            .await?;
-            self.finalize_single(
-                formula,
-                &cache,
-                install_context,
-                ResolvedPayload { method, payload },
-            )
-            .await?;
-        }
-        Ok(())
+        self.execute_install_plan(&candidate.name, &to_install, &cache, install_context)
+            .await
     }
 
     /// Prefetches a formula's payload without mutating the prefix.
@@ -1048,51 +984,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         .await
     }
 
-    /// Finalizes a single formula from prefetched payload.
-    ///
-    /// Used by the upgrade path where materialize and finalize are not split.
-    async fn finalize_single(
-        &self,
-        formula: &Formula,
-        cache: &FormulaCache,
-        install_context: &InstallContext<'_, '_>,
-        resolved: ResolvedPayload,
-    ) -> Result<(), BrewdockError> {
-        let name = formula.name.as_str();
-
-        tracing::info!(name, "installing formula");
-
-        let keg_path = Self::instrument_phase(
-            install_context.operation,
-            "materialize-payload",
-            name,
-            || self.materialize_payload(install_context.operation, formula, resolved.payload),
-        )
-        .inspect_err(|_| {
-            let _ = cleanup_failed_install(
-                &self
-                    .layout
-                    .cellar()
-                    .join(&formula.name)
-                    .join(pkg_version(&formula.versions.stable, formula.revision)),
-                self.layout.prefix(),
-                &self.layout.opt_dir(),
-                &formula.name,
-            );
-        })?;
-
-        self.finalize_with_keg(
-            formula,
-            cache,
-            install_context,
-            FinalizeContext {
-                method: &resolved.method,
-                keg_path: &keg_path,
-            },
-        )
-        .await
-    }
-
     /// Builds source into a keg and refreshes the opt link.
     fn build_source_to_keg(
         &self,
@@ -1190,48 +1081,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         tracing::info!(name, "installation complete");
         Ok(())
-    }
-
-    /// Materializes a prefetched payload into the Cellar and relocates it.
-    ///
-    /// For bottles: copies extracted content to keg and patches binaries.
-    /// For source: runs the build and refreshes the opt link.
-    fn materialize_payload(
-        &self,
-        operation: &'static str,
-        formula: &Formula,
-        payload: PrefetchedPayload,
-    ) -> Result<PathBuf, BrewdockError> {
-        match payload {
-            PrefetchedPayload::Bottle {
-                source_dir,
-                keg_path,
-                relocation_scope,
-            } => {
-                materialize_and_relocate_bottle(
-                    &source_dir,
-                    &keg_path,
-                    &self.layout.opt_dir(),
-                    self.layout.prefix(),
-                    &formula.name,
-                    relocation_scope,
-                )?;
-                Ok(keg_path)
-            }
-            PrefetchedPayload::Source {
-                source_root,
-                plan,
-                _tempdir: tempdir,
-            } => self.build_source_to_keg(
-                operation,
-                &formula.name,
-                PendingSourcePayload {
-                    source_root,
-                    plan,
-                    _tempdir: tempdir,
-                },
-            ),
-        }
     }
 
     /// Checks whether a formula's `post_install` can be parsed and lowered.
@@ -1398,15 +1247,57 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         })
     }
 
+    /// Runs the staged install pipeline: plan → prefetch → local prepare → finalize.
+    ///
+    /// Finalize runs in topological order because it is the only prefix-mutating phase.
+    async fn execute_install_plan(
+        &self,
+        label: &str,
+        to_install: &[String],
+        cache: &FormulaCache,
+        install_context: &InstallContext<'_, '_>,
+    ) -> Result<(), BrewdockError> {
+        let operation = install_context.operation;
+        let execution_plan = Self::instrument_phase(operation, "plan-execution", label, || {
+            self.build_execution_plan(to_install, cache)
+        })?;
+
+        let payloads = self
+            .run_prefetch_stage(operation, &execution_plan, install_context.blob_store)
+            .await?;
+
+        let materialized = self
+            .run_local_prepare_stage(operation, &execution_plan, payloads)
+            .await
+            .inspect_err(|_| self.cleanup_materialized_kegs(&execution_plan))?;
+
+        for (entry, materialized_payload) in execution_plan.entries.into_iter().zip(materialized) {
+            self.finalize_materialized(
+                entry.formula,
+                cache,
+                install_context,
+                MaterializedFormula {
+                    method: entry.method,
+                    finalize: entry.finalize,
+                    materialized: materialized_payload,
+                },
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn run_prefetch_stage(
         &self,
+        operation: &'static str,
         execution_plan: &ExecutionPlan<'_>,
         blob_store: &BlobStore,
     ) -> Result<Vec<PrefetchedPayload>, BrewdockError> {
         let limit = execution_plan.network_acquire_concurrency.max(1);
         let mut payloads = stream::iter(execution_plan.entries.iter().enumerate().map(
             |(index, entry)| async move {
-                self.prefetch_entry(entry, blob_store)
+                self.prefetch_entry(operation, entry, blob_store)
                     .await
                     .map(|payload| (index, payload))
             },
@@ -1420,20 +1311,22 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
     async fn prefetch_entry(
         &self,
+        operation: &'static str,
         entry: &ExecutionPlanEntry<'_>,
         blob_store: &BlobStore,
     ) -> Result<PrefetchedPayload, BrewdockError> {
         Self::instrument_async_phase(
-            "install",
+            operation,
             "prefetch-payload",
             &entry.formula.name,
-            self.prefetch_payload("install", entry.formula, &entry.method, blob_store),
+            self.prefetch_payload(operation, entry.formula, &entry.method, blob_store),
         )
         .await
     }
 
     async fn run_local_prepare_stage(
         &self,
+        operation: &'static str,
         execution_plan: &ExecutionPlan<'_>,
         payloads: Vec<PrefetchedPayload>,
     ) -> Result<Vec<MaterializedPayload>, BrewdockError> {
@@ -1455,7 +1348,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                             LocalPrepareStep::MaterializeBottle => {
                                 let span = tracing::info_span!(
                                     "bd.phase",
-                                    operation = "install",
+                                    operation = operation,
                                     phase = local_prepare.phase_name(),
                                     target = name.as_str(),
                                 );
@@ -2960,6 +2853,104 @@ install:
         let target_keg = find_installed_keg("target", &layout.cellar(), &layout.opt_dir())?
             .ok_or("expected upgraded target record")?;
         assert_eq!(target_keg.pkg_version, "2.0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_fallback_upgrade_reuses_staged_prefetch_concurrency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        setup_installed_keg(&layout, "target", "1.0", true)?;
+
+        let source_sha = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
+
+        let helper_specs = [
+            (
+                "build-helper-a",
+                "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+                "bin/helper-a",
+            ),
+            (
+                "build-helper-b",
+                "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+                "bin/helper-b",
+            ),
+            (
+                "build-helper-c",
+                "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+                "bin/helper-c",
+            ),
+            (
+                "build-helper-d",
+                "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+                "bin/helper-d",
+            ),
+            (
+                "build-helper-e",
+                "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0",
+                "bin/helper-e",
+            ),
+        ];
+        let mut target = make_formula("target", "2.0", &[], source_sha);
+        target.versions.bottle = false;
+        target.bottle.stable = None;
+        target.build_dependencies = helper_specs
+            .iter()
+            .map(|(name, ..)| (*name).to_owned())
+            .collect();
+
+        let mut payloads = helper_specs
+            .iter()
+            .map(|(name, sha, binary_path)| {
+                Ok((
+                    *sha,
+                    create_bottle_tar_gz(name, "1.0", &[(binary_path, b"#!/bin/sh\n")])?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        payloads.push((
+            source_sha,
+            create_source_tar_gz(
+                "target-2.0",
+                &[(
+                    "Makefile",
+                    br#"all:
+	printf "target\n" > target
+
+install:
+	mkdir -p "$(PREFIX)/bin"
+	cp target "$(PREFIX)/bin/target"
+"#,
+                )],
+            )?,
+        ));
+        let downloader = TrackingDownloader::new(payloads, Duration::from_millis(30));
+        let host_tag: HostTag = HOST_TAG.parse()?;
+        let orchestrator = Orchestrator::new(
+            MockRepo::new(
+                std::iter::once(target)
+                    .chain(
+                        helper_specs
+                            .iter()
+                            .map(|(name, sha, _)| make_formula(name, "1.0", &[], sha)),
+                    )
+                    .collect(),
+            ),
+            downloader,
+            layout.clone(),
+            host_tag,
+        );
+
+        let upgraded = orchestrator.upgrade(&["target"]).await?;
+
+        assert_eq!(upgraded, vec!["target"]);
+        assert_eq!(
+            orchestrator.downloader.max_in_flight(),
+            Orchestrator::<MockRepo, TrackingDownloader>::MAX_NETWORK_ACQUIRE_CONCURRENCY,
+            "source upgrade should reuse the staged prefetch concurrency contract",
+        );
         Ok(())
     }
 
