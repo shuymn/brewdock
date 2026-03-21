@@ -222,7 +222,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: materialize だけ直しても link/unlink/relocate が symlink を無視すると Python and Node style bottle layoutsで contract が閉じない
   - Escalate if: Homebrew bottles rely on symlink semantics that require a broader cellar model than the current file-walk based implementation can represent safely
 
-- [ ] Theme: Always relocate text placeholders regardless of cellar type
+- [x] Theme: Always relocate text placeholders regardless of cellar type
   - Outcome: `any_skip_relocation` bottle の Python virtualenv shebang や `.pth` ファイル内の `@@HOMEBREW_*@@` プレースホルダーが正しく置換され、httpie 等の Python formula が usable になる
   - Goal: `relocate_keg` の呼び出し条件を Homebrew の実挙動に合わせ、text relocation を cellar type に関係なく常に実行する
   - Must Not Break: 既存の bottle install 成功系を壊さない; Mach-O binary relocation の正常動作を維持する; `task check` green
