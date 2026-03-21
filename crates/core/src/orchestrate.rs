@@ -1136,6 +1136,8 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
+        time::Duration,
     };
 
     use brewdock_bottle::BottleError;
@@ -1328,6 +1330,30 @@ mod tests {
         Ok(compressed)
     }
 
+    fn create_source_tar_gz_with_raw_paths(
+        entries: &[(&[u8], &[u8])],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use flate2::{Compression, write::GzEncoder};
+        use tar::{Builder, Header};
+
+        let buf = Vec::new();
+        let encoder = GzEncoder::new(buf, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for &(path, contents) in entries {
+            let mut header = Header::new_gnu();
+            header.as_mut_bytes()[..100].fill(0);
+            header.as_mut_bytes()[..path.len()].copy_from_slice(path);
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, contents)?;
+        }
+
+        let encoder = builder.into_inner()?;
+        Ok(encoder.finish()?)
+    }
+
     #[test]
     fn test_cmake_configure_args_use_cmake_install_prefix() {
         let source_root = Path::new("/tmp/source");
@@ -1427,6 +1453,13 @@ mod tests {
         let opt_link = layout.opt_dir().join(name);
         atomic_symlink_replace(&keg_path, &opt_link)?;
         Ok(())
+    }
+
+    fn create_simple_bottle(
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        create_bottle_tar_gz(name, version, &[("bin/tool", b"#!/bin/sh\necho ok\n")])
     }
 
     /// Asserts that a formula is visible as installed via filesystem state.
@@ -2569,6 +2602,161 @@ install:
             "text placeholders in .pth must be replaced for any_skip_relocation bottles",
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_restores_old_links_when_new_payload_download_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+        setup_installed_keg(&layout, "demo", "1.0", true)?;
+        let old_keg = layout.cellar().join("demo/1.0");
+        std::fs::create_dir_all(old_keg.join("bin"))?;
+        std::fs::create_dir_all(layout.prefix().join("bin"))?;
+        std::fs::write(old_keg.join("bin/tool"), "#!/bin/sh\necho old")?;
+        std::os::unix::fs::symlink(
+            "../Cellar/demo/1.0/bin/tool",
+            layout.prefix().join("bin/tool"),
+        )?;
+
+        let sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let formula = make_formula("demo", "2.0", &[], sha);
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![],
+            download_count.clone(),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.upgrade(&["demo"]).await;
+
+        assert!(matches!(
+            result,
+            Err(BrewdockError::Bottle(_) | BrewdockError::Cellar(_) | BrewdockError::Io(_))
+        ));
+        assert!(layout.cellar().join("demo/1.0/bin/tool").exists());
+        let opt_link = layout.opt_dir().join("demo");
+        assert!(
+            opt_link.is_symlink(),
+            "rollback should restore the opt/demo symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(&opt_link)?,
+            layout.cellar().join("demo/1.0")
+        );
+        assert!(layout.prefix().join("bin/tool").is_symlink());
+        assert_eq!(download_count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_with_empty_input_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+        let orchestrator = make_orchestrator(
+            vec![],
+            vec![],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&[]).await?;
+
+        assert!(installed.is_empty());
+        assert!(!layout.cellar().exists());
+        assert!(!layout.opt_dir().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_source_archive_traversal_does_not_escape_cache_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+        let sha = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let mut formula = make_formula("evil", "1.0", &[], sha);
+        formula.bottle.stable = None;
+        let archive = create_source_tar_gz_with_raw_paths(&[
+            (b"evil-1.0/README.md", b"legit source tree"),
+            (b"../../escape.txt", b"escaped"),
+        ])?;
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![(sha, archive)],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["evil"]).await;
+
+        assert!(
+            result.is_err(),
+            "malformed source archive should fail closed"
+        );
+        assert!(
+            !layout.cache_dir().join("sources/escape.txt").exists(),
+            "path traversal must not escape the temporary source root"
+        );
+        assert!(!layout.cellar().join("evil/1.0").exists());
+        assert!(!layout.opt_dir().join("evil").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_blocks_while_lock_is_held() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+        let sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let formula = make_formula("locky", "1.0", &[], sha);
+        let tar = create_simple_bottle("locky", "1.0")?;
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let orchestrator = Arc::new(make_orchestrator(
+            vec![formula],
+            vec![(sha, tar)],
+            download_count.clone(),
+            layout.clone(),
+        )?);
+
+        let lock_path = layout.lock_dir().join("brewdock.lock");
+        let lock = FileLock::acquire(&lock_path)?;
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let handle = {
+            let orchestrator = Arc::clone(&orchestrator);
+            thread::spawn(move || -> Result<(), String> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                started_tx.send(()).map_err(|error| error.to_string())?;
+                runtime
+                    .block_on(async { orchestrator.install(&["locky"]).await })
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+        };
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            download_count.load(Ordering::SeqCst),
+            0,
+            "install must not start downloading while the lock is held"
+        );
+
+        drop(lock);
+
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(std::io::Error::other(error).into()),
+            Err(_) => return Err(std::io::Error::other("install thread panicked").into()),
+        }
+
+        assert_eq!(download_count.load(Ordering::SeqCst), 1);
+        assert!(layout.cellar().join("locky/1.0/bin/tool").exists());
         Ok(())
     }
 }
