@@ -392,14 +392,20 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     pub async fn update(&self) -> Result<usize, BrewdockError> {
         Self::instrument_operation("update", &[], async {
             // Only use ETag for conditional fetch when both metadata and
-            // formulae files are present. If the formulae file is missing
-            // (e.g., manually deleted), force a full re-fetch to restore
+            // formulae are present in the store. If the store is empty
+            // (e.g., new database), force a full re-fetch to restore
             // integrity rather than accepting a 304 with no local data.
-            let existing_meta = self.metadata_store.load_metadata().ok().flatten();
+            let existing_meta = match self.metadata_store.load_metadata() {
+                Ok(meta) => meta,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to read metadata cache, forcing full re-fetch");
+                    None
+                }
+            };
             let existing_etag = existing_meta
                 .as_ref()
                 .and_then(|m| m.etag.as_deref())
-                .filter(|_| self.metadata_store.has_formulae());
+                .filter(|_| existing_meta.as_ref().is_some_and(|m| m.formula_count > 0));
 
             let outcome = Self::instrument_async_phase(
                 "update",
@@ -587,7 +593,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok((to_install, cache))
     }
 
-    /// Persists the formula index and freshness metadata to disk.
+    /// Persists the formula index and freshness metadata to the `SQLite` store.
     fn persist_formula_index(
         &self,
         formulae: &[Formula],
@@ -598,20 +604,17 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             "persist-formula-index",
             "formula-index",
             || -> Result<(), BrewdockError> {
-                self.metadata_store
-                    .save_formulae(formulae)
-                    .map_err(BrewdockError::from)?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
-                self.metadata_store
-                    .save_metadata(&IndexMetadata {
+                Ok(self.metadata_store.save_index(
+                    formulae,
+                    &IndexMetadata {
                         etag,
                         fetched_at: now,
                         formula_count: formulae.len(),
-                    })
-                    .map_err(BrewdockError::from)?;
-                Ok(())
+                    },
+                )?)
             },
         )
     }
@@ -621,13 +624,24 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         FileLock::acquire(&self.layout.lock_dir().join("brewdock.lock"))
     }
 
+    /// Resolves a single formula from the local `SQLite` cache, falling back
+    /// to the network if not found locally.
+    async fn resolve_formula(&self, name: &str) -> Result<Formula, BrewdockError> {
+        match self.metadata_store.load_formula(name) {
+            Ok(Some(f)) => return Ok(f),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(%err, name, "failed to read formula from cache, falling back to network");
+            }
+        }
+        Ok(self.repo.formula(name).await?)
+    }
+
     /// Fetches formulae and all transitive dependencies.
     ///
-    /// Checks the on-disk metadata cache first and falls back to the
-    /// network for any formula not found locally.
+    /// Checks the on-disk metadata cache (per-formula `SQLite` lookup) first
+    /// and falls back to the network for any formula not found locally.
     async fn fetch_with_deps(&self, names: &[&str]) -> Result<FormulaCache, BrewdockError> {
-        let disk_cache = self.metadata_store.load_formula_map().ok().flatten();
-
         let mut cache = FormulaCache::new();
         let mut queue: VecDeque<String> = names.iter().map(|name| (*name).to_owned()).collect();
 
@@ -635,11 +649,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             if cache.get(&name).is_some() {
                 continue;
             }
-            let formula = if let Some(f) = disk_cache.as_ref().and_then(|m| m.get(&name)) {
-                f.clone()
-            } else {
-                self.repo.formula(&name).await?
-            };
+            let formula = self.resolve_formula(&name).await?;
             for dep in self.plan_dependencies(&formula)? {
                 if cache.get(&dep).is_none() {
                     queue.push_back(dep);
@@ -661,31 +671,15 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             &request_label(names),
             || self.fetch_installed_kegs(names),
         )?;
-        let disk_cache = self.metadata_store.load_formula_map().ok().flatten();
         let host_tag = self.host_tag.as_str();
         let mut candidates = Vec::new();
 
         for keg in installed {
-            // Borrow from cache for early checks; only clone if this keg
-            // survives the version comparison and becomes a candidate.
-            let cached_ref = disk_cache.as_ref().and_then(|m| m.get(&keg.name));
-            let fetched;
-            let formula_ref = if let Some(f) = cached_ref {
-                f
-            } else {
-                fetched = Self::instrument_async_phase(
-                    "upgrade-discovery",
-                    "fetch-formula-metadata",
-                    &keg.name,
-                    self.repo.formula(&keg.name),
-                )
-                .await?;
-                &fetched
-            };
-            check_supportability(formula_ref, host_tag)?;
-            let method = self.resolve_install_method(formula_ref)?;
+            let formula = self.resolve_formula(&keg.name).await?;
+            check_supportability(&formula, host_tag)?;
+            let method = self.resolve_install_method(&formula)?;
 
-            let latest_version = pkg_version(&formula_ref.versions.stable, formula_ref.revision);
+            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
             if keg.pkg_version == latest_version {
                 continue;
             }
@@ -694,7 +688,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 "upgrade-discovery",
                 "check-post-install-viability",
                 &keg.name,
-                self.check_post_install_viability(formula_ref),
+                self.check_post_install_viability(&formula),
             )
             .await
             {
@@ -709,7 +703,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             candidates.push(UpgradeCandidate {
                 name: keg.name,
                 installed_on_request: keg.installed_on_request,
-                formula: formula_ref.clone(),
+                formula,
                 current_version: keg.pkg_version,
                 latest_version,
                 method,
@@ -2363,16 +2357,13 @@ install:
         let count = orchestrator.update().await?;
         assert_eq!(count, 2);
 
-        let cache_path = layout.cache_dir().join("formula.json");
-        assert!(cache_path.exists());
+        let db_path = layout.cache_dir().join("formula.db");
+        assert!(db_path.exists());
 
-        let data = std::fs::read_to_string(&cache_path)?;
-        let cached: Vec<Formula> = serde_json::from_str(&data)?;
-        assert_eq!(cached.len(), 2);
-
-        let names: std::collections::HashSet<String> = cached.into_iter().map(|f| f.name).collect();
-        assert!(names.contains("a"));
-        assert!(names.contains("b"));
+        let store = MetadataStore::new(layout.cache_dir());
+        assert_eq!(store.formula_count()?, 2);
+        assert!(store.load_formula("a")?.is_some());
+        assert!(store.load_formula("b")?.is_some());
         Ok(())
     }
 
@@ -2968,12 +2959,12 @@ install:
         let count = orchestrator.update().await?;
 
         assert_eq!(count, 1);
-        assert!(layout.cache_dir().join("formula.json").exists());
-        assert!(layout.cache_dir().join("formula-meta.json").exists());
+        assert!(layout.cache_dir().join("formula.db").exists());
 
         let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
         let meta = store.load_metadata()?.ok_or("metadata should exist")?;
         assert!(meta.fetched_at > 0);
+        assert_eq!(meta.formula_count, 1);
         Ok(())
     }
 
@@ -2984,10 +2975,17 @@ install:
 
         // Pre-populate the disk cache using MetadataStore
         let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
-        store.save_formulae(&[
-            make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA),
-            make_formula("oniguruma", "6.9.9", &[], PLAN_SHA),
-        ])?;
+        store.save_index(
+            &[
+                make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA),
+                make_formula("oniguruma", "6.9.9", &[], PLAN_SHA),
+            ],
+            &brewdock_formula::IndexMetadata {
+                etag: None,
+                fetched_at: 0,
+                formula_count: 2,
+            },
+        )?;
 
         // Create orchestrator with a counting mock
         let formula_calls = Arc::new(AtomicUsize::new(0));
@@ -3023,7 +3021,14 @@ install:
 
         // Pre-populate cache with only jq (missing oniguruma)
         let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
-        store.save_formulae(&[make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA)])?;
+        store.save_index(
+            &[make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA)],
+            &brewdock_formula::IndexMetadata {
+                etag: None,
+                fetched_at: 0,
+                formula_count: 1,
+            },
+        )?;
 
         // Create orchestrator with counting mock that has both
         let formula_calls = Arc::new(AtomicUsize::new(0));

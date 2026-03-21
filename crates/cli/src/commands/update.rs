@@ -50,17 +50,13 @@ mod tests {
 
         run(&orchestrator, false, Verbosity::Normal).await?;
 
-        let cache_path = layout.cache_dir().join("formula.json");
-        assert!(cache_path.exists());
+        let db_path = layout.cache_dir().join("formula.db");
+        assert!(db_path.exists(), "SQLite database should be written");
 
-        let data = std::fs::read_to_string(&cache_path)?;
-        let cached: Vec<brewdock_formula::Formula> = serde_json::from_str(&data)?;
-        assert_eq!(cached.len(), 2);
+        let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
+        assert_eq!(store.formula_count()?, 2);
 
-        let meta_path = layout.cache_dir().join("formula-meta.json");
-        assert!(meta_path.exists(), "metadata file should be written");
-        let meta_data = std::fs::read_to_string(&meta_path)?;
-        let meta: brewdock_formula::IndexMetadata = serde_json::from_str(&meta_data)?;
+        let meta = store.load_metadata()?.ok_or("metadata should exist")?;
         assert!(meta.fetched_at > 0, "fetched_at should be set");
         assert_eq!(meta.formula_count, 2, "formula_count should match");
         Ok(())
@@ -77,8 +73,8 @@ mod tests {
 
         run(&orchestrator, true, Verbosity::Normal).await?;
 
-        let cache_path = layout.cache_dir().join("formula.json");
-        assert!(!cache_path.exists(), "dry-run should not cache");
+        let db_path = layout.cache_dir().join("formula.db");
+        assert!(!db_path.exists(), "dry-run should not cache");
         Ok(())
     }
 }

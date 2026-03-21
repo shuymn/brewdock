@@ -40,6 +40,10 @@ pub enum FormulaError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A database operation failed.
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
+
     /// A dependency cycle was detected.
     #[error("cyclic dependency: {0}")]
     CyclicDependency(DependencyCycle),

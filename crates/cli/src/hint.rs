@@ -21,6 +21,7 @@ const fn hint_for_formula(err: &FormulaError) -> Option<&'static str> {
         FormulaError::Network(_) => Some("check your internet connection"),
         FormulaError::Parse(_)
         | FormulaError::Io(_)
+        | FormulaError::Database(_)
         | FormulaError::CyclicDependency(_)
         | FormulaError::InvalidRubySourcePath { .. } => None,
     }
