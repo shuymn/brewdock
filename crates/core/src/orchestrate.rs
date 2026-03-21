@@ -26,6 +26,7 @@ use crate::{
         materialize_prefetched_payload, refresh_opt_link,
     },
     lock::FileLock,
+    progress::{NoopProgressSink, ProgressEvent, SharedProgressSink},
     source_build::{
         build_source_plan, extract_source_archive, run_source_build, source_archive_filename,
     },
@@ -265,6 +266,7 @@ pub struct Orchestrator<R, D> {
     layout: Layout,
     host_tag: HostTag,
     metadata_store: MetadataStore,
+    progress_sink: SharedProgressSink,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +334,24 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Creates a new orchestrator.
     #[must_use]
     pub fn new(repo: R, downloader: D, layout: Layout, host_tag: HostTag) -> Self {
+        Self::with_progress_sink(
+            repo,
+            downloader,
+            layout,
+            host_tag,
+            std::sync::Arc::new(NoopProgressSink),
+        )
+    }
+
+    /// Creates a new orchestrator with a user-facing progress sink.
+    #[must_use]
+    pub fn with_progress_sink(
+        repo: R,
+        downloader: D,
+        layout: Layout,
+        host_tag: HostTag,
+        progress_sink: SharedProgressSink,
+    ) -> Self {
         let metadata_store = MetadataStore::new(layout.cache_dir());
         Self {
             repo,
@@ -339,6 +359,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             layout,
             host_tag,
             metadata_store,
+            progress_sink,
         }
     }
 
@@ -351,17 +372,18 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if resolution or validation fails.
     pub async fn plan_install(&self, names: &[&str]) -> Result<Vec<PlanEntry>, BrewdockError> {
-        Self::instrument_operation("install-plan", names, async {
+        self.instrument_operation("install-plan", names, async {
             let label = request_label(names);
             let _lock = self.acquire_lock()?;
-            let (to_install, cache) = Self::instrument_async_phase(
-                "install-plan",
-                "resolve-install-list",
-                &label,
-                self.resolve_install_list(names),
-            )
-            .await?;
-            Self::instrument_phase("install-plan", "resolve-methods", &label, || {
+            let (to_install, cache) = self
+                .instrument_async_phase(
+                    "install-plan",
+                    "resolve-install-list",
+                    &label,
+                    self.resolve_install_list(names),
+                )
+                .await?;
+            self.instrument_phase("install-plan", "resolve-methods", &label, || {
                 to_install
                     .iter()
                     .map(|name| {
@@ -399,16 +421,17 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Returns [`BrewdockError`] if any step fails. Unsupported formulae are
     /// rejected before any download begins.
     pub async fn install(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
-        Self::instrument_operation("install", names, async {
+        self.instrument_operation("install", names, async {
             let _lock = self.acquire_lock()?;
             let label = request_label(names);
-            let (to_install, cache) = Self::instrument_async_phase(
-                "install",
-                "resolve-install-list",
-                &label,
-                self.resolve_install_list(names),
-            )
-            .await?;
+            let (to_install, cache) = self
+                .instrument_async_phase(
+                    "install",
+                    "resolve-install-list",
+                    &label,
+                    self.resolve_install_list(names),
+                )
+                .await?;
 
             let requested: HashSet<&str> = names.iter().copied().collect();
             let blob_store = BlobStore::new(&self.layout.blob_dir());
@@ -433,7 +456,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if the fetch or file write fails.
     pub async fn update(&self) -> Result<usize, BrewdockError> {
-        Self::instrument_operation("update", &[], async {
+        self.instrument_operation("update", &[], async {
             // Only use ETag for conditional fetch when both metadata and
             // formulae are present in the store. If the store is empty
             // (e.g., new database), force a full re-fetch to restore
@@ -441,6 +464,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             let existing_meta = match self.metadata_store.load_metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
+                    self.emit_warning(
+                        "update",
+                        "formula-index",
+                        "failed to read metadata cache, forcing full re-fetch",
+                    );
                     tracing::warn!(%err, "failed to read metadata cache, forcing full re-fetch");
                     None
                 }
@@ -450,13 +478,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 .and_then(|m| m.etag.as_deref())
                 .filter(|_| existing_meta.as_ref().is_some_and(|m| m.formula_count > 0));
 
-            let outcome = Self::instrument_async_phase(
-                "update",
-                "fetch-formula-index",
-                "formula-index",
-                self.repo.all_formulae_conditional(existing_etag),
-            )
-            .await?;
+            let outcome = self
+                .instrument_async_phase(
+                    "update",
+                    "fetch-formula-index",
+                    "formula-index",
+                    self.repo.all_formulae_conditional(existing_etag),
+                )
+                .await?;
 
             match outcome {
                 FetchOutcome::Modified { formulae, etag } => {
@@ -484,15 +513,16 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         names: &[&str],
     ) -> Result<Vec<UpgradePlanEntry>, BrewdockError> {
-        Self::instrument_operation("upgrade-plan", names, async {
+        self.instrument_operation("upgrade-plan", names, async {
             let _lock = self.acquire_lock()?;
-            let candidates = Self::instrument_async_phase(
-                "upgrade-plan",
-                "collect-upgrade-candidates",
-                &request_label(names),
-                self.collect_upgrade_candidates(names),
-            )
-            .await?;
+            let candidates = self
+                .instrument_async_phase(
+                    "upgrade-plan",
+                    "collect-upgrade-candidates",
+                    &request_label(names),
+                    self.collect_upgrade_candidates(names),
+                )
+                .await?;
             Ok(candidates
                 .into_iter()
                 .map(|candidate| UpgradePlanEntry {
@@ -517,15 +547,16 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if any step fails.
     pub async fn upgrade(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
-        Self::instrument_operation("upgrade", names, async {
+        self.instrument_operation("upgrade", names, async {
             let _lock = self.acquire_lock()?;
-            let candidates = Self::instrument_async_phase(
-                "upgrade",
-                "collect-upgrade-candidates",
-                &request_label(names),
-                self.collect_upgrade_candidates(names),
-            )
-            .await?;
+            let candidates = self
+                .instrument_async_phase(
+                    "upgrade",
+                    "collect-upgrade-candidates",
+                    &request_label(names),
+                    self.collect_upgrade_candidates(names),
+                )
+                .await?;
 
             let mut upgraded = Vec::new();
             let blob_store = BlobStore::new(&self.layout.blob_dir());
@@ -544,7 +575,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                     .join(&candidate.name)
                     .join(&candidate.current_version);
                 if old_keg.exists() {
-                    Self::instrument_phase("upgrade", "unlink-old-keg", &candidate.name, || {
+                    self.instrument_phase("upgrade", "unlink-old-keg", &candidate.name, || {
                         unlink(&old_keg, self.layout.prefix())
                     })?;
                 }
@@ -560,15 +591,21 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                     blob_store: &blob_store,
                 };
 
-                let install_result = Self::instrument_async_phase(
-                    "upgrade",
-                    "install-target-version",
-                    &candidate.name,
-                    self.run_upgrade_install(&candidate, &install_context),
-                )
-                .await;
+                let install_result = self
+                    .instrument_async_phase(
+                        "upgrade",
+                        "install-target-version",
+                        &candidate.name,
+                        self.run_upgrade_install(&candidate, &install_context),
+                    )
+                    .await;
 
                 if let Err(error) = install_result {
+                    self.emit_warning(
+                        "upgrade",
+                        &candidate.name,
+                        "upgrade failed, restoring previous version",
+                    );
                     tracing::warn!(
                         name = candidate.name,
                         %error,
@@ -660,7 +697,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         formulae: &[Formula],
         etag: Option<String>,
     ) -> Result<(), BrewdockError> {
-        Self::instrument_phase(
+        self.instrument_phase(
             "update",
             "persist-formula-index",
             "formula-index",
@@ -726,7 +763,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         names: &[&str],
     ) -> Result<Vec<UpgradeCandidate>, BrewdockError> {
-        let installed = Self::instrument_phase(
+        let installed = self.instrument_phase(
             "upgrade-discovery",
             "discover-installed-kegs",
             &request_label(names),
@@ -745,14 +782,20 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 continue;
             }
 
-            if let Err(error) = Self::instrument_async_phase(
-                "upgrade-discovery",
-                "check-post-install-viability",
-                &keg.name,
-                self.check_post_install_viability(&formula),
-            )
-            .await
+            if let Err(error) = self
+                .instrument_async_phase(
+                    "upgrade-discovery",
+                    "check-post-install-viability",
+                    &keg.name,
+                    self.check_post_install_viability(&formula),
+                )
+                .await
             {
+                self.emit_warning(
+                    "upgrade-discovery",
+                    &keg.name,
+                    "skipping upgrade: post_install not supported by bd, use `brew upgrade` instead",
+                );
                 tracing::warn!(
                     name = keg.name,
                     %error,
@@ -832,7 +875,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         match method {
             InstallMethod::Bottle(selected_bottle) => {
                 let blob_hit =
-                    Self::instrument_phase(operation, "check-blob-store", &formula.name, || {
+                    self.instrument_phase(operation, "check-blob-store", &formula.name, || {
                         blob_store.has(&selected_bottle.sha256)
                     })?;
 
@@ -843,16 +886,17 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                         "blob store hit, skipping download"
                     );
                 } else {
-                    let data = Self::instrument_async_phase(
-                        operation,
-                        "download-bottle",
-                        &formula.name,
-                        self.downloader
-                            .download_verified(&selected_bottle.url, &selected_bottle.sha256),
-                    )
-                    .await?;
+                    let data = self
+                        .instrument_async_phase(
+                            operation,
+                            "download-bottle",
+                            &formula.name,
+                            self.downloader
+                                .download_verified(&selected_bottle.url, &selected_bottle.sha256),
+                        )
+                        .await?;
 
-                    Self::instrument_phase(operation, "store-bottle-blob", &formula.name, || {
+                    self.instrument_phase(operation, "store-bottle-blob", &formula.name, || {
                         blob_store.put(&selected_bottle.sha256, &data)
                     })?;
                 }
@@ -865,7 +909,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                     tracing::info!(name = formula.name, "extract dir hit, skipping extraction");
                 } else {
                     let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
-                    Self::instrument_phase(operation, "extract-bottle", &formula.name, || {
+                    self.instrument_phase(operation, "extract-bottle", &formula.name, || {
                         extract_tar_gz(&blob_path, &extract_dir)
                     })?;
                 }
@@ -890,14 +934,15 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                         plan.formula_name.clone(),
                     ))
                 })?;
-                let data = Self::instrument_async_phase(
-                    operation,
-                    "download-source-archive",
-                    &plan.formula_name,
-                    self.downloader
-                        .download_verified(&plan.source_url, checksum),
-                )
-                .await?;
+                let data = self
+                    .instrument_async_phase(
+                        operation,
+                        "download-source-archive",
+                        &plan.formula_name,
+                        self.downloader
+                            .download_verified(&plan.source_url, checksum),
+                    )
+                    .await?;
 
                 let parent = self.layout.cache_dir().join("sources");
                 let formula_name = plan.formula_name.clone();
@@ -957,6 +1002,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ) -> Result<(), BrewdockError> {
         let name = formula.name.as_str();
 
+        self.emit_formula_started(install_context.operation, name);
         tracing::info!(name, "installing formula");
 
         let keg_path = match (resolved.finalize, resolved.materialized) {
@@ -966,22 +1012,37 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             }
             (FinalizeStep::FinalizeBottle, MaterializedPayload::PendingSource(_))
             | (FinalizeStep::BuildFromSource, MaterializedPayload::Bottle { .. }) => {
+                self.emit_formula_failed(
+                    install_context.operation,
+                    name,
+                    "execution plan finalize step does not match materialized payload",
+                );
                 return Err(BrewdockError::Io(std::io::Error::other(
                     "execution plan finalize step does not match materialized payload",
                 )));
             }
         };
 
-        self.finalize_with_keg(
-            formula,
-            cache,
-            install_context,
-            FinalizeContext {
-                method: &resolved.method,
-                keg_path: &keg_path,
-            },
-        )
-        .await
+        let result = self
+            .finalize_with_keg(
+                formula,
+                cache,
+                install_context,
+                FinalizeContext {
+                    method: &resolved.method,
+                    keg_path: &keg_path,
+                },
+            )
+            .await;
+
+        match &result {
+            Ok(()) => self.emit_formula_completed(install_context.operation, name),
+            Err(error) => {
+                self.emit_formula_failed(install_context.operation, name, &error.to_string());
+            }
+        }
+
+        result
     }
 
     /// Builds source into a keg and refreshes the opt link.
@@ -996,7 +1057,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             plan,
             _tempdir: tempdir_guard,
         } = pending;
-        Self::instrument_phase(operation, "build-from-source", name, || {
+        self.instrument_phase(operation, "build-from-source", name, || {
             run_source_build(&source_root, &plan, self.layout.prefix())
         })
         .inspect_err(|_| {
@@ -1009,7 +1070,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         })?;
         // Tempdir kept alive until after build completes; drops here.
         drop(tempdir_guard);
-        Self::instrument_phase(operation, "refresh-opt-link", name, || {
+        self.instrument_phase(operation, "refresh-opt-link", name, || {
             refresh_opt_link(
                 &plan.cellar_path,
                 &self.layout.opt_dir(),
@@ -1030,21 +1091,22 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let name = formula.name.as_str();
         let keg_path = finalize_ctx.keg_path;
 
-        let post_install_transaction = Self::instrument_async_phase(
-            install_context.operation,
-            "post-install",
-            name,
-            self.execute_post_install(install_context.operation, formula, keg_path),
-        )
-        .await
-        .inspect_err(|_| {
-            let _ = cleanup_failed_install(
-                keg_path,
-                self.layout.prefix(),
-                &self.layout.opt_dir(),
-                &formula.name,
-            );
-        })?;
+        let post_install_transaction = self
+            .instrument_async_phase(
+                install_context.operation,
+                "post-install",
+                name,
+                self.execute_post_install(install_context.operation, formula, keg_path),
+            )
+            .await
+            .inspect_err(|_| {
+                let _ = cleanup_failed_install(
+                    keg_path,
+                    self.layout.prefix(),
+                    &self.layout.opt_dir(),
+                    &formula.name,
+                );
+            })?;
 
         let is_requested = install_context.requested.contains(formula.name.as_str());
         let receipt = build_receipt(
@@ -1059,7 +1121,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             build_receipt_source(formula),
         );
         if let Err(error) =
-            Self::instrument_phase(install_context.operation, "finalize-install", name, || {
+            self.instrument_phase(install_context.operation, "finalize-install", name, || {
                 self.finalize_installed_formula(formula, keg_path, &receipt)
             })
         {
@@ -1101,18 +1163,19 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         formula: &Formula,
         keg_path: &Path,
     ) -> Result<Option<PostInstallTransaction>, BrewdockError> {
-        let Some(ruby_source) = Self::instrument_async_phase(
-            operation,
-            "fetch-post-install-source",
-            &formula.name,
-            self.fetch_post_install_source(formula),
-        )
-        .await?
+        let Some(ruby_source) = self
+            .instrument_async_phase(
+                operation,
+                "fetch-post-install-source",
+                &formula.name,
+                self.fetch_post_install_source(formula),
+            )
+            .await?
         else {
             return Ok(None);
         };
         let transaction =
-            Self::instrument_phase(operation, "run-post-install", &formula.name, || {
+            self.instrument_phase(operation, "run-post-install", &formula.name, || {
                 run_post_install(
                     &ruby_source,
                     &PostInstallContext::new(
@@ -1168,6 +1231,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             if bottle.cellar.is_compatible(&self.layout.cellar()) {
                 return Ok(InstallMethod::Bottle(bottle));
             }
+            self.emit_warning(
+                "install-resolution",
+                &formula.name,
+                "bottle requires incompatible cellar path, trying source fallback",
+            );
             tracing::warn!(
                 name = formula.name,
                 cellar = %bottle.cellar,
@@ -1233,7 +1301,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                     name: FormulaName::from(name.clone()),
                 })?;
                 let method =
-                    Self::instrument_phase("install", "resolve-install-method", name, || {
+                    self.instrument_phase("install", "resolve-install-method", name, || {
                         self.resolve_install_method(formula)
                     })?;
                 Ok(ExecutionPlanEntry::new(formula, method))
@@ -1258,7 +1326,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         install_context: &InstallContext<'_, '_>,
     ) -> Result<(), BrewdockError> {
         let operation = install_context.operation;
-        let execution_plan = Self::instrument_phase(operation, "plan-execution", label, || {
+        let execution_plan = self.instrument_phase(operation, "plan-execution", label, || {
             self.build_execution_plan(to_install, cache)
         })?;
 
@@ -1315,7 +1383,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         entry: &ExecutionPlanEntry<'_>,
         blob_store: &BlobStore,
     ) -> Result<PrefetchedPayload, BrewdockError> {
-        Self::instrument_async_phase(
+        self.instrument_async_phase(
             operation,
             "prefetch-payload",
             &entry.formula.name,
@@ -1411,6 +1479,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             let formula = match self.resolve_formula(&keg.name).await {
                 Ok(f) => f,
                 Err(err) => {
+                    self.emit_warning(
+                        "outdated",
+                        &keg.name,
+                        &format!("skipping: cannot resolve formula ({err})"),
+                    );
                     tracing::warn!(name = keg.name, %err, "skipping: cannot resolve formula");
                     continue;
                 }
@@ -1658,6 +1731,7 @@ impl LocalPrepareStep {
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     async fn instrument_operation<T, F>(
+        &self,
         operation: &'static str,
         request: &[&str],
         future: F,
@@ -1665,16 +1739,33 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     where
         F: Future<Output = Result<T, BrewdockError>>,
     {
-        future
+        let target = request_label(request);
+        self.progress_sink.emit(ProgressEvent::OperationStarted {
+            operation,
+            target: target.clone(),
+        });
+        let result = future
             .instrument(tracing::info_span!(
                 "bd.operation",
                 operation,
-                request = %request_label(request)
+                request = %target
             ))
-            .await
+            .await;
+        match &result {
+            Ok(_) => self
+                .progress_sink
+                .emit(ProgressEvent::OperationCompleted { operation, target }),
+            Err(error) => self.progress_sink.emit(ProgressEvent::OperationFailed {
+                operation,
+                target,
+                error: error.to_string(),
+            }),
+        }
+        result
     }
 
     async fn instrument_async_phase<T, E, F>(
+        &self,
         operation: &'static str,
         phase: &'static str,
         target: &str,
@@ -1684,13 +1775,34 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         E: Into<BrewdockError>,
         F: Future<Output = Result<T, E>>,
     {
-        future
+        let target_label = target.to_owned();
+        self.progress_sink.emit(ProgressEvent::PhaseStarted {
+            operation,
+            phase,
+            target: target_label.clone(),
+        });
+        let result = future
             .instrument(tracing::info_span!("bd.phase", operation, phase, target))
             .await
-            .map_err(Into::into)
+            .map_err(Into::into);
+        match &result {
+            Ok(_) => self.progress_sink.emit(ProgressEvent::PhaseCompleted {
+                operation,
+                phase,
+                target: target_label,
+            }),
+            Err(error) => self.progress_sink.emit(ProgressEvent::PhaseFailed {
+                operation,
+                phase,
+                target: target_label,
+                error: error.to_string(),
+            }),
+        }
+        result
     }
 
     fn instrument_phase<T, E, F>(
+        &self,
         operation: &'static str,
         phase: &'static str,
         target: &str,
@@ -1700,9 +1812,59 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         E: Into<BrewdockError>,
         F: FnOnce() -> Result<T, E>,
     {
+        let target_label = target.to_owned();
+        self.progress_sink.emit(ProgressEvent::PhaseStarted {
+            operation,
+            phase,
+            target: target_label.clone(),
+        });
         let span = tracing::info_span!("bd.phase", operation, phase, target);
         let _entered = span.enter();
-        work().map_err(Into::into)
+        let result = work().map_err(Into::into);
+        match &result {
+            Ok(_) => self.progress_sink.emit(ProgressEvent::PhaseCompleted {
+                operation,
+                phase,
+                target: target_label,
+            }),
+            Err(error) => self.progress_sink.emit(ProgressEvent::PhaseFailed {
+                operation,
+                phase,
+                target: target_label,
+                error: error.to_string(),
+            }),
+        }
+        result
+    }
+
+    fn emit_warning(&self, operation: &'static str, target: &str, message: &str) {
+        self.progress_sink.emit(ProgressEvent::Warning {
+            operation,
+            target: target.to_owned(),
+            message: message.to_owned(),
+        });
+    }
+
+    fn emit_formula_started(&self, operation: &'static str, name: &str) {
+        self.progress_sink.emit(ProgressEvent::FormulaStarted {
+            operation,
+            name: name.to_owned(),
+        });
+    }
+
+    fn emit_formula_completed(&self, operation: &'static str, name: &str) {
+        self.progress_sink.emit(ProgressEvent::FormulaCompleted {
+            operation,
+            name: name.to_owned(),
+        });
+    }
+
+    fn emit_formula_failed(&self, operation: &'static str, name: &str, error: &str) {
+        self.progress_sink.emit(ProgressEvent::FormulaFailed {
+            operation,
+            name: name.to_owned(),
+            error: error.to_owned(),
+        });
     }
 
     fn restore_previous_upgrade(&self, candidate: &UpgradeCandidate, old_keg: &Path) {

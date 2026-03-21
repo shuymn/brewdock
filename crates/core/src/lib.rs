@@ -8,6 +8,7 @@ pub mod layout;
 pub mod lock;
 pub mod orchestrate;
 pub mod platform;
+pub mod progress;
 mod source_build;
 
 #[doc(hidden)]
@@ -24,3 +25,4 @@ pub use orchestrate::{
     OutdatedEntry, PlanEntry, SourceBuildPlan, UpgradePlanEntry,
 };
 pub use platform::HostTag;
+pub use progress::{NoopProgressSink, OperationProgressSink, ProgressEvent, SharedProgressSink};
