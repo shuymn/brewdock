@@ -419,7 +419,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: copy strategy と relocation targeting を別 spike にすると store mutation risk と wall-clock benefit の比較軸がずれる
   - Escalate if: `clonefile` 系の候補が macOS VM 上で一貫して使えず、copy cost 改善に別の長距離 architectural bet が必要になる場合
 
-- [ ] Theme: Production manifest-targeted relocation and spike removal
+- [x] Theme: Production manifest-targeted relocation and spike removal
   - Outcome: bottle install の materialize/relocate は extracted payload から導いた manifest を使って full-tree placeholder scan を避け、spike-only harness は production path に吸収されて削除される
   - Goal: manifest-targeted relocation を本実装に入れ、representative bottle install の `materialize-payload` wall を下げつつ spike artifact を不要にする
   - Must Not Break: store は read-only source のままにする; rollback / fail-closed policy を崩さない; text placeholder relocation と Mach-O relocation の correctness を壊さない; `task check` green
