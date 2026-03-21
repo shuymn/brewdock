@@ -97,7 +97,7 @@ pub fn atomic_symlink_replace(target: &Path, link_path: &Path) -> Result<(), Cel
 ///
 /// If the destination file already exists and is read-only (e.g., from a
 /// previous bottle pour), it is made writable before overwriting.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

@@ -12,6 +12,9 @@ pub mod receipt;
 pub mod relocate;
 pub mod state;
 
+#[cfg(test)]
+mod copy_strategy_spike;
+
 pub use discover::{InstalledKeg, discover_installed_kegs, find_installed_keg};
 pub use error::CellarError;
 pub use link::{link, unlink};

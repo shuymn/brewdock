@@ -40,6 +40,37 @@ pub fn relocate_keg(
     prefix: &Path,
     scope: RelocationScope,
 ) -> Result<(), CellarError> {
+    let manifest = fs::walk_files(keg_path)?
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(keg_path).ok().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    relocate_keg_with_manifest(keg_path, prefix, scope, &manifest)
+}
+
+#[cfg(test)]
+pub(crate) fn build_relocation_manifest(
+    root: &Path,
+) -> Result<Vec<std::path::PathBuf>, CellarError> {
+    fs::walk_files(root)?
+        .into_iter()
+        .filter_map(|path| {
+            let relative = path.strip_prefix(root).ok()?.to_path_buf();
+            match std::fs::read(&path) {
+                Ok(data) if has_placeholder(&data) => Some(Ok(relative)),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => None,
+                Err(error) => Some(Err(CellarError::from(error))),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn relocate_keg_with_manifest(
+    keg_path: &Path,
+    prefix: &Path,
+    scope: RelocationScope,
+    manifest: &[std::path::PathBuf],
+) -> Result<(), CellarError> {
     let cellar = prefix.join("Cellar");
     let prefix_str = path_str(prefix)?.to_owned();
     let cellar_str = path_str(&cellar)?.to_owned();
@@ -50,7 +81,8 @@ pub fn relocate_keg(
         (REPOSITORY_PLACEHOLDER, prefix_str.as_str()),
     ];
 
-    for file in fs::walk_files(keg_path)? {
+    for relative_path in manifest {
+        let file = keg_path.join(relative_path);
         let data = match std::fs::read(&file) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => continue,
