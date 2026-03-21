@@ -6,7 +6,7 @@
 # `time.busy` alone.
 #
 # Usage:
-#   ./tests/vm-pipeline-baseline.sh [--keep] [--output <path>]
+#   ./tests/vm-pipeline-baseline.sh [--keep] [--runs <count>] [--output <path>]
 #
 set -euo pipefail
 
@@ -19,6 +19,7 @@ SSH_USER="admin"
 SSH_PASS="admin"
 BD_BINARY="$PROJECT_ROOT/target/release/bd"
 KEEP_VM=false
+RUNS=1
 OUTPUT_PATH=""
 SHARE_DIR=""
 SSH_KEY=""
@@ -33,10 +34,11 @@ fail() { printf '\033[1;31m  FAIL: %s\033[0m\n' "$*"; exit 1; }
 usage() {
   cat <<'EOF'
 Usage:
-  ./tests/vm-pipeline-baseline.sh [--keep] [--output <path>]
+  ./tests/vm-pipeline-baseline.sh [--keep] [--runs <count>] [--output <path>]
 
 Examples:
   ./tests/vm-pipeline-baseline.sh
+  ./tests/vm-pipeline-baseline.sh --runs 3
   ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md
 EOF
 }
@@ -104,11 +106,35 @@ extract_real_time() {
 }
 
 record_result() {
-  local label=$1
-  local elapsed=$2
-  local log_file=$3
+  local run_index=$1
+  local label=$2
+  local elapsed=$3
+  local log_file=$4
 
-  RESULTS+=("${label}:${elapsed}:${log_file}")
+  RESULTS+=("${run_index}:${label}:${elapsed}:${log_file}")
+}
+
+run_scenario() {
+  local run_index=$1
+  local label=$2
+  local command=$3
+  local log_file="$SHARE_DIR/run-${run_index}-${label}.jsonl"
+  local output=""
+  local elapsed=""
+
+  rm -f "$log_file"
+  log "Running baseline scenario: run ${run_index}/${RUNS} - $label"
+  if ! output=$(measure_vm_command "BREWDOCK_BENCHMARK_FILE='$MOUNT_PATH/run-${run_index}-${label}.jsonl' $command"); then
+    echo "$output"
+    fail "scenario failed: $label"
+  fi
+  echo "$output"
+
+  elapsed=$(printf '%s\n' "$output" | extract_real_time)
+  [ -n "$elapsed" ] || fail "missing wall-clock time for $label"
+  [ -f "$log_file" ] || fail "missing tracing log for $label"
+  record_result "$run_index" "$label" "${elapsed}s" "$log_file"
+  pass "$label: ${elapsed}s"
 }
 
 prepare_clean_prefix() {
@@ -168,28 +194,6 @@ setup_vm() {
   log "Copying brewdock binary from shared mount"
   vm_ssh "cp '$MOUNT_PATH/bd' /tmp/bd && chmod +x /tmp/bd"
   pass "Binary ready at /tmp/bd"
-}
-
-run_scenario() {
-  local label=$1
-  local command=$2
-  local log_file="$SHARE_DIR/${label}.jsonl"
-  local output=""
-  local elapsed=""
-
-  rm -f "$log_file"
-  log "Running baseline scenario: $label"
-  if ! output=$(measure_vm_command "BREWDOCK_BENCHMARK_FILE='$MOUNT_PATH/${label}.jsonl' $command"); then
-    echo "$output"
-    fail "scenario failed: $label"
-  fi
-  echo "$output"
-
-  elapsed=$(printf '%s\n' "$output" | extract_real_time)
-  [ -n "$elapsed" ] || fail "missing wall-clock time for $label"
-  [ -f "$log_file" ] || fail "missing tracing log for $label"
-  record_result "$label" "${elapsed}s" "$log_file"
-  pass "$label: ${elapsed}s"
 }
 
 prepare_upgrade_fixture() {
@@ -276,10 +280,35 @@ def merged_interval_ms(intervals)
   total + (current_end - current_start)
 end
 
-results = []
+def median(values)
+  sorted = values.sort
+  count = sorted.length
+  return 0.0 if count.zero?
+  return sorted[count / 2] if count.odd?
+
+  (sorted[(count / 2) - 1] + sorted[count / 2]) / 2.0
+end
+
+def summarize(values)
+  {
+    "median" => median(values),
+    "mean" => values.sum(0.0) / values.length,
+    "min" => values.min,
+    "max" => values.max,
+  }
+end
+
+scenario_runs = Hash.new { |hash, key| hash[key] = [] }
+phase_runs = Hash.new do |hash, key|
+  hash[key] = Hash.new do |phase_hash, phase_name|
+    phase_hash[phase_name] = Hash.new { |metric_hash, metric| metric_hash[metric] = [] }
+  end
+end
+
 while ARGV.any?
+  _run_index = ARGV.shift
   label = ARGV.shift
-  wall = ARGV.shift
+  wall = ARGV.shift.delete_suffix("s").to_f
   path = ARGV.shift
   phases = Hash.new do |hash, key|
     hash[key] = {
@@ -330,45 +359,85 @@ while ARGV.any?
     metrics["child_process_ms"] = merged_interval_ms(metrics.delete("child_intervals"))
   end
 
-  sorted_phases = phases.sort_by { |(_, metrics)| -metrics["wall_ms"] }
-  results << [label, wall, sorted_phases]
+  scenario_runs[label] << wall
+  phases.each do |phase_name, metrics|
+    phase_runs[label][phase_name]["wall_ms"] << metrics["wall_ms"]
+    phase_runs[label][phase_name]["busy_ms"] << metrics["busy_ms"]
+    phase_runs[label][phase_name]["idle_ms"] << metrics["idle_ms"]
+    phase_runs[label][phase_name]["child_process_ms"] << metrics["child_process_ms"]
+  end
 end
 
 puts "# Pipeline Baseline"
 puts
+run_count = scenario_runs.values.first&.length || 0
+puts "_Aggregated across #{run_count} run(s); scenario wall and phase timings use median, with mean/min/max shown for spread._"
+puts
 puts "| Scenario | Wall | Top Wall Phases | Top Child Phases |"
 puts "|---|---:|---|---|"
-results.each do |label, wall, phases|
+scenario_runs.each do |label, wall_values|
+  wall_summary = summarize(wall_values)
+  phases =
+    phase_runs[label]
+      .map do |phase_name, metrics|
+        [phase_name, metrics.transform_values { |values| summarize(values) }]
+      end
+      .sort_by { |(_, metrics)| -metrics["wall_ms"]["median"] }
   top_wall =
     phases.first(3).map do |name, metrics|
-      format("%s %.1fms", name, metrics["wall_ms"])
+      format("%s %.1fms", name, metrics["wall_ms"]["median"])
     end.join(", ")
   top_child =
     phases
-      .select { |(_, metrics)| metrics["child_process_ms"] > 0.0 }
+      .select { |(_, metrics)| metrics["child_process_ms"]["median"] > 0.0 }
       .first(3)
       .map do |name, metrics|
-        format("%s %.1fms", name, metrics["child_process_ms"])
+        format("%s %.1fms", name, metrics["child_process_ms"]["median"])
       end
       .join(", ")
-  puts "| #{label} | #{wall} | #{top_wall.empty? ? "-" : top_wall} | #{top_child.empty? ? "-" : top_child} |"
+  wall_text = format(
+    "%.2fs (mean %.2fs, min %.2fs, max %.2fs)",
+    wall_summary["median"],
+    wall_summary["mean"],
+    wall_summary["min"],
+    wall_summary["max"],
+  )
+  puts "| #{label} | #{wall_text} | #{top_wall.empty? ? "-" : top_wall} | #{top_child.empty? ? "-" : top_child} |"
 end
 puts
 puts "## Phase Breakdown"
 puts
-results.each do |label, _wall, phases|
+phase_runs.each do |label, phases|
+  summarized_phases =
+    phases
+      .map do |phase_name, metrics|
+        [phase_name, metrics.transform_values { |values| summarize(values) }]
+      end
+      .sort_by { |(_, metrics)| -metrics["wall_ms"]["median"] }
   puts "### #{label}"
   puts
   puts "| Phase | Wall Time | Busy Time | Idle Time | Child Process |"
-  puts "|---|---:|---:|---:|---:|"
-  phases.each do |name, metrics|
+  puts "|---|---|---|---|---|"
+  summarized_phases.each do |name, metrics|
     puts format(
-      "| %s | %.1fms | %.1fms | %.1fms | %.1fms |",
+      "| %s | %.1fms (mean %.1f, min %.1f, max %.1f) | %.1fms (mean %.1f, min %.1f, max %.1f) | %.1fms (mean %.1f, min %.1f, max %.1f) | %.1fms (mean %.1f, min %.1f, max %.1f) |",
       name,
-      metrics["wall_ms"],
-      metrics["busy_ms"],
-      metrics["idle_ms"],
-      metrics["child_process_ms"],
+      metrics["wall_ms"]["median"],
+      metrics["wall_ms"]["mean"],
+      metrics["wall_ms"]["min"],
+      metrics["wall_ms"]["max"],
+      metrics["busy_ms"]["median"],
+      metrics["busy_ms"]["mean"],
+      metrics["busy_ms"]["min"],
+      metrics["busy_ms"]["max"],
+      metrics["idle_ms"]["median"],
+      metrics["idle_ms"]["mean"],
+      metrics["idle_ms"]["min"],
+      metrics["idle_ms"]["max"],
+      metrics["child_process_ms"]["median"],
+      metrics["child_process_ms"]["mean"],
+      metrics["child_process_ms"]["min"],
+      metrics["child_process_ms"]["max"],
     )
   end
   puts
@@ -378,15 +447,18 @@ RUBY
 
   local args=()
   local entry=""
+  local run_index=""
   local label=""
   local wall=""
   local path=""
   for entry in "${RESULTS[@]}"; do
-    label=${entry%%:*}
-    wall=${entry#*:}
+    run_index=${entry%%:*}
+    label=${entry#*:}
+    label=${label%%:*}
+    wall=${entry#*:*:}
     wall=${wall%%:*}
     path=${entry##*:}
-    args+=("$label" "$wall" "$path")
+    args+=("$run_index" "$label" "$wall" "$path")
   done
 
   ruby -e "$ruby_script" "${args[@]}"
@@ -396,6 +468,12 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --keep)
       KEEP_VM=true
+      shift
+      ;;
+    --runs)
+      shift
+      [ "$#" -gt 0 ] || fail "missing value for --runs"
+      RUNS=$1
       shift
       ;;
     --output)
@@ -414,20 +492,30 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$RUNS" in
+  ''|*[!0-9]*)
+    fail "--runs must be a positive integer"
+    ;;
+esac
+
+[ "$RUNS" -ge 1 ] || fail "--runs must be >= 1"
+
 setup_vm
 
-prepare_clean_prefix
-run_scenario "update" "/tmp/bd update"
+for run_index in $(seq 1 "$RUNS"); do
+  prepare_clean_prefix
+  run_scenario "$run_index" "update" "/tmp/bd update"
 
-prepare_clean_prefix
-run_scenario "install-tree" "/tmp/bd install tree"
+  prepare_clean_prefix
+  run_scenario "$run_index" "install-tree" "/tmp/bd install tree"
 
-prepare_clean_prefix
-run_scenario "install-jq-wget" "/tmp/bd install jq wget"
+  prepare_clean_prefix
+  run_scenario "$run_index" "install-jq-wget" "/tmp/bd install jq wget"
 
-prepare_clean_prefix
-prepare_upgrade_fixture
-run_scenario "upgrade-dry-run-jq" "/tmp/bd upgrade --dry-run jq"
+  prepare_clean_prefix
+  prepare_upgrade_fixture
+  run_scenario "$run_index" "upgrade-dry-run-jq" "/tmp/bd upgrade --dry-run jq"
+done
 
 markdown=$(render_markdown)
 printf '%s\n' "$markdown"
