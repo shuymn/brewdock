@@ -36,12 +36,13 @@ cli → core → {formula, bottle, cellar}
 - `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve. No core dependency.
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
 - `brewdock-cellar`: materialize, receipt, relocation, linking, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only).
-- `brewdock-core`: Layout, platform, lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation. Depends on formula, bottle, cellar.
-- `brewdock-cli`: clap commands, tokio runtime. Depends on core only.
+- `brewdock-core`: Layout, platform, lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, and user-facing progress event emission. Depends on formula, bottle, cellar.
+- `brewdock-cli`: clap commands, tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only.
 
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
 Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
 Install orchestration is stage-driven via an explicit execution plan. Bottle and source installs both flow through `network acquire -> local prepare -> finalize`, where network acquire and local prepare use explicit bounded concurrency, source builds are admitted via `defer-to-finalize` entries instead of a separate control path, blob/store publication happens only after checksum-complete success, and finalize remains the only Homebrew-visible mutation boundary.
+User-facing terminal output is not derived from the `tracing` subscriber. `brewdock-core` emits explicit progress events for CLI consumption, while `tracing` remains reserved for diagnostics and benchmark capture.
 
 Each crate owns a `thiserror` error enum. Core aggregates with `#[from]`.
 
@@ -52,7 +53,7 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 | Concern | Choice | Rationale |
 |---------|--------|-----------|
 | Product stance | Performance-oriented Homebrew coexisting client, not a Homebrew replacement | Keeps optimization work focused on pipeline/storage/cache design while preserving Homebrew interoperability |
-| CLI | clap (derive) | Standard, derive macro reduces boilerplate |
+| CLI | clap (derive) + indicatif | Standard argument parsing plus non-interactive progress rendering |
 | HTTP | reqwest (rustls-tls, stream) | JSON API, bottle download, source archive fetch, Ruby source fetch without OpenSSL system dep |
 | Async | tokio | Network orchestration; blocking I/O and local builds stay isolated |
 | SHA256 | sha2 | Pure Rust, streaming chunk update |
@@ -63,7 +64,7 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 | Error (lib) | thiserror | Per-crate typed errors |
 | Error (app) | anyhow | CLI context wrapping |
 | API abstraction | Generic trait (not trait object) | Static dispatch; mock in tests via generic parameter |
-| Logging | tracing + tracing-subscriber | Structured, level-controlled |
+| Logging | explicit progress events for user-facing output; `tracing` + `tracing-subscriber` for diagnostics and benchmark capture | Keeps terminal UX stable while preserving structured benchmark data and developer diagnostics |
 | Bottle selection | Compatible tag fallback (`arm64_sequoia -> arm64_sonoma -> arm64_ventura -> all`) | Matches target Homebrew usage without requiring exact host tag parity |
 | `post_install` execution | Parse full `homebrew/core` Ruby source with `ruby-prism`, lower only allowlisted AST shapes into internal operations, then normalize reachable filesystem effects into fixed schemas before execution | Removes Ruby runtime dependency while replacing formula-specific builtins with fail-closed generic lowering and normalization |
 | Source fallback | Generic build driver (`cmake`/`configure`/`meson`/`make`) | Enables a small first source path without full Formula DSL compatibility |
@@ -79,6 +80,7 @@ None blocking. Decision record: [ADR 0001](adr/0001-nanobrew-install-method.md).
 - Need to support cask or external taps
 - Formula count exceeds JSON API scalability
 - Read-heavy commands such as `search`, `info`, `list`, or `outdated` become first-class enough that metadata cache design dominates user-facing latency
+- Terminal UX needs richer interaction than non-interactive progress plus static summaries
 - Need Homebrew Formula DSL compatibility beyond restricted AST lowering and schema normalization
 - Generic source build fallback cannot cover target formulae without Ruby formula execution
 
