@@ -577,7 +577,7 @@ if should_run_phase "upgrade"; then
 log "Running: bd upgrade (should be up-to-date)"
 UPGRADE_OUTPUT=$(vm_ssh "/tmp/bd upgrade" 2>&1 || true)
 echo "$UPGRADE_OUTPUT"
-if echo "$UPGRADE_OUTPUT" | grep -q "Already up-to-date"; then
+if echo "$UPGRADE_OUTPUT" | grep -q "Already up to date."; then
   pass "bd upgrade (no-op)"
 else
   fail "bd upgrade should report up-to-date after fresh install"
@@ -600,7 +600,7 @@ pass "Cellar faked to 0.0.0-fake"
 log "Running: bd upgrade $PRIMARY_FORMULA (should download and install)"
 UPGRADE_OUTPUT=$(vm_ssh "/tmp/bd upgrade $PRIMARY_FORMULA" 2>&1 || true)
 echo "$UPGRADE_OUTPUT"
-if echo "$UPGRADE_OUTPUT" | grep -q "Upgraded $PRIMARY_FORMULA"; then
+if echo "$UPGRADE_OUTPUT" | grep -q "^Upgraded$"; then
   pass "bd upgrade $PRIMARY_FORMULA"
 else
   fail "bd upgrade $PRIMARY_FORMULA did not report upgrade"
@@ -629,7 +629,7 @@ fi
 log "Running: bd install --dry-run $DRY_RUN_FORMULA"
 DRY_OUTPUT=$(vm_ssh "/tmp/bd install --dry-run $DRY_RUN_FORMULA" 2>&1 || true)
 echo "$DRY_OUTPUT"
-if echo "$DRY_OUTPUT" | grep -qE "(Would install|Nothing to install)"; then
+if echo "$DRY_OUTPUT" | grep -qE "(Install plan|Nothing to install)"; then
   pass "bd install --dry-run"
 else
   fail "bd install --dry-run produced unexpected output"
