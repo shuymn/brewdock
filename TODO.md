@@ -342,7 +342,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: command ごとに個別追加すると metadata/state の重複経路が増え、性能設計と共存 contract の両方が崩れやすい
   - Escalate if: prioritized command のどれかが Homebrew-visible state だけでは閉じず、別の永続モデルを要求する場合
 
-- [ ] Theme: Benchmark-grade phase accounting for optimization decisions
+- [x] Theme: Benchmark-grade phase accounting for optimization decisions
   - Outcome: `bd update` / `bd install` / `bd upgrade` の baseline が wall / busy / child-process を区別して再利用でき、以後の高速化判断で phase attribution を誤りにくくなる
   - Goal: 現行 tracing / benchmark contract を拡張し、install pipeline の真の wall bottleneck を replay 可能にする
   - Must Not Break: 既存の benchmark replay 手順を壊さない; user-visible command surface を変えない; `task check` green

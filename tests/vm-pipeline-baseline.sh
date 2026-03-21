@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # Capture brewdock pipeline baselines with tracing phase breakdowns inside a
-# disposable Tart macOS VM.
+# disposable Tart macOS VM. The report distinguishes wall/busy/idle time and
+# explicit child-process spans so optimization work is not guided by
+# `time.busy` alone.
 #
 # Usage:
 #   ./tests/vm-pipeline-baseline.sh [--keep] [--output <path>]
@@ -204,6 +206,7 @@ render_markdown() {
   local ruby_script=""
   ruby_script=$(cat <<'RUBY'
 require "json"
+require "time"
 
 def parse_duration_ms(value)
   text = value.to_s.strip
@@ -220,48 +223,135 @@ def parse_duration_ms(value)
   end
 end
 
+def find_span(event, span_name)
+  span = event["span"]
+  return span if span && span["name"] == span_name
+
+  spans = event["spans"] || []
+  spans.reverse.find { |entry| entry["name"] == span_name }
+end
+
+def span_field(span, key)
+  return nil unless span
+
+  if span.key?("fields")
+    span.dig("fields", key)
+  else
+    span[key]
+  end
+end
+
+def parse_timestamp_ms(value)
+  return nil if value.to_s.strip.empty?
+
+  Time.iso8601(value).to_r * 1000
+rescue ArgumentError
+  nil
+end
+
+def append_interval(intervals, event, duration_ms)
+  finished_at_ms = parse_timestamp_ms(event["timestamp"])
+  return if finished_at_ms.nil?
+
+  intervals << [(finished_at_ms - duration_ms).to_f, finished_at_ms.to_f]
+end
+
+def merged_interval_ms(intervals)
+  return 0.0 if intervals.empty?
+
+  merged = intervals.sort_by(&:first)
+  total = 0.0
+  current_start, current_end = merged.first
+
+  merged.drop(1).each do |start_ms, end_ms|
+    if start_ms <= current_end
+      current_end = [current_end, end_ms].max
+    else
+      total += current_end - current_start
+      current_start = start_ms
+      current_end = end_ms
+    end
+  end
+
+  total + (current_end - current_start)
+end
+
 results = []
 while ARGV.any?
   label = ARGV.shift
   wall = ARGV.shift
   path = ARGV.shift
-  phases = Hash.new(0.0)
+  phases = Hash.new do |hash, key|
+    hash[key] = {
+      "wall_ms" => 0.0,
+      "busy_ms" => 0.0,
+      "idle_ms" => 0.0,
+      "child_process_ms" => 0.0,
+      "wall_intervals" => [],
+      "child_intervals" => [],
+    }
+  end
 
   File.foreach(path) do |line|
     event = JSON.parse(line)
     fields = event["fields"] || {}
     next unless fields["message"] == "close"
 
-    span = event["span"]
-    unless span && span["name"] == "bd.phase"
-      spans = event["spans"] || []
-      span = spans.reverse.find { |entry| entry["name"] == "bd.phase" }
-    end
-    next unless span
+    busy_ms = parse_duration_ms(fields["time.busy"])
+    idle_ms = parse_duration_ms(fields["time.idle"])
+    wall_ms = busy_ms + idle_ms
 
-    phase =
-      if span.key?("fields")
-        span.dig("fields", "phase")
-      else
-        span["phase"]
+    phase_close_span = event["span"]
+
+    if phase_close_span && phase_close_span["name"] == "bd.phase"
+      phase_span = phase_close_span
+      phase = span_field(phase_span, "phase")
+      unless phase.nil? || phase.empty?
+        phases[phase]["busy_ms"] += busy_ms
+        phases[phase]["idle_ms"] += idle_ms
+        append_interval(phases[phase]["wall_intervals"], event, wall_ms)
       end
+    end
+
+    next unless find_span(event, "bd.child_process")
+    phase_span = find_span(event, "bd.phase")
+    next unless phase_span
+
+    phase = span_field(phase_span, "phase")
     next if phase.nil? || phase.empty?
 
-    phases[phase] += parse_duration_ms(fields["time.busy"])
+    append_interval(phases[phase]["child_intervals"], event, wall_ms)
   rescue JSON::ParserError
     next
   end
 
-  results << [label, wall, phases.sort_by { |(_, value)| -value }]
+  phases.each_value do |metrics|
+    metrics["wall_ms"] = merged_interval_ms(metrics.delete("wall_intervals"))
+    metrics["child_process_ms"] = merged_interval_ms(metrics.delete("child_intervals"))
+  end
+
+  sorted_phases = phases.sort_by { |(_, metrics)| -metrics["wall_ms"] }
+  results << [label, wall, sorted_phases]
 end
 
 puts "# Pipeline Baseline"
 puts
-puts "| Scenario | Wall | Top Phases |"
-puts "|---|---:|---|"
+puts "| Scenario | Wall | Top Wall Phases | Top Child Phases |"
+puts "|---|---:|---|---|"
 results.each do |label, wall, phases|
-  top = phases.first(3).map { |name, value| format("%s %.1fms", name, value) }.join(", ")
-  puts "| #{label} | #{wall} | #{top.empty? ? "-" : top} |"
+  top_wall =
+    phases.first(3).map do |name, metrics|
+      format("%s %.1fms", name, metrics["wall_ms"])
+    end.join(", ")
+  top_child =
+    phases
+      .select { |(_, metrics)| metrics["child_process_ms"] > 0.0 }
+      .first(3)
+      .map do |name, metrics|
+        format("%s %.1fms", name, metrics["child_process_ms"])
+      end
+      .join(", ")
+  puts "| #{label} | #{wall} | #{top_wall.empty? ? "-" : top_wall} | #{top_child.empty? ? "-" : top_child} |"
 end
 puts
 puts "## Phase Breakdown"
@@ -269,10 +359,17 @@ puts
 results.each do |label, _wall, phases|
   puts "### #{label}"
   puts
-  puts "| Phase | Busy Time |"
-  puts "|---|---:|"
-  phases.each do |name, value|
-    puts format("| %s | %.1fms |", name, value)
+  puts "| Phase | Wall Time | Busy Time | Idle Time | Child Process |"
+  puts "|---|---:|---:|---:|---:|"
+  phases.each do |name, metrics|
+    puts format(
+      "| %s | %.1fms | %.1fms | %.1fms | %.1fms |",
+      name,
+      metrics["wall_ms"],
+      metrics["busy_ms"],
+      metrics["idle_ms"],
+      metrics["child_process_ms"],
+    )
   end
   puts
 end
