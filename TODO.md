@@ -341,3 +341,64 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Executable doc: `cargo test -p brewdock-cli -- commands`; `cargo run -p brewdock-cli -- --help`; `cargo run -p brewdock-cli -- outdated`
   - Why not split vertically further?: command ごとに個別追加すると metadata/state の重複経路が増え、性能設計と共存 contract の両方が崩れやすい
   - Escalate if: prioritized command のどれかが Homebrew-visible state だけでは閉じず、別の永続モデルを要求する場合
+
+- [ ] Theme: Benchmark-grade phase accounting for optimization decisions
+  - Outcome: `bd update` / `bd install` / `bd upgrade` の baseline が wall / busy / child-process を区別して再利用でき、以後の高速化判断で phase attribution を誤りにくくなる
+  - Goal: 現行 tracing / benchmark contract を拡張し、install pipeline の真の wall bottleneck を replay 可能にする
+  - Must Not Break: 既存の benchmark replay 手順を壊さない; user-visible command surface を変えない; `task check` green
+  - Non-goals: この Theme で install pipeline 自体は高速化しない; cache format 変更; cask 対応
+  - Acceptance (EARS):
+    - When the pipeline baseline is replayed, the system shall record wall-clock evidence that distinguishes async busy time from subprocess or blocking wait where the current benchmark contract can mislead optimization decisions
+    - When benchmark evidence is reviewed for `install-jq-wget`, the system shall make it possible to decide whether `prefetch`, `materialize`, or subprocess-heavy relocation is the dominant wall bottleneck
+    - If a timing signal cannot be captured replayably without ambiguous interpretation, the system shall fail the Theme rather than publish misleading evidence
+  - Evidence: `run=task check && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md; oracle=updated baseline shows replayable wall-oriented phase evidence for update/install/upgrade without changing user-visible commands; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md`
+  - Gates: `static`, `benchmark`, `system`
+  - Executable doc: `./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md`
+  - Why not split vertically further?: evidence contract を先に固めないと、後続 Theme の効果判定が `time.busy` 偏重で揺れる
+  - Escalate if: wall / subprocess attribution の取得に benchmark harness か user-visible command の前提変更が必要になる場合
+
+- [ ] Theme: Two-stage bottle pre-finalize executor with explicit execution plan
+  - Outcome: multi-formula bottle install が `network acquire -> local prepare -> materialize/relocate -> finalize` に再編され、`current_thread` runtime でも blocking I/O による不要な直列化が減る
+  - Goal: bottle path を staged executor に載せ、phase contract と rollback ownership を `ExecutionPlan` に固定したうえで pre-finalize 並列性を上げる
+  - Must Not Break: Homebrew-visible finalize boundary を壊さない; rollback は keg 単位で fail-closed のままにする; source build path の成功系を壊さない; `task check` green
+  - Non-goals: source build executor の再設計; dedicated prefix; uninstall 実装; store format の大幅変更
+  - Acceptance (EARS):
+    - When multiple independent bottle installs are requested, the system shall allow `network acquire` to progress without being serialized by unrelated blob persistence or extraction work
+    - When local payload preparation runs, the system shall bound blocking concurrency explicitly rather than letting all blocking work contend implicitly
+    - When a bottle install is planned, the system shall represent staged work and the finalize boundary in an explicit plan artifact rather than distributing that contract across ad-hoc orchestrator control flow
+    - If one formula fails before finalize, the system shall cleanup that formula safely without mutating unrelated successful formulae into an inconsistent Homebrew-visible state
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-benchmark.sh --formula-set jq,wget --manager brewdock; oracle=integration tests prove phase ordering and rollback under the new staged bottle executor, and VM replay shows lower wall time for multi-formula bottle installs without state regression; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget`
+  - Gates: `static`, `integration`, `benchmark`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- install`; `./tests/vm-smoke-test.sh --formula jq --formula wget`; `./tests/vm-benchmark.sh --formula-set jq,wget --manager brewdock`
+  - Why not split vertically further?: executor split だけ先に入れても `ExecutionPlan` と rollback closure が揃わなければ、source path 編入の入口条件も user-visible latency 改善も固定できない
+  - Escalate if: pre-finalize で分離した local prepare が opt / Cellar mutation と実質的に競合し、finalize boundary の再定義が必要になる場合
+
+- [ ] Theme: Source-build admission into staged executor
+  - Outcome: bottle staged executor Theme の直後に、source fallback も同じ `ExecutionPlan` と phase contract に編入され、install path が bottle/source で二重化しない
+  - Goal: staged bottle executor Theme 完了直後の follow-up として、source build を同じ plan artifact に載せて ad-hoc な finalize-only path を閉じる
+  - Must Not Break: linked dependency 前提の source build correctness を壊さない; rollback と Homebrew-visible finalize contract を弱めない; unsupported requirement は fail-closed のままにする; `task check` green
+  - Non-goals: generic builder の大幅拡張; Ruby Formula DSL 互換導入; source build 自体の性能最適化
+  - Acceptance (EARS):
+    - When a source fallback formula is installed, the system shall schedule source build through the same `ExecutionPlan` and phase contract used by bottle installs
+    - When linked dependencies are required before build, the system shall serialize only the mutation boundary needed to preserve Homebrew-visible correctness rather than reintroducing an ad-hoc install path
+    - If source build cannot fit the staged executor without weakening rollback or Homebrew-visible state guarantees, the system shall fail the Theme and escalate
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula portable-libffi; oracle=integration tests prove source fallback uses the shared plan artifact and phase contract, and VM replay covers one representative source fallback install without rollback or state regression; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula portable-libffi`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- source_fallback`; `./tests/vm-smoke-test.sh --formula portable-libffi`
+  - Why not split vertically further?: bottle path だけ staged executor に載せたまま source path を別制御に残すと phase contract が二重化し、いつ source build を編入すべきかが再び未決になる
+  - Escalate if: shared `ExecutionPlan` に source build を載せるために finalize boundary 以外の Homebrew-visible contract を変更する必要がある場合
+
+- [ ] Theme: Copy-strategy spike for manifest-aware materialize/relocate
+  - Outcome: bottle materialize/relocate の高コスト区間に対し、`clonefile` first + fallback copy と targeted relocation manifest の可否が evidence 付きで判断できる
+  - Goal: warm/cold install の支配コストである full-tree copy と full-tree relocation walk を安全に減らせる候補を spike で見極める
+  - Must Not Break: store を mutation source にしない; rollback / fail-closed policy を崩さない; `task check` green
+  - Non-goals: この Theme で final architecture を固定すること; hardlink default 採用; source build path 最適化
+  - Acceptance (EARS):
+    - When the spike is replayed on representative bottles, the system shall produce evidence comparing current copy+walk against `clonefile`-first and manifest-targeted relocation candidates
+    - If a candidate strategy can mutate shared store state or weakens rollback guarantees, the system shall reject that strategy explicitly
+    - When the spike concludes, the system shall leave a single next implementation choice rather than an open-ended option list
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md; oracle=spike evidence identifies one safe next copy/relocation strategy with measured cost on representative bottle installs; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget`
+  - Gates: `static`, `benchmark`, `system`
+  - Executable doc: `./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md`; `./tests/vm-smoke-test.sh --formula jq --formula wget`
+  - Why not split vertically further?: copy strategy と relocation targeting を別 spike にすると store mutation risk と wall-clock benefit の比較軸がずれる
+  - Escalate if: `clonefile` 系の候補が macOS VM 上で一貫して使えず、copy cost 改善に別の長距離 architectural bet が必要になる場合
