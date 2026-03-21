@@ -480,13 +480,6 @@ mod tests {
         assert_order("3.51.3", "3.52.0");
     }
 
-    #[test]
-    fn test_sqlite_bug_case() {
-        // The original bug: installed 3.52.0 was reported as outdated
-        // because cached latest was 3.51.3.
-        assert_order("3.51.3", "3.52.0");
-    }
-
     // -- Null padding (different lengths) ----------------------------------
 
     #[test]

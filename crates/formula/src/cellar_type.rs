@@ -78,69 +78,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cellar_type_deserialize_any() -> Result<(), serde_json::Error> {
-        let ct: CellarType = serde_json::from_str(r#"":any""#)?;
-        assert_eq!(ct, CellarType::Any);
-        Ok(())
-    }
+    fn test_cellar_type_round_trip_cases() -> Result<(), serde_json::Error> {
+        let cases = [
+            (
+                r#"":any""#,
+                CellarType::Any,
+                Path::new("/opt/homebrew/Cellar"),
+                true,
+            ),
+            (
+                r#"":any_skip_relocation""#,
+                CellarType::AnySkipRelocation,
+                Path::new("/usr/local/Cellar"),
+                true,
+            ),
+            (
+                r#""/opt/homebrew/Cellar""#,
+                CellarType::Path("/opt/homebrew/Cellar".to_owned()),
+                Path::new("/opt/homebrew/Cellar"),
+                true,
+            ),
+            (
+                r#""/usr/local/Cellar""#,
+                CellarType::Path("/usr/local/Cellar".to_owned()),
+                Path::new("/opt/homebrew/Cellar"),
+                false,
+            ),
+        ];
 
-    #[test]
-    fn test_cellar_type_deserialize_any_skip_relocation() -> Result<(), serde_json::Error> {
-        let ct: CellarType = serde_json::from_str(r#"":any_skip_relocation""#)?;
-        assert_eq!(ct, CellarType::AnySkipRelocation);
-        Ok(())
-    }
-
-    #[test]
-    fn test_cellar_type_deserialize_path() -> Result<(), serde_json::Error> {
-        let ct: CellarType = serde_json::from_str(r#""/opt/homebrew/Cellar""#)?;
-        assert_eq!(ct, CellarType::Path("/opt/homebrew/Cellar".to_owned()));
-        Ok(())
-    }
-
-    #[test]
-    fn test_cellar_type_display() {
-        assert_eq!(CellarType::Any.to_string(), ":any");
-        assert_eq!(
-            CellarType::AnySkipRelocation.to_string(),
-            ":any_skip_relocation"
-        );
-        assert_eq!(
-            CellarType::Path("/opt/homebrew/Cellar".to_owned()).to_string(),
-            "/opt/homebrew/Cellar"
-        );
-    }
-
-    #[test]
-    fn test_is_compatible_any() {
-        assert!(CellarType::Any.is_compatible(Path::new("/opt/homebrew/Cellar")));
-        assert!(CellarType::Any.is_compatible(Path::new("/usr/local/Cellar")));
-    }
-
-    #[test]
-    fn test_is_compatible_any_skip_relocation() {
-        assert!(CellarType::AnySkipRelocation.is_compatible(Path::new("/opt/homebrew/Cellar")));
-        assert!(CellarType::AnySkipRelocation.is_compatible(Path::new("/usr/local/Cellar")));
-    }
-
-    #[test]
-    fn test_is_compatible_matching_path() {
-        let ct = CellarType::Path("/opt/homebrew/Cellar".to_owned());
-        assert!(ct.is_compatible(Path::new("/opt/homebrew/Cellar")));
-    }
-
-    #[test]
-    fn test_is_compatible_mismatching_path() {
-        let ct = CellarType::Path("/usr/local/Cellar".to_owned());
-        assert!(!ct.is_compatible(Path::new("/opt/homebrew/Cellar")));
-    }
-
-    #[test]
-    fn test_cellar_type_round_trip() -> Result<(), serde_json::Error> {
-        for input in [":any", ":any_skip_relocation", "/custom/path"] {
-            let json = format!("\"{input}\"");
-            let ct: CellarType = serde_json::from_str(&json)?;
-            assert_eq!(ct.to_string(), input);
+        for (json, expected, path, compatible) in cases {
+            let actual: CellarType = serde_json::from_str(json)?;
+            assert_eq!(actual, expected, "deserialize mismatch for {json}");
+            assert_eq!(
+                actual.to_string(),
+                json.trim_matches('"'),
+                "display mismatch for {json}"
+            );
+            assert_eq!(
+                actual.is_compatible(path),
+                compatible,
+                "compatible mismatch for {json}"
+            );
         }
         Ok(())
     }
