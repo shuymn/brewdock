@@ -95,6 +95,7 @@ For destructive runtime validation and comparative benchmarks, use the VM script
 ./tests/vm-smoke-test.sh --formula jq
 ./tests/vm-benchmark.sh --formula tree --manager brewdock --manager homebrew
 ./tests/vm-benchmark.sh --formula-set jq,wget
+./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md
 ```
 
 ## Repository Layout

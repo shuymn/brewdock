@@ -47,6 +47,16 @@ tasks:
     cmds:
       - ./tests/vm-benchmark.sh {{.CLI_ARGS}}
 
+  bench:pipeline:
+    desc: Capture brewdock pipeline baselines in a Tart macOS VM
+    summary: |
+      Replays bd update / install / upgrade paths in a disposable Tart macOS VM and
+      emits a markdown summary with tracing-derived phase breakdowns. Pass extra args
+      after --, for example:
+      task bench:pipeline -- --output docs/pipeline-baseline.md
+    cmds:
+      - ./tests/vm-pipeline-baseline.sh {{.CLI_ARGS}}
+
   doc:
     desc: Build documentation
     summary: |

@@ -264,7 +264,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: `node` と `ruby` を別々に閉じても VM 上の user-visible contract は依存 chain 単位でしか確認できず、known blocker の解消判定が揺れる
   - Escalate if: `node` または `ruby` の reachable runtime semantics が schema normalization では吸収できず、formula-specific behavior か arbitrary Ruby execution を要求する場合
 
-- [ ] Theme: Pipeline baseline and bottleneck evidence for install/update/upgrade
+- [x] Theme: Pipeline baseline and bottleneck evidence for install/update/upgrade
   - Outcome: `install` / `update` / `upgrade` の主要フェーズごとの所要時間と replay 手順が固定され、今後の最適化前後比較で同じ baseline を再利用できる
   - Goal: 現行 pipeline の wall-clock baseline と phase breakdown を、single install / multi install / update / upgrade の user-visible 経路ごとに取得して保存する
   - Must Not Break: `/opt/homebrew` 共存の contract を変えない; benchmark は brewdock に有利な特別条件を入れない; destructive 操作は VM 内に限定する
@@ -273,9 +273,9 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
     - When representative commands such as `bd install tree`, `bd install jq wget`, `bd update`, and `bd upgrade` are replayed, the system shall produce reusable timing evidence with the same command surface the user runs
     - When benchmark evidence is reviewed later, the system shall show phase-level bottlenecks rather than only a single total duration
     - If a benchmark scenario cannot be replayed without ambiguous setup or tool-specific bias, the system shall fail the Theme rather than record a misleading baseline
-  - Evidence: `run=./tests/vm-benchmark.sh --formula tree --formula wget --formula ffmpeg --formula-set jq,wget && cargo build --release -p brewdock-cli && <targeted update/upgrade replay command>; oracle=baseline table plus phase-attributed measurements for install/update/upgrade on a disposable VM; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task check plus targeted VM replay; notes=baseline must stay tool-neutral and Homebrew-coexisting`
+  - Evidence: `run=task check && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md; oracle=committed markdown baseline plus tracing-derived phase-attributed measurements for update/install/upgrade-dry-run on a disposable VM; visibility=implementation-visible; controls=[]; missing=[agent,context]; companion=task check plus ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md; notes=2026-03-21 baseline keeps Homebrew coexistence and uses the same user-visible command surface`
   - Gates: `static`, `benchmark`, `system`
-  - Executable doc: `./tests/vm-benchmark.sh --formula tree --formula wget --formula ffmpeg --formula-set jq,wget`; `cargo run -p brewdock-cli -- update`; `cargo run -p brewdock-cli -- upgrade --dry-run`
+  - Executable doc: `./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md`
   - Why not split vertically further?: install/update/upgrade の baseline が別々だと pipeline 再設計の優先順位を比較できず、optimization Theme の blocker 判定が揺れる
   - Escalate if: phase breakdown を取るために user-visible contract を変える必要が出る場合
 

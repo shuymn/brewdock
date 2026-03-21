@@ -9,8 +9,9 @@ Read this file before writing or modifying tests in this repository.
 - For focused runs: `cargo test -p brewdock-core <filter>`, `cargo test -p brewdock-formula <filter>`, etc. Use `-- --nocapture` for output.
 - Use [`tests/vm-smoke-test.sh`](../tests/vm-smoke-test.sh) for destructive install smoke tests that must not touch the local `/opt/homebrew` environment. It runs inside a disposable Tart macOS VM: `./tests/vm-smoke-test.sh [--keep] [--formula <name> ...]`.
 - Use [`tests/vm-benchmark.sh`](../tests/vm-benchmark.sh) for comparative install benchmarks in a disposable Tart macOS VM. It installs Homebrew, brewdock, zerobrew, and nanobrew inside the VM and prints a Markdown summary table. Single-package rows use `--formula <name>` and multi-package one-command rows use `--formula-set <a,b,...>`: `./tests/vm-benchmark.sh [--keep] [--formula <name> ...] [--formula-set <a,b,...> ...] [--manager <name> ...]`.
+- Use [`tests/vm-pipeline-baseline.sh`](../tests/vm-pipeline-baseline.sh) to capture brewdock-only `update` / `install` / `upgrade --dry-run` baselines with tracing-derived phase breakdowns inside a disposable Tart macOS VM: `./tests/vm-pipeline-baseline.sh [--keep] [--output docs/pipeline-baseline.md]`.
 - Before running the VM smoke test, satisfy the script prerequisites: install `tart`, pull `ghcr.io/cirruslabs/macos-sequoia-base:latest`, and build the release CLI with `cargo build --release -p brewdock-cli`.
-- The benchmark script uses the same VM prerequisites as the smoke test and also requires outbound network access inside the VM for the Homebrew / zerobrew / nanobrew installers.
+- The benchmark scripts use the same VM prerequisites as the smoke test. `vm-benchmark.sh` also requires outbound network access inside the VM for the Homebrew / zerobrew / nanobrew installers.
 
 ## Suite Expectations
 
