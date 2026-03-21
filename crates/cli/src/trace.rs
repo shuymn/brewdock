@@ -113,6 +113,7 @@ mod tests {
         assert!(output.contains("\"message\":\"close\""));
         assert!(output.contains("fetch-formula-index"));
         assert!(output.contains("\"time.busy\""));
+        assert!(output.contains("\"time.idle\""));
         Ok(())
     }
 }

@@ -1740,6 +1740,16 @@ fn run_system(arguments: &[Argument], context: &PostInstallContext) -> Result<()
             .ok_or_else(|| CellarError::UnsupportedPostInstallSyntax {
                 message: "system expects at least one argument".to_owned(),
             })?;
+    let span = tracing::info_span!(
+        "bd.child_process",
+        program = %program.to_string_lossy(),
+        argv = %program_args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let _entered = span.enter();
     let output = Command::new(program).args(program_args).output()?;
     if output.status.success() {
         return Ok(());

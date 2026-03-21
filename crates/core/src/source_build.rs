@@ -274,6 +274,8 @@ fn run_build_command(
     program: &str,
     args: &[&str],
 ) -> Result<(), BrewdockError> {
+    let span = tracing::info_span!("bd.child_process", program, argv = args.join(" "),);
+    let _entered = span.enter();
     let output = Command::new(program)
         .current_dir(source_root)
         .env("PATH", path)

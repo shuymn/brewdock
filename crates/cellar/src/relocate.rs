@@ -260,6 +260,8 @@ fn skip_cmdsize_and_extract<'a>(
 
 /// Runs a command and returns its stdout as a string.
 fn run_cmd(program: &str, args: &[&str]) -> Result<String, CellarError> {
+    let span = tracing::info_span!("bd.child_process", program, argv = args.join(" "),);
+    let _entered = span.enter();
     let output = std::process::Command::new(program)
         .args(args)
         .output()
