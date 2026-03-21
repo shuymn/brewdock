@@ -194,7 +194,7 @@ pub fn create_bottle_tar_gz(
         let mut header = tar::Header::new_gnu();
         header.set_path(&full_path)?;
         header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(bottle_entry_mode(path));
         header.set_cksum();
         builder.append(&header, contents)?;
     }
@@ -202,6 +202,14 @@ pub fn create_bottle_tar_gz(
     let encoder = builder.into_inner()?;
     let compressed = encoder.finish()?;
     Ok(compressed)
+}
+
+fn bottle_entry_mode(path: &str) -> u32 {
+    if path.starts_with("bin/") || path.starts_with("sbin/") {
+        0o755
+    } else {
+        0o644
+    }
 }
 
 pub fn create_source_tar_gz(
