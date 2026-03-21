@@ -565,7 +565,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// or contains unsupported syntax.
     async fn check_post_install_viability(&self, formula: &Formula) -> Result<(), BrewdockError> {
         if let Some(source) = self.fetch_post_install_source(formula).await? {
-            validate_post_install(&source)?;
+            validate_post_install(&source, &formula.versions.stable)?;
         }
         Ok(())
     }
@@ -580,7 +580,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         };
         let transaction = run_post_install(
             &ruby_source,
-            &PostInstallContext::new(self.layout.prefix(), keg_path),
+            &PostInstallContext::new(self.layout.prefix(), keg_path, &formula.versions.stable),
         )?;
         Ok(Some(transaction))
     }

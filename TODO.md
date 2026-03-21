@@ -237,7 +237,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: text relocation の条件変更だけでは VM 上の usability が確認できず、httpie の動作確認とセットでないと contract が閉じない
   - Escalate if: `any_skip_relocation` bottle に Homebrew が text relocation 以外の追加処理をしていて、text placeholder 置換だけでは httpie が動作しない場合
 
-- [ ] Theme: Expand restricted `post_install` support for dependency-critical formulae
+- [x] Theme: Expand restricted `post_install` support for dependency-critical formulae
   - Outcome: `node` と `ruby` のような依存の中核になる formula の `post_install` が restricted runtime で通り、`agent-browser` と `vim` の依存 chain が known blocker から外れる
   - Goal: dependency-critical formulae の `post_install` を調査し、現在の restricted lowering / schema normalization に収まる最小拡張で `node` と `ruby` を通す
   - Must Not Break: fail-closed policy を崩さない; unsupported runtime branch は明示失敗のままにする; receipt/state cleanup は成功時のみ更新する; `task check` green

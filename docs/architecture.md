@@ -73,12 +73,14 @@ None blocking. Decision record: [ADR 0001](adr/0001-nanobrew-install-method.md).
 - Parse `post_install` from full formula source and allow helper methods to participate only as static lowering material.
 - The parser accepts representational variance such as receiverless space-call / paren-call, zero-arg helper calls, receiver-based path helper calls, `if OS.mac?`, `if path.exist?`, `rm(..., force: true)`, `rm(...) if ...exist?`, `install_symlink`, and `Formula["..."].pkgetc`.
 - The evaluator never executes AST directly. It executes only lowered internal operations.
-- The initial internal operation set is fixed to `Mkpath`, `CopyFile`, `RunSystemArgv`, `RemoveIfExists`, `InstallSymlink`, `IfPathExists`, `MacOsBranch`, `CallHelper`, and `ResolveFormulaPkgetc`.
+- The initial internal operation set is fixed to `Mkpath`, `CopyFile`, `RunSystemArgv`, `RemoveIfExists`, `InstallSymlink`, `IfPathExists`, `MacOsBranch`, `CallHelper`, `ResolveFormulaPkgetc`, `RecursiveCopy`, `ForceSymlink`, `WriteFile`, `GlobRemove`, and `GlobSymlink`.
 - macOS runtime semantics are fixed: `if OS.mac?` executes only the `then` branch; the `else` branch is parsed but is not a runtime path.
 - Unsupported nodes that remain in a reachable macOS runtime branch fail closed.
 - Unsupported nodes that exist only in a non-runtime branch do not fail by themselves.
 - Helper methods are zero-arg only. Path helpers must lower to a single path expression; action helpers must lower fully into allowlisted operations; recursive helpers, arity-bearing helpers, and block-taking helpers fail closed.
-- Schema normalization is fixed to two reachable filesystem-effect schemas for now:
+- Schema normalization recognizes four reachable filesystem-effect schemas:
   - bundle bootstrap: materialize a keg PEM bundle into `prefix/etc/<formula>/cert.pem`
   - dependent cert symlink: replace `prefix/etc/<name>/cert.pem` with a relative symlink to `Formula["..."].pkgetc/"cert.pem"`
+  - Ruby bundler cleanup: remove bundler executables and gem directories from `HOMEBREW_PREFIX/lib/ruby/gems/<api_version>/` (detected via `api_version` + `rubygems_bindir` helpers with `rm` + `rm_r` calls; `api_version` is computed from formula version)
+  - Node npm propagation: copy npm from `libexec` to `HOMEBREW_PREFIX/lib/node_modules`, create bin/man symlinks, write npmrc config (detected via `cp_r` + `ln_sf` calls with `HOMEBREW_PREFIX` + `node_modules` references)
 - Schema normalization may read non-runtime branches as static material only. Linux branches remain unsupported as runtime behavior.
