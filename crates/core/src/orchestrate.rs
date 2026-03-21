@@ -2127,6 +2127,83 @@ end
     }
 
     #[tokio::test]
+    async fn test_install_succeeds_when_post_install_creates_prefix_owned_link_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let mut formula = make_formula("shared-mime-info", "2.4", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz(
+            "shared-mime-info",
+            "2.4",
+            &[
+                (
+                    "bin/update-mime-database",
+                    b"#!/bin/sh\nmkdir -p \"$1\"\ntouch \"$1/mime.cache\"\n",
+                ),
+                (
+                    "share/shared-mime-info/packages/freedesktop.org.xml",
+                    b"<mime-info/>",
+                ),
+            ],
+        )?;
+
+        let source = r#"
+class SharedMimeInfo < Formula
+  def post_install
+    global_mime = HOMEBREW_PREFIX/"share/mime"
+    cellar_mime = share/"mime"
+
+    rm_r(global_mime) if global_mime.symlink?
+    rm_r(cellar_mime) if cellar_mime.exist? && !cellar_mime.symlink?
+    ln_sf(global_mime, cellar_mime)
+
+    (global_mime/"packages").mkpath
+    cp (pkgshare/"packages").children, global_mime/"packages"
+
+    system bin/"update-mime-database", global_mime
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/shared-mime-info.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["shared-mime-info"]).await?;
+        let mime_dir = layout.prefix().join("share/mime");
+
+        assert_eq!(installed, vec!["shared-mime-info"]);
+        assert_eq!(
+            std::fs::read_to_string(mime_dir.join("packages/freedesktop.org.xml"))?,
+            "<mime-info/>"
+        );
+        assert!(mime_dir.join("mime.cache").exists());
+        assert!(
+            layout
+                .prefix()
+                .join("bin/update-mime-database")
+                .is_symlink()
+        );
+        assert!(
+            layout
+                .cellar()
+                .join("shared-mime-info/2.4/share/mime")
+                .is_symlink()
+        );
+        assert_installed(&layout, "shared-mime-info");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_install_cleans_up_failed_post_install_without_receipt_or_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
