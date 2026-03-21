@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::error::CellarError;
+use crate::{error::CellarError, util::normalize_absolute_path};
 
 /// Minimal metadata read from an existing `INSTALL_RECEIPT.json`.
 ///
@@ -59,13 +59,19 @@ pub fn find_installed_keg(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    let Some(resolved_target) = normalize_opt_target(&opt_link, &target) else {
+        return Ok(None);
+    };
 
-    let pkg_version = match target.file_name().and_then(|n| n.to_str()) {
+    let pkg_version = match resolved_target.file_name().and_then(|n| n.to_str()) {
         Some(v) => v.to_owned(),
         None => return Ok(None),
     };
 
     let keg_path = cellar.join(name).join(&pkg_version);
+    if resolved_target != keg_path {
+        return Ok(None);
+    }
     let receipt_path = keg_path.join("INSTALL_RECEIPT.json");
 
     let content = match std::fs::read_to_string(&receipt_path) {
@@ -80,6 +86,15 @@ pub fn find_installed_keg(
         pkg_version,
         installed_on_request: metadata.installed_on_request,
     }))
+}
+
+fn normalize_opt_target(opt_link: &Path, target: &Path) -> Option<PathBuf> {
+    let joined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        opt_link.parent()?.join(target)
+    };
+    normalize_absolute_path(&joined)
 }
 
 /// Discovers all installed kegs from the Cellar directory.
@@ -302,6 +317,121 @@ mod tests {
         assert_eq!(keg.name, "tree");
         assert_eq!(keg.pkg_version, "2.2.1");
         assert!(keg.installed_on_request);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_installed_keg_accepts_absolute_opt_link_with_matching_keg()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let cellar = dir.path().join("Cellar");
+        let opt_dir = dir.path().join("opt");
+        let keg_path = cellar.join("jq").join("1.7");
+
+        std::fs::create_dir_all(&keg_path)?;
+        let receipt = InstallReceipt::for_bottle(
+            InstallReason::OnRequest,
+            Some(1_700_000_000.0),
+            Vec::new(),
+            ReceiptSource {
+                path: String::new(),
+                tap: "homebrew/core".to_owned(),
+                spec: "stable".to_owned(),
+                versions: ReceiptSourceVersions {
+                    stable: "1.7".to_owned(),
+                    head: None,
+                    version_scheme: 0,
+                },
+            },
+        );
+        write_receipt(&keg_path, &receipt)?;
+        std::fs::create_dir_all(&opt_dir)?;
+        crate::atomic_symlink_replace(&keg_path, &opt_dir.join("jq"))?;
+
+        let keg = find_installed_keg("jq", &cellar, &opt_dir)?.ok_or("expected keg")?;
+        assert_eq!(keg.pkg_version, "1.7");
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_installed_keg_rejects_mismatched_opt_symlink_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let cellar = dir.path().join("Cellar");
+        let opt_dir = dir.path().join("opt");
+
+        let keg_path = cellar.join("jq").join("1.7");
+        std::fs::create_dir_all(&keg_path)?;
+        let receipt = InstallReceipt::for_bottle(
+            InstallReason::OnRequest,
+            Some(1_700_000_000.0),
+            Vec::new(),
+            ReceiptSource {
+                path: String::new(),
+                tap: "homebrew/core".to_owned(),
+                spec: "stable".to_owned(),
+                versions: ReceiptSourceVersions {
+                    stable: "1.7".to_owned(),
+                    head: None,
+                    version_scheme: 0,
+                },
+            },
+        );
+        write_receipt(&keg_path, &receipt)?;
+
+        let hostile_target = dir.path().join("outside/other/1.7");
+        std::fs::create_dir_all(
+            hostile_target
+                .parent()
+                .ok_or_else(|| std::io::Error::other("missing parent"))?,
+        )?;
+        std::fs::create_dir_all(&opt_dir)?;
+        crate::atomic_symlink_replace(&hostile_target, &opt_dir.join("jq"))?;
+
+        let result = find_installed_keg("jq", &cellar, &opt_dir)?;
+        assert!(
+            result.is_none(),
+            "an opt symlink pointing outside the keg tree should not be trusted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_installed_keg_rejects_opt_link_outside_formula_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let cellar = dir.path().join("Cellar");
+        let opt_dir = dir.path().join("opt");
+
+        let other_keg = cellar.join("other").join("9.9");
+        std::fs::create_dir_all(&other_keg)?;
+        write_receipt(
+            &other_keg,
+            &InstallReceipt::for_bottle(
+                InstallReason::OnRequest,
+                Some(1_700_000_000.0),
+                Vec::new(),
+                ReceiptSource {
+                    path: String::new(),
+                    tap: "homebrew/core".to_owned(),
+                    spec: "stable".to_owned(),
+                    versions: ReceiptSourceVersions {
+                        stable: "9.9".to_owned(),
+                        head: None,
+                        version_scheme: 0,
+                    },
+                },
+            ),
+        )?;
+
+        std::fs::create_dir_all(&opt_dir)?;
+        std::os::unix::fs::symlink("../Cellar/other/9.9", opt_dir.join("target"))?;
+
+        let found = find_installed_keg("target", &cellar, &opt_dir)?;
+        assert_eq!(
+            found, None,
+            "opt symlink pointing at a different formula directory must be ignored"
+        );
         Ok(())
     }
 
