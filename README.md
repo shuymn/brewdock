@@ -64,16 +64,19 @@ cargo run -p brewdock-cli -- --help
 
 ```bash
 task build
+task build:release
 task test
 task lint
 task fmt
 task check
+task bench:vm -- --formula tree
 ```
 
 Rust-native equivalents:
 
 ```bash
 cargo build --workspace --locked
+cargo build --workspace --release --locked
 cargo test --workspace --all-targets --all-features --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -84,6 +87,14 @@ Optional: install [Lefthook](https://github.com/evilmartians/lefthook) and enabl
 
 ```bash
 lefthook install
+```
+
+For destructive runtime validation and comparative benchmarks, use the VM scripts so the local `/opt/homebrew` tree is not touched:
+
+```bash
+./tests/vm-smoke-test.sh --formula jq
+./tests/vm-benchmark.sh --formula tree --manager brewdock --manager homebrew
+./tests/vm-benchmark.sh --formula-set jq,wget
 ```
 
 ## Repository Layout

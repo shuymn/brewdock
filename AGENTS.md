@@ -5,6 +5,7 @@
 
 - Use Task ([Taskfile.yml](Taskfile.yml)) as the default interface
 - `task build` / `task test` / `task lint` / `task fmt` / `task check` — primary workflow; `task check` runs formatting check, Clippy, tests, `cargo doc`, and build; `task check:fast` skips tests and docs (see [docs/tooling.md](docs/tooling.md))
+- `task bench:vm -- --formula tree [--formula-set jq,wget] [--manager <name> ...]` — comparative install benchmark in a disposable Tart macOS VM for Homebrew / brewdock / zerobrew / nanobrew; destructive only inside the VM
 - Rust-native equivalents work without Task: `cargo build`, `cargo test`, `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` (same as `task lint`; see [docs/tooling.md](docs/tooling.md) for Clippy policy details)
 - Run the CLI: `cargo run -p brewdock-cli -- <args>` (binary name: `bd`)
 - Focused test run: `cargo test -p brewdock-core -- layout`, `cargo test -p brewdock-formula -- types`, etc.

@@ -38,6 +38,15 @@ tasks:
     cmds:
       - cargo test --workspace --all-targets --all-features --locked
 
+  bench:vm:
+    desc: Benchmark package managers in a Tart macOS VM
+    summary: |
+      Runs comparative install benchmarks for Homebrew, brewdock, zerobrew, and nanobrew
+      inside a disposable Tart macOS VM. Pass extra args after --, for example:
+      task bench:vm -- --formula tree --formula-set jq,wget --manager brewdock --manager homebrew
+    cmds:
+      - ./tests/vm-benchmark.sh {{.CLI_ARGS}}
+
   doc:
     desc: Build documentation
     summary: |
