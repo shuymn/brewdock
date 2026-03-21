@@ -10,8 +10,8 @@ pub mod orchestrate;
 pub mod platform;
 mod source_build;
 
-#[cfg(test)]
-mod testutil;
+#[doc(hidden)]
+pub mod testutil;
 
 pub use brewdock_bottle::{BottleDownloader, HttpBottleDownloader, Sha256Hex};
 pub use brewdock_formula::{FormulaRepository, HttpFormulaRepository, MetadataStore};

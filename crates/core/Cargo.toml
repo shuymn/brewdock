@@ -21,11 +21,11 @@ brewdock-cellar = { path = "../cellar" }
 fs2 = "0.4"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
+flate2 = "=1.1.9"
+tar = "=0.4.45"
 
 [dev-dependencies]
 tokio = { version = "=1.50.0", features = ["rt", "macros"] }
-flate2 = "=1.1.9"
-tar = "=0.4.45"
 
 [lints]
 workspace = true

@@ -21,6 +21,9 @@ use crate::{BottleDownloader, BrewdockError, HostTag, Layout, Orchestrator};
 
 pub const HOST_TAG: &str = "arm64_sequoia";
 pub const PLAN_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+pub const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 pub struct MockRepo {
     formulae: HashMap<String, Formula>,
@@ -28,6 +31,7 @@ pub struct MockRepo {
 }
 
 impl MockRepo {
+    #[must_use]
     pub fn new(list: Vec<Formula>) -> Self {
         let formulae = list
             .into_iter()
@@ -39,14 +43,18 @@ impl MockRepo {
         }
     }
 
-    pub fn with_sources(list: Vec<Formula>, ruby_sources: HashMap<String, String>) -> Self {
+    #[must_use]
+    pub fn with_sources(
+        list: Vec<Formula>,
+        ruby_sources: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
         let formulae = list
             .into_iter()
             .map(|formula| (formula.name.clone(), formula))
             .collect();
         Self {
             formulae,
-            ruby_sources,
+            ruby_sources: ruby_sources.into_iter().collect(),
         }
     }
 }
@@ -120,6 +128,7 @@ impl BottleDownloader for MockDownloader {
     }
 }
 
+#[must_use]
 pub fn make_formula(name: &str, version: &str, deps: &[&str], sha256: &str) -> Formula {
     Formula {
         name: name.to_owned(),
@@ -255,7 +264,7 @@ pub fn make_orchestrator(
 
 pub fn make_orchestrator_with_sources(
     formulae: Vec<Formula>,
-    ruby_sources: HashMap<String, String>,
+    ruby_sources: impl IntoIterator<Item = (String, String)>,
     bottles: Vec<(&str, Vec<u8>)>,
     counter: Arc<AtomicUsize>,
     layout: Layout,
