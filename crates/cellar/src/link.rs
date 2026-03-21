@@ -30,6 +30,10 @@ pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
                 .map_err(std::io::Error::other)?;
             let link_path = prefix.join(dir_name).join(relative);
 
+            if should_skip_self_referential_prefix_symlink(&entry, &link_path)? {
+                continue;
+            }
+
             check_link_collision(&link_path, keg_path)?;
 
             // Remove existing symlink (same keg) before recreating.
@@ -131,6 +135,23 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+fn should_skip_self_referential_prefix_symlink(
+    entry: &Path,
+    link_path: &Path,
+) -> Result<bool, CellarError> {
+    let metadata = std::fs::symlink_metadata(entry)?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+
+    let target = std::fs::read_link(entry)?;
+    let Some(parent) = entry.parent() else {
+        return Ok(false);
+    };
+    let resolved = normalize_path(&parent.join(target));
+    Ok(resolved == link_path && link_path.symlink_metadata().is_ok())
 }
 
 /// Checks whether creating a symlink at `link_path` would collide with an existing
@@ -376,6 +397,24 @@ mod tests {
             !prefix.join("lib/link_dir/file.txt").is_symlink(),
             "should not descend into symlinked directory"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_skips_self_referential_prefix_symlink_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+
+        std::fs::create_dir_all(prefix.join("share/mime"))?;
+        std::fs::create_dir_all(keg_path.join("share"))?;
+        std::os::unix::fs::symlink("../../../../share/mime", keg_path.join("share/mime"))?;
+
+        link(&keg_path, &prefix)?;
+
+        assert!(prefix.join("share/mime").is_dir());
+        assert!(!prefix.join("share/mime").is_symlink());
         Ok(())
     }
 
