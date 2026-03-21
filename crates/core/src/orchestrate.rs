@@ -1,33 +1,35 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    ffi::OsStr,
     future::Future,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
     InstallReason, InstallReceipt, InstalledKeg, PostInstallContext, PostInstallTransaction,
-    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, RelocationScope,
-    atomic_symlink_replace, discover_installed_kegs, find_installed_keg, link, materialize,
-    relocate_keg, run_post_install, unlink, validate_post_install, write_receipt,
+    RelocationScope, discover_installed_kegs, find_installed_keg, link, run_post_install, unlink,
+    validate_post_install, write_receipt,
 };
 use brewdock_formula::{
     CellarType, FetchOutcome, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository,
-    IndexMetadata, MetadataStore, Requirement, SelectedBottle, UnsupportedReason,
-    check_supportability, resolve_install_order, select_bottle,
+    IndexMetadata, MetadataStore, SelectedBottle, UnsupportedReason, check_supportability,
+    resolve_install_order, select_bottle,
 };
 use futures::future::try_join_all;
 use tracing::Instrument;
 
-use crate::{BrewdockError, HostTag, Layout, error::SourceBuildError, lock::FileLock};
-
-/// Default tap name for receipt source metadata.
-const TAP_NAME: &str = "homebrew/core";
-
-/// Prefix for formula source paths in receipt metadata.
-const FORMULA_PATH_PREFIX: &str = "@@HOMEBREW_PREFIX@@/Library/Taps/homebrew/homebrew-core/Formula";
+use crate::{
+    BrewdockError, HostTag, Layout,
+    error::SourceBuildError,
+    finalize::{
+        build_receipt, build_receipt_deps, build_receipt_source, cleanup_failed_install,
+        materialize_and_relocate_bottle, materialize_prefetched_payload, refresh_opt_link,
+    },
+    lock::FileLock,
+    source_build::{
+        build_source_plan, extract_source_archive, run_source_build, source_archive_filename,
+    },
+};
 
 /// Entry in an install plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +98,7 @@ pub struct SourceBuildPlan {
 ///
 /// Contains all downloaded and extracted data needed to finalize
 /// the installation without further network access.
-enum PrefetchedPayload {
+pub(crate) enum PrefetchedPayload {
     /// A bottle was downloaded, stored, and extracted.
     Bottle {
         /// Path to the extracted bottle content (`store_dir/sha256/name/version`).
@@ -175,7 +177,7 @@ struct FinalizeContext<'a> {
 /// Bottles are materialized and relocated in a parallel phase before finalize.
 /// Source builds are deferred to the serial finalize phase because they may
 /// depend on other formulae being linked first.
-enum MaterializedPayload {
+pub(crate) enum MaterializedPayload {
     /// A bottle was materialized into its keg and relocated.
     Bottle {
         /// Target keg path (`Cellar/name/version`).
@@ -186,13 +188,13 @@ enum MaterializedPayload {
 }
 
 /// Payload for a source build that is deferred to the finalize phase.
-struct PendingSourcePayload {
+pub(crate) struct PendingSourcePayload {
     /// Extracted source root directory.
-    source_root: PathBuf,
+    pub(crate) source_root: PathBuf,
     /// Build plan with all metadata needed for the build.
-    plan: SourceBuildPlan,
+    pub(crate) plan: SourceBuildPlan,
     /// Tempdir guard — dropped after finalize to clean up extracted source.
-    _tempdir: tempfile::TempDir,
+    pub(crate) _tempdir: tempfile::TempDir,
 }
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
@@ -1276,71 +1278,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     }
 }
 
-fn build_source_plan(
-    formula: &Formula,
-    layout: &Layout,
-) -> Result<SourceBuildPlan, SourceBuildError> {
-    if let Some(requirement) = formula.requirements.first() {
-        return Err(SourceBuildError::UnsupportedRequirement(
-            requirement_name(requirement).to_owned(),
-        ));
-    }
-
-    let stable = formula
-        .urls
-        .stable
-        .as_ref()
-        .ok_or_else(|| SourceBuildError::UnsupportedSourceArchive(formula.name.clone()))?;
-    let source_checksum = stable.checksum.clone().ok_or_else(|| {
-        SourceBuildError::MissingSourceChecksum(FormulaName::from(formula.name.clone()))
-    })?;
-    if source_archive_kind(&stable.url).is_none() {
-        return Err(SourceBuildError::UnsupportedSourceArchive(
-            stable.url.clone(),
-        ));
-    }
-    let version = pkg_version(&formula.versions.stable, formula.revision);
-    Ok(SourceBuildPlan {
-        formula_name: formula.name.clone(),
-        version: version.clone(),
-        source_url: stable.url.clone(),
-        source_checksum: Some(source_checksum),
-        build_dependencies: formula.build_dependencies.clone(),
-        runtime_dependencies: formula.dependencies.clone(),
-        prefix: layout.prefix().to_path_buf(),
-        cellar_path: layout.cellar().join(&formula.name).join(version),
-    })
-}
-
-fn build_receipt(
-    method: &InstallMethod,
-    install_reason: InstallReason,
-    time: Option<f64>,
-    runtime_dependencies: Vec<ReceiptDependency>,
-    source: ReceiptSource,
-) -> InstallReceipt {
-    match method {
-        InstallMethod::Bottle(_) => {
-            InstallReceipt::for_bottle(install_reason, time, runtime_dependencies, source)
-        }
-        InstallMethod::Source(_) => {
-            InstallReceipt::for_source(install_reason, time, runtime_dependencies, source)
-        }
-    }
-}
-
-fn requirement_name(requirement: &Requirement) -> &str {
-    match requirement {
-        Requirement::Name(name) => name,
-        Requirement::Detailed(detail) => &detail.name,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceArchiveKind {
-    TarGz,
-}
-
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     async fn instrument_operation<T, F>(
         operation: &'static str,
@@ -1402,66 +1339,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     }
 }
 
-/// Copies extracted bottle content into a keg and patches binaries/text.
-///
-/// Shared by both the parallel install path and the serial upgrade path.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "thin delegation to materialize + relocate_keg"
-)]
-fn materialize_and_relocate_bottle(
-    source_dir: &Path,
-    keg_path: &Path,
-    opt_dir: &Path,
-    prefix: &Path,
-    formula_name: &str,
-    relocation_scope: RelocationScope,
-) -> Result<(), BrewdockError> {
-    materialize(source_dir, keg_path, opt_dir, formula_name)?;
-    relocate_keg(keg_path, prefix, relocation_scope)?;
-    Ok(())
-}
-
-/// Materializes a prefetched payload into a [`MaterializedPayload`].
-///
-/// This is a free function (not a method) so it can be moved into
-/// [`tokio::task::spawn_blocking`] without borrowing the orchestrator.
-fn materialize_prefetched_payload(
-    payload: PrefetchedPayload,
-    formula_name: &str,
-    opt_dir: &Path,
-    prefix: &Path,
-) -> Result<MaterializedPayload, BrewdockError> {
-    match payload {
-        PrefetchedPayload::Bottle {
-            source_dir,
-            keg_path,
-            relocation_scope,
-        } => {
-            materialize_and_relocate_bottle(
-                &source_dir,
-                &keg_path,
-                opt_dir,
-                prefix,
-                formula_name,
-                relocation_scope,
-            )?;
-            Ok(MaterializedPayload::Bottle { keg_path })
-        }
-        PrefetchedPayload::Source {
-            source_root,
-            plan,
-            _tempdir: tempdir,
-        } => Ok(MaterializedPayload::PendingSource(Box::new(
-            PendingSourcePayload {
-                source_root,
-                plan,
-                _tempdir: tempdir,
-            },
-        ))),
-    }
-}
-
 fn request_label(names: &[&str]) -> String {
     if names.is_empty() {
         "all".to_owned()
@@ -1470,336 +1347,12 @@ fn request_label(names: &[&str]) -> String {
     }
 }
 
-fn source_archive_filename(url: &str) -> Option<&str> {
-    let trimmed = url.split('?').next().unwrap_or(url);
-    trimmed.rsplit('/').next()
-}
-
-fn source_archive_kind(url: &str) -> Option<SourceArchiveKind> {
-    let filename = source_archive_filename(url)?.to_ascii_lowercase();
-    if filename.ends_with(".tar.gz")
-        || Path::new(&filename)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("tgz"))
-    {
-        Some(SourceArchiveKind::TarGz)
-    } else {
-        None
-    }
-}
-
-fn extract_source_archive(
-    archive_path: &Path,
-    tempdir_root: &Path,
-) -> Result<PathBuf, BrewdockError> {
-    let kind = source_archive_kind(
-        archive_path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default(),
-    )
-    .ok_or_else(|| {
-        SourceBuildError::UnsupportedSourceArchive(archive_path.display().to_string())
-    })?;
-
-    let extract_dir = tempdir_root.join("extract");
-    match kind {
-        SourceArchiveKind::TarGz => extract_tar_gz(archive_path, &extract_dir)?,
-    }
-    discover_source_root(&extract_dir)
-}
-
-fn discover_source_root(extract_dir: &Path) -> Result<PathBuf, BrewdockError> {
-    let entries: Vec<PathBuf> = std::fs::read_dir(extract_dir)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .collect();
-
-    if entries.len() == 1 && entries[0].is_dir() {
-        Ok(entries[0].clone())
-    } else if entries.is_empty() {
-        Err(SourceBuildError::MissingSourceRoot(extract_dir.display().to_string()).into())
-    } else {
-        Ok(extract_dir.to_path_buf())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceBuildSystem {
-    Configure,
-    Cmake,
-    Meson,
-    PerlMakeMaker,
-    Make,
-}
-
-fn run_source_build(
-    source_root: &Path,
-    plan: &SourceBuildPlan,
-    prefix: &Path,
-) -> Result<(), BrewdockError> {
-    std::fs::create_dir_all(&plan.cellar_path)?;
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let joined_path = std::env::join_paths(
-        std::iter::once(prefix.join("bin")).chain(std::env::split_paths(&path)),
-    )
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let build_system = detect_build_system(source_root)?;
-    let prefix_arg = format!("--prefix={}", plan.cellar_path.display());
-
-    match build_system {
-        SourceBuildSystem::Configure => {
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "./configure",
-                &[&prefix_arg],
-            )?;
-            run_build_command(source_root, prefix, &joined_path, "make", &[])?;
-            run_build_command(source_root, prefix, &joined_path, "make", &["install"])?;
-        }
-        SourceBuildSystem::Cmake => {
-            let build_dir = source_root.join("build");
-            let configure_args = cmake_configure_args(source_root, &build_dir, &plan.cellar_path);
-            let configure_arg_refs = configure_args
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "cmake",
-                &configure_arg_refs,
-            )?;
-            let build_arg = build_dir.display().to_string();
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "cmake",
-                &["--build", &build_arg],
-            )?;
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "cmake",
-                &["--install", &build_arg],
-            )?;
-        }
-        SourceBuildSystem::Meson => {
-            let build_dir = source_root.join("build");
-            let build_arg = build_dir.display().to_string();
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "meson",
-                &["setup", &build_arg, &prefix_arg],
-            )?;
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "ninja",
-                &["-C", &build_arg],
-            )?;
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "ninja",
-                &["-C", &build_arg, "install"],
-            )?;
-        }
-        SourceBuildSystem::PerlMakeMaker => {
-            let install_base = format!("INSTALL_BASE={}", plan.cellar_path.display());
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "perl",
-                &["Makefile.PL", &install_base],
-            )?;
-            run_build_command(source_root, prefix, &joined_path, "make", &[])?;
-            run_build_command(source_root, prefix, &joined_path, "make", &["install"])?;
-        }
-        SourceBuildSystem::Make => {
-            let prefix_value = plan.cellar_path.display().to_string();
-            run_build_command(source_root, prefix, &joined_path, "make", &[])?;
-            run_build_command(
-                source_root,
-                prefix,
-                &joined_path,
-                "make",
-                &[
-                    "install",
-                    &format!("PREFIX={prefix_value}"),
-                    &format!("prefix={prefix_value}"),
-                ],
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-fn cmake_configure_args(source_root: &Path, build_dir: &Path, cellar_path: &Path) -> Vec<String> {
-    vec![
-        "-S".to_owned(),
-        source_root.display().to_string(),
-        "-B".to_owned(),
-        build_dir.display().to_string(),
-        format!("-DCMAKE_INSTALL_PREFIX={}", cellar_path.display()),
-    ]
-}
-
-fn detect_build_system(source_root: &Path) -> Result<SourceBuildSystem, BrewdockError> {
-    let candidates = [
-        ("Makefile.PL", SourceBuildSystem::PerlMakeMaker),
-        ("CMakeLists.txt", SourceBuildSystem::Cmake),
-        ("meson.build", SourceBuildSystem::Meson),
-        ("configure", SourceBuildSystem::Configure),
-        ("Makefile", SourceBuildSystem::Make),
-        ("makefile", SourceBuildSystem::Make),
-    ];
-
-    candidates
-        .iter()
-        .find(|(name, _)| source_root.join(name).exists())
-        .map(|(_, build_system)| *build_system)
-        .ok_or_else(|| {
-            SourceBuildError::UnsupportedBuildSystem(source_root.display().to_string()).into()
-        })
-}
-
-fn run_build_command(
-    source_root: &Path,
-    prefix: &Path,
-    path: &OsStr,
-    program: &str,
-    args: &[&str],
-) -> Result<(), BrewdockError> {
-    let output = Command::new(program)
-        .current_dir(source_root)
-        .env("PATH", path)
-        .env("HOMEBREW_PREFIX", prefix)
-        .args(args)
-        .output()
-        .map_err(|error| SourceBuildError::CommandFailed {
-            command: format_command(program, args),
-            stderr: error.to_string(),
-        })?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let detail = if stderr.is_empty() { stdout } else { stderr };
-    Err(SourceBuildError::CommandFailed {
-        command: format_command(program, args),
-        stderr: if detail.is_empty() {
-            output.status.code().map_or_else(
-                || "terminated by signal".to_owned(),
-                |code| code.to_string(),
-            )
-        } else {
-            detail
-        },
-    }
-    .into())
-}
-
-fn format_command(program: &str, args: &[&str]) -> String {
-    if args.is_empty() {
-        program.to_owned()
-    } else {
-        format!("{program} {}", args.join(" "))
-    }
-}
-
-fn refresh_opt_link(
-    keg_path: &Path,
-    opt_dir: &Path,
-    formula_name: &str,
-) -> Result<(), BrewdockError> {
-    std::fs::create_dir_all(opt_dir)?;
-    let opt_link = opt_dir.join(formula_name);
-    atomic_symlink_replace(keg_path, &opt_link)?;
-    Ok(())
-}
-
-fn cleanup_failed_install(
-    keg_path: &Path,
-    prefix: &Path,
-    opt_dir: &Path,
-    formula_name: &str,
-) -> Result<(), BrewdockError> {
-    let _ = unlink(keg_path, prefix);
-    let opt_link = opt_dir.join(formula_name);
-    if opt_link.symlink_metadata().is_ok() {
-        std::fs::remove_file(&opt_link)?;
-    }
-
-    if keg_path.exists() {
-        std::fs::remove_dir_all(keg_path)?;
-    }
-
-    // Clean up temp keg left by an interrupted atomic materialize.
-    if let Some(parent) = keg_path.parent()
-        && let Some(version) = keg_path.file_name().and_then(|n| n.to_str())
-    {
-        let temp_keg = parent.join(format!(".{version}.brewdock-tmp"));
-        if temp_keg.exists() {
-            std::fs::remove_dir_all(&temp_keg)?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Creates the package version string used in Cellar paths.
-fn pkg_version(version: &str, revision: u32) -> String {
+pub(crate) fn pkg_version(version: &str, revision: u32) -> String {
     if revision > 0 {
         format!("{version}_{revision}")
     } else {
         version.to_owned()
-    }
-}
-
-/// Builds receipt dependency list from formula dependencies.
-fn build_receipt_deps(formula: &Formula, cache: &FormulaCache) -> Vec<ReceiptDependency> {
-    formula
-        .dependencies
-        .iter()
-        .filter_map(|dep_name| cache.get(dep_name))
-        .map(|dep| ReceiptDependency {
-            full_name: dep.full_name.clone(),
-            version: dep.versions.stable.clone(),
-            revision: dep.revision,
-            pkg_version: pkg_version(&dep.versions.stable, dep.revision),
-            declared_directly: true,
-        })
-        .collect()
-}
-
-/// Builds receipt source from formula metadata.
-fn build_receipt_source(formula: &Formula) -> ReceiptSource {
-    let first_char = formula.name.chars().next().unwrap_or('_');
-    ReceiptSource {
-        path: format!("{FORMULA_PATH_PREFIX}/{first_char}/{}.rb", formula.name),
-        tap: TAP_NAME.to_owned(),
-        spec: "stable".to_owned(),
-        versions: ReceiptSourceVersions {
-            stable: formula.versions.stable.clone(),
-            head: formula.versions.head.clone(),
-            version_scheme: 0,
-        },
     }
 }
 
@@ -1828,349 +1381,18 @@ mod tests {
         time::Duration,
     };
 
-    use brewdock_bottle::BottleError;
-    use brewdock_cellar::find_installed_keg;
-    use brewdock_formula::{
-        BottleFile, BottleSpec, BottleStable, CellarType, FormulaUrls, StableUrl, Versions,
+    use brewdock_cellar::{
+        InstallReceipt, ReceiptSource, ReceiptSourceVersions, atomic_symlink_replace, write_receipt,
     };
+    use brewdock_formula::{CellarType, Requirement};
 
     use super::*;
-
-    const HOST_TAG: &str = "arm64_sequoia";
-    const PLAN_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    // --- Mock types ---
-
-    struct MockRepo {
-        formulae: HashMap<String, Formula>,
-        ruby_sources: HashMap<String, String>,
-    }
-
-    impl MockRepo {
-        fn new(list: Vec<Formula>) -> Self {
-            let formulae = list.into_iter().map(|f| (f.name.clone(), f)).collect();
-            Self {
-                formulae,
-                ruby_sources: HashMap::new(),
-            }
-        }
-
-        fn with_sources(list: Vec<Formula>, ruby_sources: HashMap<String, String>) -> Self {
-            let formulae = list.into_iter().map(|f| (f.name.clone(), f)).collect();
-            Self {
-                formulae,
-                ruby_sources,
-            }
-        }
-    }
-
-    impl FormulaRepository for MockRepo {
-        async fn formula(&self, name: &str) -> Result<Formula, FormulaError> {
-            self.formulae
-                .get(name)
-                .cloned()
-                .ok_or_else(|| FormulaError::NotFound {
-                    name: FormulaName::from(name),
-                })
-        }
-
-        async fn all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
-            Ok(self.formulae.values().cloned().collect())
-        }
-
-        async fn ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
-            self.ruby_sources
-                .get(ruby_source_path)
-                .cloned()
-                .ok_or_else(|| FormulaError::NotFound {
-                    name: FormulaName::from(ruby_source_path),
-                })
-        }
-    }
-
-    struct MockDownloader {
-        data: HashMap<String, Vec<u8>>,
-        download_count: Arc<AtomicUsize>,
-    }
-
-    impl MockDownloader {
-        fn new(entries: Vec<(&str, Vec<u8>)>, counter: Arc<AtomicUsize>) -> Self {
-            let data = entries
-                .into_iter()
-                .map(|(k, v)| (k.to_owned(), v))
-                .collect();
-            Self {
-                data,
-                download_count: counter,
-            }
-        }
-    }
-
-    impl BottleDownloader for MockDownloader {
-        async fn download_verified(
-            &self,
-            _url: &str,
-            expected_sha256: &str,
-        ) -> Result<Vec<u8>, BottleError> {
-            self.download_count.fetch_add(1, Ordering::SeqCst);
-            self.data.get(expected_sha256).cloned().ok_or_else(|| {
-                BottleError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("mock: no data for {expected_sha256}"),
-                ))
-            })
-        }
-    }
-
-    // --- Helpers ---
-
-    fn make_formula(name: &str, version: &str, deps: &[&str], sha256: &str) -> Formula {
-        Formula {
-            name: name.to_owned(),
-            full_name: name.to_owned(),
-            versions: Versions {
-                stable: version.to_owned(),
-                head: None,
-                bottle: true,
-            },
-            revision: 0,
-            ruby_source_path: Some(format!("Formula/{name}.rb")),
-            bottle: BottleSpec {
-                stable: Some(BottleStable {
-                    rebuild: 0,
-                    root_url: "https://example.com".to_owned(),
-                    files: HashMap::from([(
-                        HOST_TAG.to_owned(),
-                        BottleFile {
-                            cellar: CellarType::Any,
-                            url: format!("https://example.com/{name}.tar.gz"),
-                            sha256: sha256.to_owned(),
-                        },
-                    )]),
-                }),
-            },
-            urls: FormulaUrls {
-                stable: Some(StableUrl {
-                    url: format!("https://example.com/{name}-{version}.tar.gz"),
-                    checksum: Some(sha256.to_owned()),
-                }),
-            },
-            pour_bottle_only_if: None,
-            keg_only: false,
-            dependencies: deps.iter().map(|s| (*s).to_owned()).collect(),
-            build_dependencies: Vec::new(),
-            uses_from_macos: Vec::new(),
-            requirements: Vec::new(),
-            disabled: false,
-            post_install_defined: false,
-        }
-    }
-
-    /// Creates a tar.gz archive mimicking a Homebrew bottle structure.
-    fn create_bottle_tar_gz(
-        name: &str,
-        version: &str,
-        files: &[(&str, &[u8])],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        use flate2::{Compression, write::GzEncoder};
-
-        let buf = Vec::new();
-        let encoder = GzEncoder::new(buf, Compression::default());
-        let mut builder = tar::Builder::new(encoder);
-
-        for &(path, contents) in files {
-            let full_path = format!("{name}/{version}/{path}");
-            let mut header = tar::Header::new_gnu();
-            header.set_path(&full_path)?;
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append(&header, contents)?;
-        }
-
-        let encoder = builder.into_inner()?;
-        let compressed = encoder.finish()?;
-        Ok(compressed)
-    }
-
-    fn create_source_tar_gz(
-        root: &str,
-        files: &[(&str, &[u8])],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        use flate2::{Compression, write::GzEncoder};
-
-        let buf = Vec::new();
-        let encoder = GzEncoder::new(buf, Compression::default());
-        let mut builder = tar::Builder::new(encoder);
-
-        for &(path, contents) in files {
-            let full_path = format!("{root}/{path}");
-            let mut header = tar::Header::new_gnu();
-            header.set_path(&full_path)?;
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            builder.append(&header, contents)?;
-        }
-
-        let encoder = builder.into_inner()?;
-        let compressed = encoder.finish()?;
-        Ok(compressed)
-    }
-
-    fn create_source_tar_gz_with_raw_paths(
-        entries: &[(&[u8], &[u8])],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        use flate2::{Compression, write::GzEncoder};
-        use tar::{Builder, Header};
-
-        let buf = Vec::new();
-        let encoder = GzEncoder::new(buf, Compression::default());
-        let mut builder = Builder::new(encoder);
-
-        for &(path, contents) in entries {
-            let mut header = Header::new_gnu();
-            header.as_mut_bytes()[..100].fill(0);
-            header.as_mut_bytes()[..path.len()].copy_from_slice(path);
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append(&header, contents)?;
-        }
-
-        let encoder = builder.into_inner()?;
-        Ok(encoder.finish()?)
-    }
-
-    #[test]
-    fn test_cmake_configure_args_use_cmake_install_prefix() {
-        let source_root = Path::new("/tmp/source");
-        let build_dir = Path::new("/tmp/source/build");
-        let cellar_path = Path::new("/opt/homebrew/Cellar/demo/1.0");
-
-        let args = cmake_configure_args(source_root, build_dir, cellar_path);
-
-        assert!(args.iter().any(|arg| arg == "-S"));
-        assert!(args.iter().any(|arg| arg == "-B"));
-        assert!(
-            args.iter()
-                .any(|arg| { arg == "-DCMAKE_INSTALL_PREFIX=/opt/homebrew/Cellar/demo/1.0" })
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--prefix=/opt/homebrew/Cellar/demo/1.0")
-        );
-    }
-
-    fn make_orchestrator(
-        formulae: Vec<Formula>,
-        bottles: Vec<(&str, Vec<u8>)>,
-        counter: Arc<AtomicUsize>,
-        layout: Layout,
-    ) -> Result<Orchestrator<MockRepo, MockDownloader>, BrewdockError> {
-        let host_tag: HostTag = HOST_TAG.parse()?;
-        let repo = MockRepo::new(formulae);
-        let downloader = MockDownloader::new(bottles, counter);
-        Ok(Orchestrator::new(repo, downloader, layout, host_tag))
-    }
-
-    fn make_orchestrator_with_sources(
-        formulae: Vec<Formula>,
-        ruby_sources: HashMap<String, String>,
-        bottles: Vec<(&str, Vec<u8>)>,
-        counter: Arc<AtomicUsize>,
-        layout: Layout,
-    ) -> Result<Orchestrator<MockRepo, MockDownloader>, BrewdockError> {
-        let host_tag: HostTag = HOST_TAG.parse()?;
-        let repo = MockRepo::with_sources(formulae, ruby_sources);
-        let downloader = MockDownloader::new(bottles, counter);
-        Ok(Orchestrator::new(repo, downloader, layout, host_tag))
-    }
-
-    fn move_host_bottle_to_tag(
-        formula: &mut Formula,
-        tag: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let stable = formula
-            .bottle
-            .stable
-            .as_mut()
-            .ok_or("expected stable bottle metadata")?;
-        let bottle = stable
-            .files
-            .remove(HOST_TAG)
-            .ok_or("expected host bottle")?;
-        stable.files.insert(tag.to_owned(), bottle);
-        Ok(())
-    }
-
-    /// Sets up filesystem install state for a formula (keg directory + receipt + opt symlink).
-    fn setup_installed_keg(
-        layout: &Layout,
-        name: &str,
-        version: &str,
-        on_request: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let keg_path = layout.cellar().join(name).join(version);
-        std::fs::create_dir_all(&keg_path)?;
-
-        let receipt = InstallReceipt::for_bottle(
-            if on_request {
-                InstallReason::OnRequest
-            } else {
-                InstallReason::AsDependency
-            },
-            Some(1_000.0),
-            Vec::new(),
-            ReceiptSource {
-                path: String::new(),
-                tap: "homebrew/core".to_owned(),
-                spec: "stable".to_owned(),
-                versions: ReceiptSourceVersions {
-                    stable: version.to_owned(),
-                    head: None,
-                    version_scheme: 0,
-                },
-            },
-        );
-        write_receipt(&keg_path, &receipt)?;
-
-        // Create opt symlink (absolute path; relative_from_to is pub(crate) in cellar).
-        std::fs::create_dir_all(layout.opt_dir())?;
-        let opt_link = layout.opt_dir().join(name);
-        atomic_symlink_replace(&keg_path, &opt_link)?;
-        Ok(())
-    }
-
-    fn create_simple_bottle(
-        name: &str,
-        version: &str,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        create_bottle_tar_gz(name, version, &[("bin/tool", b"#!/bin/sh\necho ok\n")])
-    }
-
-    /// Asserts that a formula is visible as installed via filesystem state.
-    fn assert_installed(layout: &Layout, name: &str) {
-        assert!(
-            find_installed_keg(name, &layout.cellar(), &layout.opt_dir())
-                .ok()
-                .flatten()
-                .is_some(),
-            "expected {name} to be installed"
-        );
-    }
-
-    /// Asserts that a formula is NOT visible as installed via filesystem state.
-    fn assert_not_installed(layout: &Layout, name: &str) {
-        assert!(
-            find_installed_keg(name, &layout.cellar(), &layout.opt_dir())
-                .ok()
-                .flatten()
-                .is_none(),
-            "expected {name} to not be installed"
-        );
-    }
+    use crate::testutil::{
+        HOST_TAG, MockDownloader, PLAN_SHA, assert_installed, assert_not_installed,
+        create_bottle_tar_gz, create_simple_bottle, create_source_tar_gz,
+        create_source_tar_gz_with_raw_paths, make_formula, make_orchestrator,
+        make_orchestrator_with_sources, move_host_bottle_to_tag, setup_installed_keg,
+    };
 
     // --- Install tests ---
 

@@ -76,10 +76,11 @@ Read this file before writing or modifying any Rust code in this repository.
 
 ## Module Organization
 
-- Default to private. Use `pub(crate)` for crate-internal helpers. Expose `pub` only for intentional API surface.
+- Default to private. Use `pub(crate)` for crate-internal helpers at the top level; inside private modules (`mod`, not `pub mod`) use plain `pub` instead — Clippy flags `pub(crate)` in private modules as redundant. Expose `pub` at the top level only for intentional API surface.
 - Use `pub use` re-exports to flatten internal module structure into a clean public API.
 - Avoid glob imports except `use super::*` in test modules.
 - One concept per module — usually one primary type with its impls. Avoid catch-all `util` modules.
+- For orchestration-heavy code, keep the entrypoint module focused on phase ordering and policy decisions; move source-build, finalize, and other execution details into internal helper modules.
 - Place public items before private items in files.
 - Enum variants and trait methods are always public if the enum/trait is public.
 

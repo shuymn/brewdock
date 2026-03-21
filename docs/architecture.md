@@ -36,10 +36,11 @@ cli → core → {formula, bottle, cellar}
 - `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve. No core dependency.
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
 - `brewdock-cellar`: materialize, receipt, relocation, linking, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only).
-- `brewdock-core`: Layout, platform, lock, orchestration (install/upgrade), install method resolution, source build driver, error aggregation. Depends on formula, bottle, cellar.
+- `brewdock-core`: Layout, platform, lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation. Depends on formula, bottle, cellar.
 - `brewdock-cli`: clap commands, tokio runtime. Depends on core only.
 
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
+Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
 
 Each crate owns a `thiserror` error enum. Core aggregates with `#[from]`.
 

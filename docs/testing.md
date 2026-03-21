@@ -25,6 +25,7 @@ Read this file before writing or modifying tests in this repository.
 - Use `use super::*` in test modules to access private items.
 - Integration tests under `tests/` test public API only.
 - Shared test helpers go in `tests/common/mod.rs` (not `tests/common.rs`, which Cargo treats as a test binary).
+- For large unit-test modules, move reusable mocks and archive/setup helpers into crate-local test support modules before splitting scenarios across files.
 
 ## Writing Tests
 
