@@ -31,13 +31,18 @@ enum Statement {
         target: PathExpr,
     },
     System(Vec<Argument>),
-    IfExists {
+    IfPath {
         condition: PathExpr,
+        kind: PathCondition,
         then_branch: Vec<Self>,
     },
     RecursiveCopy {
         from: PathExpr,
         to: PathExpr,
+    },
+    CopyChildren {
+        from_dir: PathExpr,
+        to_dir: PathExpr,
     },
     ForceSymlink {
         target: PathExpr,
@@ -56,6 +61,13 @@ enum Statement {
         pattern: String,
         link_dir: PathExpr,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathCondition {
+    Exists,
+    Symlink,
+    ExistsAndNotSymlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +103,7 @@ enum PathBase {
     Bin,
     Etc,
     FormulaPkgetc(String),
+    FormulaOptBin(String),
     HomebrewPrefix,
     Lib,
     Libexec,
@@ -142,6 +155,9 @@ impl PostInstallContext {
             PathBase::Bin => self.keg_path.join("bin"),
             PathBase::Etc => self.prefix.join("etc"),
             PathBase::FormulaPkgetc(ref formula) => self.prefix.join("etc").join(formula),
+            PathBase::FormulaOptBin(ref formula) => {
+                self.prefix.join("opt").join(formula).join("bin")
+            }
             PathBase::HomebrewPrefix => self.prefix.clone(),
             PathBase::Lib => self.keg_path.join("lib"),
             PathBase::Libexec => self.keg_path.join("libexec"),
@@ -283,6 +299,7 @@ fn collect_statement_roots(
         match statement {
             Statement::Copy { to, .. }
             | Statement::RecursiveCopy { to, .. }
+            | Statement::CopyChildren { to_dir: to, .. }
             | Statement::WriteFile { path: to, .. }
             | Statement::GlobRemove { dir: to, .. }
             | Statement::GlobSymlink { link_dir: to, .. }
@@ -319,7 +336,7 @@ fn collect_statement_roots(
                     }
                 }
             }
-            Statement::IfExists { then_branch, .. } => {
+            Statement::IfPath { then_branch, .. } => {
                 collect_statement_roots(then_branch, context, roots);
             }
         }
@@ -462,6 +479,32 @@ fn copy_path(from: &Path, to: &Path) -> Result<(), CellarError> {
     Ok(())
 }
 
+fn copy_children(from: &Path, to: &Path) -> Result<(), CellarError> {
+    std::fs::create_dir_all(to)?;
+    if !from.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        copy_path(&entry.path(), &to.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn path_condition_matches(
+    context: &PostInstallContext,
+    condition: &PathExpr,
+    kind: PathCondition,
+) -> Result<bool, CellarError> {
+    let path = context.resolve_allowed_path(condition)?;
+    Ok(match kind {
+        PathCondition::Exists => path.exists(),
+        PathCondition::Symlink => path.is_symlink(),
+        PathCondition::ExistsAndNotSymlink => path.exists() && !path.is_symlink(),
+    })
+}
+
 fn lower_post_install(source: &str, formula_version: &str) -> Result<Program, CellarError> {
     let parsed = parse_source(source)?;
     let methods = build_method_table(&parsed)?;
@@ -583,6 +626,10 @@ fn normalize_method_schema<'pr>(
 
     if matches_node_npm_propagation_schema(body, parsed)? {
         return Ok(Some(normalize_node_npm_propagation()));
+    }
+
+    if matches_shared_mime_info_schema(body, parsed)? {
+        return Ok(Some(normalize_shared_mime_info()));
     }
 
     if matches_bundle_bootstrap_schema(body, parsed, methods, helper_stack)? {
@@ -766,8 +813,9 @@ fn normalize_node_npm_propagation() -> Vec<Statement> {
 
     let mut stmts = vec![
         Statement::Mkpath(node_modules.clone()),
-        Statement::IfExists {
+        Statement::IfPath {
             condition: npm_dir.clone(),
+            kind: PathCondition::Exists,
             then_branch: vec![Statement::RemoveIfExists(npm_dir)],
         },
         Statement::RecursiveCopy {
@@ -815,6 +863,73 @@ fn normalize_node_npm_propagation() -> Vec<Statement> {
     });
 
     stmts
+}
+
+fn matches_shared_mime_info_schema(
+    body: &Node<'_>,
+    parsed: &ParseResult<'_>,
+) -> Result<bool, CellarError> {
+    let source = node_source(parsed, body)?;
+    if !source.contains("HOMEBREW_PREFIX/\"share/mime\"")
+        || !source.contains("ln_sf(global_mime, cellar_mime)")
+        || !source.contains("(pkgshare/\"packages\").children")
+        || !source.contains("update-mime-database")
+    {
+        return Ok(false);
+    }
+
+    let mut has_rm_r = false;
+    let mut has_ln_sf = false;
+    let mut has_cp = false;
+    let mut has_system = false;
+    visit_calls(body, &mut |call| {
+        match call_name(call)?.as_str() {
+            "rm_r" => has_rm_r = true,
+            "ln_sf" => has_ln_sf = true,
+            "cp" => has_cp = true,
+            "system" => has_system = true,
+            _ => {}
+        }
+        Ok(())
+    })?;
+
+    Ok(has_rm_r && has_ln_sf && has_cp && has_system)
+}
+
+fn normalize_shared_mime_info() -> Vec<Statement> {
+    let hp = |segs: &[&str]| PathExpr::new(PathBase::HomebrewPrefix, segs);
+    let share = |segs: &[&str]| PathExpr::new(PathBase::Share, segs);
+    let pkgshare = |segs: &[&str]| PathExpr::new(PathBase::Pkgshare, segs);
+    let bin = |segs: &[&str]| PathExpr::new(PathBase::Bin, segs);
+
+    let global_mime = hp(&["share", "mime"]);
+    let cellar_mime = share(&["mime"]);
+
+    vec![
+        Statement::IfPath {
+            condition: global_mime.clone(),
+            kind: PathCondition::Symlink,
+            then_branch: vec![Statement::RemoveIfExists(global_mime.clone())],
+        },
+        Statement::IfPath {
+            condition: cellar_mime.clone(),
+            kind: PathCondition::ExistsAndNotSymlink,
+            then_branch: vec![Statement::RemoveIfExists(cellar_mime.clone())],
+        },
+        Statement::ForceSymlink {
+            target: global_mime.clone(),
+            link: cellar_mime,
+        },
+        Statement::Mkpath(hp(&["share", "mime", "packages"])),
+        Statement::CopyChildren {
+            from_dir: pkgshare(&["packages"]),
+            to_dir: hp(&["share", "mime", "packages"]),
+        },
+        Statement::System(vec![
+            Argument::Path(bin(&["update-mime-database"])),
+            Argument::Path(global_mime),
+        ]),
+    ]
 }
 
 fn lower_body_node<'pr>(
@@ -925,8 +1040,9 @@ fn lower_if_statement<'pr>(
         if if_node.subsequent().is_some() {
             return unsupported("unsupported else branch for path existence condition");
         }
-        return Ok(vec![Statement::IfExists {
+        return Ok(vec![Statement::IfPath {
             condition,
+            kind: PathCondition::Exists,
             then_branch,
         }]);
     }
@@ -1098,6 +1214,18 @@ fn parse_path_expr_ast<'pr>(
         return parse_path_expr_ast(&body, parsed, methods, helper_stack);
     }
 
+    if let Some(constant) = node.as_constant_read_node() {
+        let name = constant.name();
+        let name = constant_name(&name)?;
+        if name == "HOMEBREW_PREFIX" {
+            return Ok(PathExpr {
+                base: PathBase::HomebrewPrefix,
+                segments: Vec::new(),
+            });
+        }
+        return unsupported(&format!("unsupported constant in path expression: {name}"));
+    }
+
     let Some(call) = node.as_call_node() else {
         return unsupported(&format!(
             "unsupported path expression: {}",
@@ -1128,6 +1256,16 @@ fn parse_path_expr_ast<'pr>(
     {
         return Ok(PathExpr {
             base: PathBase::FormulaPkgetc(formula),
+            segments: Vec::new(),
+        });
+    }
+
+    if name == "opt_bin"
+        && let Some(receiver) = call.receiver()
+        && let Some(formula) = parse_formula_ref(&receiver)?
+    {
+        return Ok(PathExpr {
+            base: PathBase::FormulaOptBin(formula),
             segments: Vec::new(),
         });
     }
@@ -1190,12 +1328,16 @@ fn parse_path_base(name: &str) -> Option<PathBase> {
         "sbin" => Some(PathBase::Sbin),
         "share" => Some(PathBase::Share),
         "var" => Some(PathBase::Var),
+        "HOMEBREW_PREFIX" => Some(PathBase::HomebrewPrefix),
         _ => None,
     }
 }
 
 fn parse_path_expr_text(raw: &str) -> Result<PathExpr, CellarError> {
     let trimmed = raw.trim().trim_start_matches('(').trim_end_matches(')');
+    if let Some(path) = parse_interpolated_homebrew_prefix_path(trimmed)? {
+        return Ok(path);
+    }
     let Some(split_index) = find_path_split(trimmed) else {
         return parse_path_base(trimmed)
             .map(|base| PathExpr {
@@ -1214,6 +1356,24 @@ fn parse_path_expr_text(raw: &str) -> Result<PathExpr, CellarError> {
         base,
         segments: parse_path_segments(rest)?,
     })
+}
+
+fn parse_interpolated_homebrew_prefix_path(raw: &str) -> Result<Option<PathExpr>, CellarError> {
+    let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return Ok(None);
+    };
+    let Some(rest) = inner.strip_prefix("#{HOMEBREW_PREFIX}") else {
+        return Ok(None);
+    };
+    let segments = rest
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| validate_path_segment(segment).map(ToOwned::to_owned))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(PathExpr {
+        base: PathBase::HomebrewPrefix,
+        segments,
+    }))
 }
 
 fn find_path_split(raw: &str) -> Option<usize> {
@@ -1424,7 +1584,9 @@ fn append_segment(path: &PathExpr, segment: &str) -> PathExpr {
     next
 }
 
-const ALLOWED_PREFIX_DIRS: &[&str] = &["etc", "var", "share", "bin", "sbin", "lib", "include"];
+const ALLOWED_PREFIX_DIRS: &[&str] = &[
+    "etc", "var", "share", "bin", "sbin", "lib", "include", "opt",
+];
 
 fn path_is_allowed(path: &Path, context: &PostInstallContext) -> bool {
     path.starts_with(&context.keg_path)
@@ -1463,11 +1625,12 @@ fn execute_statements(
                 std::os::unix::fs::symlink(link_target, link_path)?;
             }
             Statement::System(arguments) => run_system(arguments, context)?,
-            Statement::IfExists {
+            Statement::IfPath {
                 condition,
+                kind,
                 then_branch,
             } => {
-                if context.resolve_allowed_path(condition)?.exists() {
+                if path_condition_matches(context, condition, *kind)? {
                     execute_statements(then_branch, context)?;
                 }
             }
@@ -1482,6 +1645,11 @@ fn execute_statements(
                         })?;
                 let dest = to_path.join(file_name);
                 copy_path(&from_path, &dest)?;
+            }
+            Statement::CopyChildren { from_dir, to_dir } => {
+                let from_path = context.resolve_allowed_path(from_dir)?;
+                let to_path = context.resolve_allowed_path(to_dir)?;
+                copy_children(&from_path, &to_path)?;
             }
             Statement::ForceSymlink { target, link } => {
                 let target_path = context.resolve_allowed_path(target)?;
@@ -1622,6 +1790,38 @@ fn unsupported<T>(message: &str) -> Result<T, CellarError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_executable(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::write(path, contents)?;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    fn shared_mime_info_post_install_source() -> &'static str {
+        r#"
+class SharedMimeInfo < Formula
+  def post_install
+    global_mime = HOMEBREW_PREFIX/"share/mime"
+    cellar_mime = share/"mime"
+
+    rm_r(global_mime) if global_mime.symlink?
+    rm_r(cellar_mime) if cellar_mime.exist? && !cellar_mime.symlink?
+    ln_sf(global_mime, cellar_mime)
+
+    (global_mime/"packages").mkpath
+    cp (pkgshare/"packages").children, global_mime/"packages"
+
+    system bin/"update-mime-database", global_mime
+  end
+end
+"#
+    }
 
     #[test]
     fn test_extract_post_install_block() -> Result<(), Box<dyn std::error::Error>> {
@@ -2210,6 +2410,109 @@ end
 "#;
 
         run_post_install(source, &PostInstallContext::new(&prefix, &keg, "2.16.0"))?.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_handles_homebrew_prefix_constant_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/glib/2.88.0");
+        std::fs::create_dir_all(&keg)?;
+
+        let source = r#"
+class Glib < Formula
+  def post_install
+    (HOMEBREW_PREFIX/"lib/gio/modules").mkpath
+  end
+end
+"#;
+
+        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "2.88.0"))?.commit()?;
+        assert!(prefix.join("lib/gio/modules").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_normalizes_shared_mime_info_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/shared-mime-info/2.4");
+        std::fs::create_dir_all(keg.join("bin"))?;
+        std::fs::create_dir_all(keg.join("share/shared-mime-info/packages"))?;
+        std::fs::write(
+            keg.join("share/shared-mime-info/packages/freedesktop.org.xml"),
+            "<mime-info/>",
+        )?;
+
+        let global_mime = prefix.join("share/mime");
+        let stale_target = prefix.join("share/old-mime");
+        std::fs::create_dir_all(&stale_target)?;
+        std::fs::create_dir_all(global_mime.parent().unwrap_or(&prefix))?;
+        std::os::unix::fs::symlink(&stale_target, &global_mime)?;
+
+        let cellar_mime = keg.join("share/mime");
+        std::fs::create_dir_all(&cellar_mime)?;
+        std::fs::write(cellar_mime.join("stale.cache"), "old")?;
+
+        write_executable(
+            &keg.join("bin/update-mime-database"),
+            "#!/bin/sh\nmkdir -p \"$1\"\ntouch \"$1/mime.cache\"\n",
+        )?;
+
+        run_post_install(
+            shared_mime_info_post_install_source(),
+            &PostInstallContext::new(&prefix, &keg, "2.4"),
+        )?
+        .commit()?;
+
+        assert!(global_mime.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(global_mime.join("packages/freedesktop.org.xml"))?,
+            "<mime-info/>"
+        );
+        assert!(global_mime.join("mime.cache").exists());
+        assert!(cellar_mime.is_symlink());
+        assert_eq!(
+            std::fs::read_link(&cellar_mime)?,
+            PathBuf::from("../../../../share/mime")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_handles_formula_opt_bin_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/libheif/1.0");
+        std::fs::create_dir_all(&keg)?;
+
+        let shared_mime_keg = prefix.join("Cellar/shared-mime-info/2.4");
+        std::fs::create_dir_all(shared_mime_keg.join("bin"))?;
+        std::fs::create_dir_all(prefix.join("opt"))?;
+        std::os::unix::fs::symlink(
+            "../Cellar/shared-mime-info/2.4",
+            prefix.join("opt/shared-mime-info"),
+        )?;
+
+        write_executable(
+            &shared_mime_keg.join("bin/update-mime-database"),
+            "#!/bin/sh\nmkdir -p \"$1\"\ntouch \"$1/mime.cache\"\n",
+        )?;
+
+        let source = r##"
+class Libheif < Formula
+  def post_install
+    system Formula["shared-mime-info"].opt_bin/"update-mime-database", "#{HOMEBREW_PREFIX}/share/mime"
+  end
+end
+"##;
+
+        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        assert!(prefix.join("share/mime/mime.cache").exists());
         Ok(())
     }
 }
