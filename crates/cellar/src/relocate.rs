@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{error::CellarError, util};
+use crate::{error::CellarError, fs};
 
 /// Placeholder strings embedded in Homebrew bottles.
 const PREFIX_PLACEHOLDER: &str = "@@HOMEBREW_PREFIX@@";
@@ -50,7 +50,7 @@ pub fn relocate_keg(
         (REPOSITORY_PLACEHOLDER, prefix_str.as_str()),
     ];
 
-    for file in util::walk_files(keg_path)? {
+    for file in fs::walk_files(keg_path)? {
         let data = match std::fs::read(&file) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => continue,
@@ -91,7 +91,7 @@ fn is_macho(data: &[u8]) -> bool {
 /// batched `install_name_tool` invocation.
 fn relocate_macho(path: &Path, replacements: &[(&str, &str)]) -> Result<(), CellarError> {
     let path_s = path_str(path)?;
-    util::make_writable(path)?;
+    fs::make_writable(path)?;
 
     // Parse all load commands in one pass.
     let otool_output = run_cmd("otool", &["-l", path_s])?;
@@ -158,7 +158,7 @@ fn relocate_text_file(
     }
 
     if changed {
-        util::make_writable(path)?;
+        fs::make_writable(path)?;
         std::fs::write(path, &content)?;
     }
     Ok(())

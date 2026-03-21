@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::{error::CellarError, util::normalize_absolute_path};
+use crate::{error::CellarError, fs::normalize_absolute_path};
 
 /// Minimal metadata read from an existing `INSTALL_RECEIPT.json`.
 ///

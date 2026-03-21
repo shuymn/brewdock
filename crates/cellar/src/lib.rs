@@ -4,13 +4,13 @@
 
 pub mod discover;
 pub mod error;
+pub(crate) mod fs;
 pub mod link;
 pub mod materialize;
 pub mod post_install;
 pub mod receipt;
 pub mod relocate;
 pub mod state;
-pub(crate) mod util;
 
 pub use discover::{InstalledKeg, discover_installed_kegs, find_installed_keg};
 pub use error::CellarError;

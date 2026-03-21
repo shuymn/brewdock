@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::{error::CellarError, util};
+use crate::{error::CellarError, fs};
 
 /// Directories in a keg that are linked into the Homebrew prefix.
 const LINKABLE_DIRS: &[&str] = &["bin", "sbin", "lib", "include", "share", "etc"];
@@ -23,7 +23,7 @@ pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             continue;
         }
 
-        let entries = util::walk_entries(&keg_subdir)?;
+        let entries = fs::walk_entries(&keg_subdir)?;
         for entry in entries {
             let relative = entry
                 .strip_prefix(&keg_subdir)
@@ -69,7 +69,7 @@ pub fn unlink(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             continue;
         }
 
-        let entries = util::walk_entries(&keg_subdir)?;
+        let entries = fs::walk_entries(&keg_subdir)?;
         for entry in entries {
             let relative = entry
                 .strip_prefix(&keg_subdir)

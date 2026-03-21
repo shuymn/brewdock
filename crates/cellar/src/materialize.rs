@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::{error::CellarError, link::relative_from_to, util};
+use crate::{error::CellarError, fs, link::relative_from_to};
 
 /// Copies extracted bottle contents to the Cellar and creates the `opt/<name>` symlink.
 ///
@@ -121,7 +121,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
             }
             std::os::unix::fs::symlink(&target, &dst_path)?;
         } else {
-            util::make_writable(&dst_path)?;
+            fs::make_writable(&dst_path)?;
             std::fs::copy(&src_path, &dst_path)?;
         }
     }

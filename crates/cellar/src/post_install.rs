@@ -8,7 +8,7 @@ use std::{
 
 use ruby_prism::{ConstantId, Node, ParseResult, parse as parse_ruby};
 
-use crate::{error::CellarError, link::relative_from_to, util::normalize_absolute_path};
+use crate::{error::CellarError, fs::normalize_absolute_path, link::relative_from_to};
 
 static ROLLBACK_NONCE: AtomicUsize = AtomicUsize::new(0);
 
