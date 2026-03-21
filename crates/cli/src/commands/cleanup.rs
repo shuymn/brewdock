@@ -21,9 +21,3 @@ pub fn run<R: FormulaRepository, D: BottleDownloader>(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_cleanup_output_is_covered_by_output_module() {}
-}

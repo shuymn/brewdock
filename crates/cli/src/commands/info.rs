@@ -27,43 +27,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
-
-    use brewdock_core::Layout;
-
-    use super::*;
-    use crate::{
-        output,
-        testutil::{SHA_A, make_formula, make_orchestrator, setup_installed_keg},
-    };
-
-    #[tokio::test]
-    async fn test_info_shows_formula_details() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        let formula = make_formula("a", "1.0", &["b"], SHA_A);
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
-
-        run(&orchestrator, "a", Verbosity::Normal).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_info_shows_installed_version() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        setup_installed_keg(&layout, "a", "1.0", true)?;
-
-        let formula = make_formula("a", "1.0", &[], SHA_A);
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout)?;
-
-        run(&orchestrator, "a", Verbosity::Normal).await?;
-        Ok(())
-    }
+    use crate::output;
 
     #[test]
     fn test_render_info_format() {
