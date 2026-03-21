@@ -23,7 +23,7 @@ use crate::{
     error::SourceBuildError,
     finalize::{
         build_receipt, build_receipt_deps, build_receipt_source, cleanup_failed_install,
-        materialize_prefetched_payload, refresh_opt_link,
+        materialize_and_relocate_bottle, refresh_opt_link,
     },
     lock::FileLock,
     progress::{NoopProgressSink, ProgressEvent, SharedProgressSink},
@@ -143,29 +143,14 @@ pub struct CleanupResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutionPlan<'a> {
     entries: Vec<ExecutionPlanEntry<'a>>,
-    network_acquire_concurrency: usize,
-    local_prepare_concurrency: usize,
+    acquire_concurrency: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutionPlanEntry<'a> {
     formula: &'a Formula,
     method: InstallMethod,
-    prefetch: PrefetchStep,
-    local_prepare: LocalPrepareStep,
     finalize: FinalizeStep,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrefetchStep {
-    AcquireBottle,
-    AcquireSource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalPrepareStep {
-    MaterializeBottle,
-    DeferToFinalize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,23 +161,13 @@ enum FinalizeStep {
 
 impl<'a> ExecutionPlanEntry<'a> {
     const fn new(formula: &'a Formula, method: InstallMethod) -> Self {
-        let (prefetch, local_prepare, finalize) = match &method {
-            InstallMethod::Bottle(_) => (
-                PrefetchStep::AcquireBottle,
-                LocalPrepareStep::MaterializeBottle,
-                FinalizeStep::FinalizeBottle,
-            ),
-            InstallMethod::Source(_) => (
-                PrefetchStep::AcquireSource,
-                LocalPrepareStep::DeferToFinalize,
-                FinalizeStep::BuildFromSource,
-            ),
+        let finalize = match &method {
+            InstallMethod::Bottle(_) => FinalizeStep::FinalizeBottle,
+            InstallMethod::Source(_) => FinalizeStep::BuildFromSource,
         };
         Self {
             formula,
             method,
-            prefetch,
-            local_prepare,
             finalize,
         }
     }
@@ -225,41 +200,16 @@ impl std::fmt::Display for DiagnosticCategory {
     }
 }
 
-/// Result of the prefetch phase for a single formula.
-///
-/// Contains all downloaded and extracted data needed to finalize
-/// the installation without further network access.
-pub(crate) enum PrefetchedPayload {
-    /// A bottle was downloaded, stored, and extracted.
-    Bottle {
-        /// Path to the extracted bottle content (`store_dir/sha256/name/version`).
-        source_dir: PathBuf,
-        /// Target keg path (`Cellar/name/version`).
-        keg_path: PathBuf,
-        /// Relocation scope determined by the bottle's cellar type.
-        relocation_scope: RelocationScope,
-    },
-    /// A source archive was downloaded and extracted; build is deferred to finalize.
-    Source {
-        /// Extracted source root directory.
-        source_root: PathBuf,
-        /// Build plan with all metadata needed for the build.
-        plan: SourceBuildPlan,
-        /// Tempdir guard — dropped after finalize to clean up extracted source.
-        _tempdir: tempfile::TempDir,
-    },
-}
-
 /// Orchestrates formula installation and upgrade operations.
 ///
 /// Generic over `R` (formula repository) and `D` (bottle downloader) for
 /// testability via mock implementations.
 ///
 /// The install pipeline is driven by an explicit execution plan that fixes
-/// the `network acquire -> local prepare -> finalize` boundary per formula.
-/// `network acquire` runs concurrently, `local prepare` is bounded explicitly,
-/// and `finalize` remains serialized in topological order to preserve
-/// Homebrew-visible state transitions.
+/// the `acquire -> finalize` boundary per formula. `acquire` merges
+/// download and materialization into a single streaming stage with bounded
+/// concurrency. `finalize` remains serialized in topological order to
+/// preserve Homebrew-visible state transitions.
 pub struct Orchestrator<R, D> {
     repo: R,
     downloader: D,
@@ -285,11 +235,11 @@ struct InstallContext<'a, 'b> {
     blob_store: &'a BlobStore,
 }
 
-/// Bundles a resolved install method with its materialized payload.
-struct MaterializedFormula {
+/// Bundles a resolved install method with its acquired payload.
+struct AcquiredFormula {
     method: InstallMethod,
     finalize: FinalizeStep,
-    materialized: MaterializedPayload,
+    acquired: AcquiredPayload,
 }
 
 /// Bundles method and keg path for finalization.
@@ -298,18 +248,19 @@ struct FinalizeContext<'a> {
     keg_path: &'a Path,
 }
 
-/// Result of the materialize/relocate phase for a single formula.
+/// Result of the acquire stage for a single formula.
 ///
-/// Bottles are materialized and relocated in a parallel phase before finalize.
-/// Source builds are deferred to the serial finalize phase because they may
-/// depend on other formulae being linked first.
-pub(crate) enum MaterializedPayload {
+/// Bottles are downloaded, extracted, materialized, and relocated during
+/// the concurrent acquire stage. Source builds defer the actual build to
+/// the serial finalize stage because they may depend on other formulae
+/// being linked first.
+pub(crate) enum AcquiredPayload {
     /// A bottle was materialized into its keg and relocated.
     Bottle {
         /// Target keg path (`Cellar/name/version`).
         keg_path: PathBuf,
     },
-    /// Source build is deferred to the finalize phase.
+    /// Source build is deferred to the finalize stage.
     PendingSource(Box<PendingSourcePayload>),
 }
 
@@ -328,8 +279,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Matches Homebrew's default staleness window (7 days).
     const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
-    const MAX_LOCAL_PREPARE_CONCURRENCY: usize = 4;
-    const MAX_NETWORK_ACQUIRE_CONCURRENCY: usize = 4;
+    const MAX_ACQUIRE_CONCURRENCY: usize = 4;
 
     /// Creates a new orchestrator.
     #[must_use]
@@ -406,14 +356,13 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns the names of formulae actually installed (excludes already-installed).
     ///
-    /// The pipeline is split into three phases:
-    /// 1. **Prefetch**: download, verify, store, and extract all payloads
-    ///    concurrently. No prefix mutation occurs. Blob store and extract dir
-    ///    hits skip download and extraction respectively (warm-path).
-    /// 2. **Materialize/Relocate**: copy extracted bottle contents into per-keg
-    ///    Cellar paths and patch binaries/text concurrently. Each keg is
-    ///    independent so no serialization is needed. Source builds are deferred.
-    /// 3. **Finalize**: post-install, link, and write receipts in topological
+    /// The pipeline is split into two stages:
+    /// 1. **Acquire**: download, verify, store, extract, and (for bottles)
+    ///    materialize and relocate all payloads concurrently. Each keg is
+    ///    independent so no serialization is needed. Source builds defer the
+    ///    actual build to finalize. Blob store and extract dir hits skip
+    ///    download and extraction respectively (warm-path).
+    /// 2. **Finalize**: post-install, link, and write receipts in topological
     ///    order. Source builds run here because they may need linked dependencies.
     ///
     /// # Errors
@@ -860,19 +809,21 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             .await
     }
 
-    /// Prefetches a formula's payload without mutating the prefix.
+    /// Acquires a formula's payload: downloads, extracts, and (for bottles)
+    /// materializes and relocates in a single streaming step.
     ///
-    /// For bottles: downloads, verifies, stores in blob store, and extracts.
-    /// For source: downloads and extracts the source archive.
-    /// No files are written to Cellar, opt, or prefix directories.
-    async fn prefetch_payload(
+    /// For bottles: downloads, verifies, stores, extracts, materializes to keg,
+    /// and relocates binaries. The keg is ready for finalize.
+    /// For source: downloads and extracts the source archive. Build is deferred
+    /// to finalize.
+    async fn acquire_payload(
         &self,
         operation: &'static str,
-        formula: &Formula,
-        method: &InstallMethod,
+        entry: &ExecutionPlanEntry<'_>,
         blob_store: &BlobStore,
-    ) -> Result<PrefetchedPayload, BrewdockError> {
-        match method {
+    ) -> Result<AcquiredPayload, BrewdockError> {
+        let formula = entry.formula;
+        match &entry.method {
             InstallMethod::Bottle(selected_bottle) => {
                 let blob_hit =
                     self.instrument_phase(operation, "check-blob-store", &formula.name, || {
@@ -922,11 +873,29 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                         RelocationScope::Full
                     };
 
-                Ok(PrefetchedPayload::Bottle {
-                    source_dir,
-                    keg_path,
-                    relocation_scope,
+                let name = formula.name.clone();
+                let opt_dir = self.layout.opt_dir();
+                let prefix = self.layout.prefix().to_path_buf();
+                let span = tracing::info_span!(
+                    "bd.phase",
+                    operation = operation,
+                    phase = "materialize-payload",
+                    target = name.as_str(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    let _entered = span.enter();
+                    materialize_and_relocate_bottle(
+                        &source_dir,
+                        &keg_path,
+                        &opt_dir,
+                        &prefix,
+                        &name,
+                        relocation_scope,
+                    )?;
+                    Ok(AcquiredPayload::Bottle { keg_path })
                 })
+                .await
+                .map_err(|err| BrewdockError::from(std::io::Error::other(err)))?
             }
             InstallMethod::Source(plan) => {
                 let checksum = plan.source_checksum.as_deref().ok_or_else(|| {
@@ -979,46 +948,48 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 .await
                 .map_err(|err| BrewdockError::from(std::io::Error::other(err)))??;
 
-                Ok(PrefetchedPayload::Source {
-                    source_root,
-                    plan: plan.clone(),
-                    _tempdir: tempdir,
-                })
+                Ok(AcquiredPayload::PendingSource(Box::new(
+                    PendingSourcePayload {
+                        source_root,
+                        plan: plan.clone(),
+                        _tempdir: tempdir,
+                    },
+                )))
             }
         }
     }
 
-    /// Finalizes a single formula from a materialized payload.
+    /// Finalizes a single formula from an acquired payload.
     ///
     /// For bottles: runs post-install, link, and receipt write (keg is already
     /// materialized and relocated).
     /// For source: builds from source first, then runs the same finalize steps.
-    async fn finalize_materialized(
+    async fn finalize_acquired(
         &self,
         formula: &Formula,
         cache: &FormulaCache,
         install_context: &InstallContext<'_, '_>,
-        resolved: MaterializedFormula,
+        resolved: AcquiredFormula,
     ) -> Result<(), BrewdockError> {
         let name = formula.name.as_str();
 
         self.emit_formula_started(install_context.operation, name);
         tracing::info!(name, "installing formula");
 
-        let keg_path = match (resolved.finalize, resolved.materialized) {
-            (FinalizeStep::FinalizeBottle, MaterializedPayload::Bottle { keg_path }) => keg_path,
-            (FinalizeStep::BuildFromSource, MaterializedPayload::PendingSource(pending)) => {
+        let keg_path = match (resolved.finalize, resolved.acquired) {
+            (FinalizeStep::FinalizeBottle, AcquiredPayload::Bottle { keg_path }) => keg_path,
+            (FinalizeStep::BuildFromSource, AcquiredPayload::PendingSource(pending)) => {
                 self.build_source_to_keg(install_context.operation, name, *pending)?
             }
-            (FinalizeStep::FinalizeBottle, MaterializedPayload::PendingSource(_))
-            | (FinalizeStep::BuildFromSource, MaterializedPayload::Bottle { .. }) => {
+            (FinalizeStep::FinalizeBottle, AcquiredPayload::PendingSource(_))
+            | (FinalizeStep::BuildFromSource, AcquiredPayload::Bottle { .. }) => {
                 self.emit_formula_failed(
                     install_context.operation,
                     name,
-                    "execution plan finalize step does not match materialized payload",
+                    "execution plan finalize step does not match acquired payload",
                 );
                 return Err(BrewdockError::Io(std::io::Error::other(
-                    "execution plan finalize step does not match materialized payload",
+                    "execution plan finalize step does not match acquired payload",
                 )));
             }
         };
@@ -1310,14 +1281,13 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         Ok(ExecutionPlan {
             entries,
-            network_acquire_concurrency: Self::MAX_NETWORK_ACQUIRE_CONCURRENCY,
-            local_prepare_concurrency: Self::MAX_LOCAL_PREPARE_CONCURRENCY,
+            acquire_concurrency: Self::MAX_ACQUIRE_CONCURRENCY,
         })
     }
 
-    /// Runs the staged install pipeline: plan → prefetch → local prepare → finalize.
+    /// Runs the staged install pipeline: plan → acquire → finalize.
     ///
-    /// Finalize runs in topological order because it is the only prefix-mutating phase.
+    /// Finalize runs in topological order because it is the only prefix-mutating stage.
     async fn execute_install_plan(
         &self,
         label: &str,
@@ -1330,24 +1300,20 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             self.build_execution_plan(to_install, cache)
         })?;
 
-        let payloads = self
-            .run_prefetch_stage(operation, &execution_plan, install_context.blob_store)
-            .await?;
-
-        let materialized = self
-            .run_local_prepare_stage(operation, &execution_plan, payloads)
+        let acquired = self
+            .run_acquire_stage(operation, &execution_plan, install_context.blob_store)
             .await
             .inspect_err(|_| self.cleanup_materialized_kegs(&execution_plan))?;
 
-        for (entry, materialized_payload) in execution_plan.entries.into_iter().zip(materialized) {
-            self.finalize_materialized(
+        for (entry, acquired_payload) in execution_plan.entries.into_iter().zip(acquired) {
+            self.finalize_acquired(
                 entry.formula,
                 cache,
                 install_context,
-                MaterializedFormula {
+                AcquiredFormula {
                     method: entry.method,
                     finalize: entry.finalize,
-                    materialized: materialized_payload,
+                    acquired: acquired_payload,
                 },
             )
             .await?;
@@ -1356,16 +1322,16 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(())
     }
 
-    async fn run_prefetch_stage(
+    async fn run_acquire_stage(
         &self,
         operation: &'static str,
         execution_plan: &ExecutionPlan<'_>,
         blob_store: &BlobStore,
-    ) -> Result<Vec<PrefetchedPayload>, BrewdockError> {
-        let limit = execution_plan.network_acquire_concurrency.max(1);
-        let mut payloads = stream::iter(execution_plan.entries.iter().enumerate().map(
+    ) -> Result<Vec<AcquiredPayload>, BrewdockError> {
+        let limit = execution_plan.acquire_concurrency.max(1);
+        let mut results = stream::iter(execution_plan.entries.iter().enumerate().map(
             |(index, entry)| async move {
-                self.prefetch_entry(operation, entry, blob_store)
+                self.acquire_entry(operation, entry, blob_store)
                     .await
                     .map(|payload| (index, payload))
             },
@@ -1373,71 +1339,22 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         .buffer_unordered(limit)
         .try_collect::<Vec<_>>()
         .await?;
-        payloads.sort_by_key(|(index, _)| *index);
-        Ok(payloads.into_iter().map(|(_, payload)| payload).collect())
+        results.sort_by_key(|(index, _)| *index);
+        Ok(results.into_iter().map(|(_, payload)| payload).collect())
     }
 
-    async fn prefetch_entry(
+    async fn acquire_entry(
         &self,
         operation: &'static str,
         entry: &ExecutionPlanEntry<'_>,
         blob_store: &BlobStore,
-    ) -> Result<PrefetchedPayload, BrewdockError> {
+    ) -> Result<AcquiredPayload, BrewdockError> {
         self.instrument_async_phase(
             operation,
-            "prefetch-payload",
+            "acquire-payload",
             &entry.formula.name,
-            self.prefetch_payload(operation, entry.formula, &entry.method, blob_store),
+            self.acquire_payload(operation, entry, blob_store),
         )
-        .await
-    }
-
-    async fn run_local_prepare_stage(
-        &self,
-        operation: &'static str,
-        execution_plan: &ExecutionPlan<'_>,
-        payloads: Vec<PrefetchedPayload>,
-    ) -> Result<Vec<MaterializedPayload>, BrewdockError> {
-        let opt_dir = self.layout.opt_dir();
-        let prefix = self.layout.prefix().to_path_buf();
-        let limit = execution_plan.local_prepare_concurrency.max(1);
-        stream::iter(
-            execution_plan
-                .entries
-                .iter()
-                .zip(payloads)
-                .map(|(entry, payload)| {
-                    let opt_dir = opt_dir.clone();
-                    let prefix = prefix.clone();
-                    let name = entry.formula.name.clone();
-                    let local_prepare = entry.local_prepare;
-                    async move {
-                        match local_prepare {
-                            LocalPrepareStep::MaterializeBottle => {
-                                let span = tracing::info_span!(
-                                    "bd.phase",
-                                    operation = operation,
-                                    phase = local_prepare.phase_name(),
-                                    target = name.as_str(),
-                                );
-                                tokio::task::spawn_blocking(move || {
-                                    let _entered = span.enter();
-                                    materialize_prefetched_payload(
-                                        payload, &name, &opt_dir, &prefix,
-                                    )
-                                })
-                                .await
-                                .map_err(|err| BrewdockError::from(std::io::Error::other(err)))?
-                            }
-                            LocalPrepareStep::DeferToFinalize => {
-                                materialize_prefetched_payload(payload, &name, &opt_dir, &prefix)
-                            }
-                        }
-                    }
-                }),
-        )
-        .buffered(limit)
-        .try_collect()
         .await
     }
 
@@ -1717,15 +1634,6 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         }
 
         Ok(diagnostics)
-    }
-}
-
-impl LocalPrepareStep {
-    const fn phase_name(self) -> &'static str {
-        match self {
-            Self::MaterializeBottle => "materialize-payload",
-            Self::DeferToFinalize => "defer-to-finalize",
-        }
     }
 }
 
@@ -2235,12 +2143,8 @@ mod tests {
             .build_execution_plan(&["bottle".to_owned(), "source".to_owned()], &cache)?;
 
         assert_eq!(
-            plan.network_acquire_concurrency,
-            Orchestrator::<crate::testutil::MockRepo, crate::testutil::MockDownloader>::MAX_NETWORK_ACQUIRE_CONCURRENCY
-        );
-        assert_eq!(
-            plan.local_prepare_concurrency,
-            Orchestrator::<crate::testutil::MockRepo, crate::testutil::MockDownloader>::MAX_LOCAL_PREPARE_CONCURRENCY
+            plan.acquire_concurrency,
+            Orchestrator::<crate::testutil::MockRepo, crate::testutil::MockDownloader>::MAX_ACQUIRE_CONCURRENCY
         );
         assert_eq!(
             plan.entries
@@ -2250,28 +2154,12 @@ mod tests {
             vec!["bottle", "source"]
         );
         assert!(matches!(
-            (
-                plan.entries[0].prefetch,
-                plan.entries[0].local_prepare,
-                plan.entries[0].finalize
-            ),
-            (
-                PrefetchStep::AcquireBottle,
-                LocalPrepareStep::MaterializeBottle,
-                FinalizeStep::FinalizeBottle
-            )
+            plan.entries[0].finalize,
+            FinalizeStep::FinalizeBottle
         ));
         assert!(matches!(
-            (
-                plan.entries[1].prefetch,
-                plan.entries[1].local_prepare,
-                plan.entries[1].finalize
-            ),
-            (
-                PrefetchStep::AcquireSource,
-                LocalPrepareStep::DeferToFinalize,
-                FinalizeStep::BuildFromSource
-            )
+            plan.entries[1].finalize,
+            FinalizeStep::BuildFromSource
         ));
         Ok(())
     }
@@ -3110,8 +2998,8 @@ install:
         assert_eq!(upgraded, vec!["target"]);
         assert_eq!(
             orchestrator.downloader.max_in_flight(),
-            Orchestrator::<MockRepo, TrackingDownloader>::MAX_NETWORK_ACQUIRE_CONCURRENCY,
-            "source upgrade should reuse the staged prefetch concurrency contract",
+            Orchestrator::<MockRepo, TrackingDownloader>::MAX_ACQUIRE_CONCURRENCY,
+            "source upgrade should reuse the staged acquire concurrency contract",
         );
         Ok(())
     }
@@ -3747,8 +3635,8 @@ install:
         assert_eq!(installed.len(), 6);
         assert_eq!(
             orchestrator.downloader.max_in_flight(),
-            Orchestrator::<MockRepo, TrackingDownloader>::MAX_NETWORK_ACQUIRE_CONCURRENCY,
-            "prefetch should cap concurrent downloads at the execution plan limit",
+            Orchestrator::<MockRepo, TrackingDownloader>::MAX_ACQUIRE_CONCURRENCY,
+            "acquire should cap concurrent downloads at the execution plan limit",
         );
         Ok(())
     }
@@ -3929,7 +3817,7 @@ install:
         let result = orchestrator.install(&["alpha", "bravo", "charlie"]).await;
 
         assert!(result.is_err());
-        // With prefetch-first architecture: no prefix mutation should have occurred
+        // With acquire-first architecture: no prefix mutation should have occurred
         // because all downloads happen before any finalization
         assert_not_installed(&layout, "alpha");
         assert_not_installed(&layout, "bravo");

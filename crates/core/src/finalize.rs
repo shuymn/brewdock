@@ -9,9 +9,7 @@ use brewdock_formula::{Formula, FormulaCache};
 
 use crate::{
     BrewdockError,
-    orchestrate::{
-        InstallMethod, MaterializedPayload, PendingSourcePayload, PrefetchedPayload, pkg_version,
-    },
+    orchestrate::{InstallMethod, pkg_version},
 };
 
 /// Default tap name for receipt source metadata.
@@ -56,46 +54,6 @@ pub fn materialize_and_relocate_bottle(
     materialize(source_dir, keg_path, opt_dir, formula_name)?;
     relocate_keg_with_manifest(keg_path, prefix, relocation_scope, &relocation_manifest)?;
     Ok(())
-}
-
-/// Materializes a prefetched payload into a [`MaterializedPayload`].
-///
-/// This is a free function (not a method) so it can be moved into
-/// [`tokio::task::spawn_blocking`] without borrowing the orchestrator.
-pub fn materialize_prefetched_payload(
-    payload: PrefetchedPayload,
-    formula_name: &str,
-    opt_dir: &Path,
-    prefix: &Path,
-) -> Result<MaterializedPayload, BrewdockError> {
-    match payload {
-        PrefetchedPayload::Bottle {
-            source_dir,
-            keg_path,
-            relocation_scope,
-        } => {
-            materialize_and_relocate_bottle(
-                &source_dir,
-                &keg_path,
-                opt_dir,
-                prefix,
-                formula_name,
-                relocation_scope,
-            )?;
-            Ok(MaterializedPayload::Bottle { keg_path })
-        }
-        PrefetchedPayload::Source {
-            source_root,
-            plan,
-            _tempdir: tempdir,
-        } => Ok(MaterializedPayload::PendingSource(Box::new(
-            PendingSourcePayload {
-                source_root,
-                plan,
-                _tempdir: tempdir,
-            },
-        ))),
-    }
 }
 
 pub fn refresh_opt_link(
