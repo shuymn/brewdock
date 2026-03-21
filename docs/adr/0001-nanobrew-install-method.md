@@ -74,7 +74,7 @@ Formula-name matching and string-fragment builtins are not part of the supported
 `brewdock-formula` becomes responsible for bottle selection inputs and install method planning inputs, not only exact-tag supportability.
 
 `brewdock-core` owns a single install method resolution path reused by install, dry-run, and upgrade, plus source fallback orchestration.
-Bottle execution is staged behind an explicit execution plan so `network acquire`, bounded pre-finalize local prepare, and Homebrew-visible finalize remain separate contracts instead of ad-hoc control flow.
+Bottle execution is staged behind an explicit execution plan so bounded `network acquire`, bounded pre-finalize local prepare, checksum-complete blob publication, and Homebrew-visible finalize remain separate contracts instead of ad-hoc control flow.
 
 `brewdock-cellar` gains Prism-backed parse, restricted lowering, and schema normalization support for post-install execution and becomes part of the fail-closed boundary around receipt/state persistence.
 
