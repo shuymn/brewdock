@@ -15,10 +15,7 @@ use brewdock_formula::{
     IndexMetadata, MetadataStore, PkgVersion, SelectedBottle, UnsupportedReason,
     check_supportability, resolve_install_order, select_bottle,
 };
-use futures::{
-    future::try_join_all,
-    stream::{self, StreamExt, TryStreamExt},
-};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tracing::Instrument;
 
 use crate::{
@@ -145,6 +142,7 @@ pub struct CleanupResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutionPlan<'a> {
     entries: Vec<ExecutionPlanEntry<'a>>,
+    network_acquire_concurrency: usize,
     local_prepare_concurrency: usize,
 }
 
@@ -335,6 +333,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Matches Homebrew's default staleness window (7 days).
     const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
     const MAX_LOCAL_PREPARE_CONCURRENCY: usize = 4;
+    const MAX_NETWORK_ACQUIRE_CONCURRENCY: usize = 4;
 
     /// Creates a new orchestrator.
     #[must_use]
@@ -429,20 +428,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                     self.build_execution_plan(&to_install, &cache)
                 })?;
 
-            let prefetch_futures: Vec<_> = execution_plan
-                .entries
-                .iter()
-                .map(|entry| {
-                    Self::instrument_async_phase(
-                        "install",
-                        "prefetch-payload",
-                        &entry.formula.name,
-                        self.prefetch_payload("install", entry.formula, &entry.method, &blob_store),
-                    )
-                })
-                .collect();
-
-            let payloads = try_join_all(prefetch_futures).await?;
+            let payloads = self
+                .run_prefetch_stage(&execution_plan, &blob_store)
+                .await?;
 
             let materialized = self
                 .run_local_prepare_stage(&execution_plan, payloads)
@@ -1405,8 +1393,43 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         Ok(ExecutionPlan {
             entries,
+            network_acquire_concurrency: Self::MAX_NETWORK_ACQUIRE_CONCURRENCY,
             local_prepare_concurrency: Self::MAX_LOCAL_PREPARE_CONCURRENCY,
         })
+    }
+
+    async fn run_prefetch_stage(
+        &self,
+        execution_plan: &ExecutionPlan<'_>,
+        blob_store: &BlobStore,
+    ) -> Result<Vec<PrefetchedPayload>, BrewdockError> {
+        let limit = execution_plan.network_acquire_concurrency.max(1);
+        let mut payloads = stream::iter(execution_plan.entries.iter().enumerate().map(
+            |(index, entry)| async move {
+                self.prefetch_entry(entry, blob_store)
+                    .await
+                    .map(|payload| (index, payload))
+            },
+        ))
+        .buffer_unordered(limit)
+        .try_collect::<Vec<_>>()
+        .await?;
+        payloads.sort_by_key(|(index, _)| *index);
+        Ok(payloads.into_iter().map(|(_, payload)| payload).collect())
+    }
+
+    async fn prefetch_entry(
+        &self,
+        entry: &ExecutionPlanEntry<'_>,
+        blob_store: &BlobStore,
+    ) -> Result<PrefetchedPayload, BrewdockError> {
+        Self::instrument_async_phase(
+            "install",
+            "prefetch-payload",
+            &entry.formula.name,
+            self.prefetch_payload("install", entry.formula, &entry.method, blob_store),
+        )
+        .await
     }
 
     async fn run_local_prepare_stage(
@@ -1945,6 +1968,7 @@ mod tests {
         time::Duration,
     };
 
+    use brewdock_bottle::BottleError;
     use brewdock_cellar::{
         InstallReceipt, ReceiptSource, ReceiptSourceVersions, atomic_symlink_replace, write_receipt,
     };
@@ -1952,8 +1976,8 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        HOST_TAG, MockDownloader, PLAN_SHA, SHA_B, assert_installed, assert_not_installed,
-        create_bottle_tar_gz, create_simple_bottle, create_source_tar_gz,
+        HOST_TAG, MockDownloader, MockRepo, PLAN_SHA, SHA_A, SHA_B, SHA_C, assert_installed,
+        assert_not_installed, create_bottle_tar_gz, create_simple_bottle, create_source_tar_gz,
         create_source_tar_gz_with_raw_paths, make_formula, make_orchestrator,
         make_orchestrator_with_sources, move_host_bottle_to_tag, setup_installed_keg,
     };
@@ -2155,6 +2179,10 @@ mod tests {
         let plan = orchestrator
             .build_execution_plan(&["bottle".to_owned(), "source".to_owned()], &cache)?;
 
+        assert_eq!(
+            plan.network_acquire_concurrency,
+            Orchestrator::<crate::testutil::MockRepo, crate::testutil::MockDownloader>::MAX_NETWORK_ACQUIRE_CONCURRENCY
+        );
         assert_eq!(
             plan.local_prepare_concurrency,
             Orchestrator::<crate::testutil::MockRepo, crate::testutil::MockDownloader>::MAX_LOCAL_PREPARE_CONCURRENCY
@@ -3453,6 +3481,148 @@ install:
         assert_installed(&layout, "bravo");
         // charlie was rolled back
         assert_not_installed(&layout, "charlie");
+        Ok(())
+    }
+
+    struct TrackingDownloader {
+        data: HashMap<String, Vec<u8>>,
+        delay: Duration,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl TrackingDownloader {
+        fn new(entries: Vec<(&str, Vec<u8>)>, delay: Duration) -> Self {
+            Self {
+                data: entries
+                    .into_iter()
+                    .map(|(checksum, bytes)| (checksum.to_owned(), bytes))
+                    .collect(),
+                delay,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BottleDownloader for TrackingDownloader {
+        async fn download_verified(
+            &self,
+            _url: &str,
+            expected_sha256: &str,
+        ) -> Result<Vec<u8>, BottleError> {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.data.get(expected_sha256).cloned().ok_or_else(|| {
+                BottleError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("mock: no data for {expected_sha256}"),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_install_bounds_concurrent_prefetch_downloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let formulas = vec![
+            make_formula("alpha", "1.0", &[], SHA_A),
+            make_formula("bravo", "1.0", &[], SHA_B),
+            make_formula("charlie", "1.0", &[], SHA_C),
+            make_formula(
+                "delta",
+                "1.0",
+                &[],
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ),
+            make_formula(
+                "echo",
+                "1.0",
+                &[],
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ),
+            make_formula(
+                "foxtrot",
+                "1.0",
+                &[],
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+        ];
+        let payloads = vec![
+            (
+                SHA_A,
+                create_bottle_tar_gz("alpha", "1.0", &[("bin/alpha-tool", b"#!/bin/sh\n")])?,
+            ),
+            (
+                SHA_B,
+                create_bottle_tar_gz("bravo", "1.0", &[("bin/bravo-tool", b"#!/bin/sh\n")])?,
+            ),
+            (
+                SHA_C,
+                create_bottle_tar_gz("charlie", "1.0", &[("bin/charlie-tool", b"#!/bin/sh\n")])?,
+            ),
+            (
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                create_bottle_tar_gz("delta", "1.0", &[("bin/delta-tool", b"#!/bin/sh\n")])?,
+            ),
+            (
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                create_bottle_tar_gz("echo", "1.0", &[("bin/echo-tool", b"#!/bin/sh\n")])?,
+            ),
+            (
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                create_bottle_tar_gz("foxtrot", "1.0", &[("bin/foxtrot-tool", b"#!/bin/sh\n")])?,
+            ),
+        ];
+        let downloader = TrackingDownloader::new(payloads, Duration::from_millis(30));
+        let host_tag: HostTag = HOST_TAG.parse()?;
+        let orchestrator = Orchestrator::new(MockRepo::new(formulas), downloader, layout, host_tag);
+
+        let installed = orchestrator
+            .install(&["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"])
+            .await?;
+
+        assert_eq!(installed.len(), 6);
+        assert_eq!(
+            orchestrator.downloader.max_in_flight(),
+            Orchestrator::<MockRepo, TrackingDownloader>::MAX_NETWORK_ACQUIRE_CONCURRENCY,
+            "prefetch should cap concurrent downloads at the execution plan limit",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_failed_download_does_not_publish_blob()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = SHA_A;
+        let formula = make_formula("alpha", "1.0", &[], sha);
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![],
+            Arc::new(AtomicUsize::new(0)),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["alpha"]).await;
+
+        assert!(result.is_err());
+        let blob_store = BlobStore::new(&layout.blob_dir());
+        assert!(
+            !blob_store.has(sha)?,
+            "failed downloads must not publish incomplete payloads to the blob store",
+        );
         Ok(())
     }
 
