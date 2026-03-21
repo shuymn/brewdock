@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the doctor command.
 ///
@@ -15,9 +15,7 @@ pub fn run<R: FormulaRepository, D: BottleDownloader>(
     let diagnostics = orchestrator.doctor().context("doctor check failed")?;
 
     if !verbosity.is_quiet() {
-        for entry in &diagnostics {
-            println!("[{}] {}", entry.category, entry.message);
-        }
+        print!("{}", output::render_doctor(&diagnostics));
     }
 
     Ok(())

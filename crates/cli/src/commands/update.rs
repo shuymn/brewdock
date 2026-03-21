@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the update command.
 ///
@@ -15,14 +15,14 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
 ) -> Result<()> {
     if dry_run {
         if !verbosity.is_quiet() {
-            println!("Would update formula index");
+            print!("{}", output::render_update_dry_run());
         }
         return Ok(());
     }
 
     let count = orchestrator.update().await.context("update failed")?;
     if !verbosity.is_quiet() {
-        println!("Updated {count} formulae");
+        print!("{}", output::render_update_summary(count));
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ use std::{fs::OpenOptions, path::PathBuf};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, format::FmtSpan},
+    prelude::*,
 };
 
 use crate::Verbosity;
@@ -55,7 +56,7 @@ fn benchmark_log_path_from_value(value: Option<std::ffi::OsString>) -> Option<Pa
 }
 
 fn default_subscriber(filter: EnvFilter) -> Box<dyn tracing::Subscriber + Send + Sync> {
-    Box::new(fmt::Subscriber::builder().with_env_filter(filter).finish())
+    Box::new(tracing_subscriber::registry().with(filter))
 }
 
 fn benchmark_subscriber(

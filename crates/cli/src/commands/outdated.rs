@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the outdated command.
 ///
@@ -21,16 +21,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
         .context("outdated check failed")?;
 
     if !verbosity.is_quiet() {
-        if entries.is_empty() {
-            println!("All formulae are up to date");
-        } else {
-            for entry in &entries {
-                println!(
-                    "{} {} -> {}",
-                    entry.name, entry.current_version, entry.latest_version
-                );
-            }
-        }
+        print!("{}", output::render_outdated(&entries));
     }
 
     Ok(())

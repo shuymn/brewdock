@@ -44,12 +44,14 @@ Useful global flags:
 # Preview actions without executing
 bd --dry-run install jq
 
-# More logs
+# Progress UI plus detailed phase messages
 bd --verbose install jq
 
 # Errors only
 bd --quiet install jq
 ```
+
+Normal interactive runs use an `indicatif`-style progress UI for long-running commands (`install`, `update`, `upgrade`). When stderr is not a TTY, brewdock automatically falls back to plain line-oriented output so pipes and CI logs stay readable. Benchmark tracing via `BREWDOCK_BENCHMARK_FILE` is unchanged.
 
 ## Local Development
 

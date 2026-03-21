@@ -1,9 +1,7 @@
-use std::fmt::Write;
-
 use anyhow::{Context, Result};
-use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator, UpgradePlanEntry};
+use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the upgrade command.
 ///
@@ -24,7 +22,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
             .await
             .context("upgrade planning failed")?;
         if !verbosity.is_quiet() {
-            print!("{}", render_upgrade_plan(&plan));
+            print!("{}", output::render_upgrade_plan(&plan));
         }
         return Ok(());
     }
@@ -34,31 +32,9 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
         .await
         .context("upgrade failed")?;
     if !verbosity.is_quiet() {
-        if upgraded.is_empty() {
-            println!("Already up-to-date");
-        } else {
-            for name in &upgraded {
-                println!("Upgraded {name}");
-            }
-        }
+        print!("{}", output::render_upgrade_summary(&upgraded));
     }
     Ok(())
-}
-
-fn render_upgrade_plan(plan: &[UpgradePlanEntry]) -> String {
-    if plan.is_empty() {
-        return "Already up-to-date\n".to_owned();
-    }
-
-    let mut output = String::from("Would upgrade:\n");
-    for entry in plan {
-        let _ = writeln!(
-            output,
-            "  {} {} -> {} [{}]",
-            entry.name, entry.from_version, entry.to_version, entry.method
-        );
-    }
-    output
 }
 
 #[cfg(test)]
@@ -68,8 +44,12 @@ mod tests {
     use brewdock_core::{InstallMethod, Layout, SourceBuildPlan, UpgradePlanEntry};
 
     use super::*;
-    use crate::testutil::{
-        SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator, setup_installed_keg,
+    use crate::{
+        output,
+        testutil::{
+            SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator,
+            setup_installed_keg,
+        },
     };
 
     #[tokio::test]
@@ -164,7 +144,7 @@ mod tests {
             }),
         }];
 
-        let rendered = render_upgrade_plan(&plan);
+        let rendered = output::render_upgrade_plan(&plan);
         assert!(rendered.contains("a 1.0 -> 2.0 [source]"));
     }
 }

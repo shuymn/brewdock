@@ -6,6 +6,8 @@ use clap::Parser;
 
 mod commands;
 mod hint;
+mod output;
+mod progress;
 mod trace;
 mod verbosity;
 
@@ -93,11 +95,12 @@ async fn main() -> Result<()> {
 
     let layout = Layout::production();
     let host_tag = HostTag::detect().context("platform detection failed")?;
-    let orchestrator = Orchestrator::new(
+    let orchestrator = Orchestrator::with_progress_sink(
         HttpFormulaRepository::new(),
         HttpBottleDownloader::new(),
         layout,
         host_tag,
+        progress::progress_sink(verbosity),
     );
     let result = match cli.command {
         Commands::Install { formulae } => {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the list command.
 ///
@@ -17,13 +17,7 @@ pub fn run<R: FormulaRepository, D: BottleDownloader>(
         .context("listing installed formulae failed")?;
 
     if !verbosity.is_quiet() {
-        if kegs.is_empty() {
-            println!("No formulae installed");
-        } else {
-            for keg in &kegs {
-                println!("{} {}", keg.name, keg.pkg_version);
-            }
-        }
+        print!("{}", output::render_list(&kegs));
     }
 
     Ok(())

@@ -1,9 +1,7 @@
-use std::fmt::Write;
-
 use anyhow::{Context, Result};
-use brewdock_core::{BottleDownloader, FormulaInfo, FormulaRepository, Orchestrator};
+use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the info command.
 ///
@@ -21,46 +19,10 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
         .context("info lookup failed")?;
 
     if !verbosity.is_quiet() {
-        print!("{}", render_info(&info));
+        print!("{}", output::render_info(&info));
     }
 
     Ok(())
-}
-
-fn render_info(info: &FormulaInfo) -> String {
-    let mut output = format!("{} {}", info.name, info.version);
-    if info.keg_only {
-        output.push_str(" [keg-only]");
-    }
-    output.push('\n');
-
-    if let Some(desc) = &info.desc {
-        let _ = writeln!(output, "{desc}");
-    }
-    if let Some(homepage) = &info.homepage {
-        let _ = writeln!(output, "{homepage}");
-    }
-    if let Some(license) = &info.license {
-        let _ = writeln!(output, "License: {license}");
-    }
-
-    if info.bottle_available {
-        let _ = writeln!(output, "Bottle: available");
-    } else {
-        let _ = writeln!(output, "Bottle: not available");
-    }
-
-    if let Some(installed) = &info.installed_version {
-        let _ = writeln!(output, "Installed: {installed}");
-    } else {
-        let _ = writeln!(output, "Not installed");
-    }
-
-    if !info.dependencies.is_empty() {
-        let _ = writeln!(output, "Dependencies: {}", info.dependencies.join(", "));
-    }
-
-    output
 }
 
 #[cfg(test)]
@@ -70,7 +32,10 @@ mod tests {
     use brewdock_core::Layout;
 
     use super::*;
-    use crate::testutil::{SHA_A, make_formula, make_orchestrator, setup_installed_keg};
+    use crate::{
+        output,
+        testutil::{SHA_A, make_formula, make_orchestrator, setup_installed_keg},
+    };
 
     #[tokio::test]
     async fn test_info_shows_formula_details() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,7 +67,7 @@ mod tests {
 
     #[test]
     fn test_render_info_format() {
-        let info = FormulaInfo {
+        let info = brewdock_core::FormulaInfo {
             name: "jq".to_owned(),
             version: "1.7".to_owned(),
             desc: Some("Lightweight JSON processor".to_owned()),
@@ -114,9 +79,9 @@ mod tests {
             installed_version: Some("1.7".to_owned()),
         };
 
-        let rendered = render_info(&info);
+        let rendered = output::render_info(&info);
         assert!(rendered.contains("jq 1.7"));
-        assert!(rendered.contains("Lightweight JSON processor"));
+        assert!(rendered.contains("Description: Lightweight JSON processor"));
         assert!(rendered.contains("Bottle: available"));
         assert!(rendered.contains("Installed: 1.7"));
         assert!(rendered.contains("Dependencies: oniguruma"));
@@ -124,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_render_info_not_installed() {
-        let info = FormulaInfo {
+        let info = brewdock_core::FormulaInfo {
             name: "wget".to_owned(),
             version: "1.24".to_owned(),
             desc: None,
@@ -136,9 +101,9 @@ mod tests {
             installed_version: None,
         };
 
-        let rendered = render_info(&info);
+        let rendered = output::render_info(&info);
         assert!(rendered.contains("[keg-only]"));
-        assert!(rendered.contains("Not installed"));
+        assert!(rendered.contains("Installed: no"));
         assert!(rendered.contains("Bottle: not available"));
     }
 }

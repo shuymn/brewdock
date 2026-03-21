@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the search command.
 ///
@@ -19,13 +19,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
         .context("search failed")?;
 
     if !verbosity.is_quiet() {
-        if results.is_empty() {
-            println!("No formulae found matching \"{pattern}\"");
-        } else {
-            for name in &results {
-                println!("{name}");
-            }
-        }
+        print!("{}", output::render_search_results(pattern, &results));
     }
 
     Ok(())

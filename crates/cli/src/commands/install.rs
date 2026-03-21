@@ -1,9 +1,7 @@
-use std::fmt::Write;
-
 use anyhow::{Context, Result};
-use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator, PlanEntry};
+use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
-use crate::Verbosity;
+use crate::{Verbosity, output};
 
 /// Runs the install command.
 ///
@@ -24,7 +22,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
             .await
             .context("install planning failed")?;
         if !verbosity.is_quiet() {
-            print!("{}", render_install_plan(&plan));
+            print!("{}", output::render_install_plan(&plan));
         }
         return Ok(());
     }
@@ -34,27 +32,9 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
         .await
         .context("install failed")?;
     if !verbosity.is_quiet() {
-        for name in &installed {
-            println!("Installed {name}");
-        }
+        print!("{}", output::render_install_summary(&installed));
     }
     Ok(())
-}
-
-fn render_install_plan(plan: &[PlanEntry]) -> String {
-    if plan.is_empty() {
-        return "Nothing to install\n".to_owned();
-    }
-
-    let mut output = String::from("Would install:\n");
-    for entry in plan {
-        let _ = writeln!(
-            output,
-            "  {} {} [{}]",
-            entry.name, entry.version, entry.method
-        );
-    }
-    output
 }
 
 #[cfg(test)]
@@ -64,7 +44,10 @@ mod tests {
     use brewdock_core::{InstallMethod, Layout, PlanEntry, SourceBuildPlan};
 
     use super::*;
-    use crate::testutil::{SHA_A, SHA_B, create_bottle_tar_gz, make_formula, make_orchestrator};
+    use crate::{
+        output,
+        testutil::{SHA_A, SHA_B, create_bottle_tar_gz, make_formula, make_orchestrator},
+    };
 
     #[tokio::test]
     async fn test_commands_install_single_formula() -> Result<(), Box<dyn std::error::Error>> {
@@ -192,7 +175,7 @@ mod tests {
             },
         ];
 
-        let rendered = render_install_plan(&plan);
+        let rendered = output::render_install_plan(&plan);
         assert!(rendered.contains("a 1.0 [bottle:arm64_sonoma]"));
         assert!(rendered.contains("b 2.0 [source]"));
     }
