@@ -310,7 +310,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: warm-path skip だけ入れても materialize/relocate が wall time の 77% を占めるため user-visible improvement が小さく、並列 materialize だけ入れても warm-path で毎回 download/extract を繰り返すので warm benchmark が閉じない; 両方セットで初めて warm benchmark の改善が user-visible になる
   - Escalate if: per-keg materialize/relocate の並列化で opt symlink や keg parent directory の操作に予期しない競合が発生し、per-keg 独立性の前提が崩れる場合
 
-- [ ] Theme: Metadata cache redesign for update and future formula/cask scale
+- [x] Theme: Metadata cache redesign for update and future formula/cask scale
   - Outcome: `update` と将来の search/info/install planning が full snapshot 一本足ではなくなり、formula/cask 件数が増えても metadata path が支配的ボトルネックになりにくい
   - Goal: Homebrew 互換 install state を維持したまま、metadata 取得と local cache の責務を再設計して `update` を将来の scale に備えさせる
   - Must Not Break: install/upgrade の correctness を metadata cache 変更で壊さない; offline stale cache では fail-open せず明示的に扱う; `task check` green
