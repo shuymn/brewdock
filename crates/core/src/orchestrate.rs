@@ -17,6 +17,7 @@ use brewdock_formula::{
     CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
     SelectedBottle, UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
 };
+use futures::future::try_join_all;
 use tracing::Instrument;
 
 use crate::{BrewdockError, HostTag, Layout, error::SourceBuildError, lock::FileLock};
@@ -90,14 +91,42 @@ pub struct SourceBuildPlan {
     pub cellar_path: PathBuf,
 }
 
+/// Result of the prefetch phase for a single formula.
+///
+/// Contains all downloaded and extracted data needed to finalize
+/// the installation without further network access.
+enum PrefetchedPayload {
+    /// A bottle was downloaded, stored, and extracted.
+    Bottle {
+        /// Path to the extracted bottle content (`store_dir/sha256/name/version`).
+        source_dir: PathBuf,
+        /// Target keg path (`Cellar/name/version`).
+        keg_path: PathBuf,
+        /// Relocation scope determined by the bottle's cellar type.
+        relocation_scope: RelocationScope,
+    },
+    /// A source archive was downloaded and extracted; build is deferred to finalize.
+    Source {
+        /// Extracted source root directory.
+        source_root: PathBuf,
+        /// Build plan with all metadata needed for the build.
+        plan: SourceBuildPlan,
+        /// Tempdir guard — dropped after finalize to clean up extracted source.
+        _tempdir: tempfile::TempDir,
+    },
+}
+
 /// Orchestrates formula installation and upgrade operations.
 ///
 /// Generic over `R` (formula repository) and `D` (bottle downloader) for
 /// testability via mock implementations.
 ///
-/// Blocking I/O (file operations) is called directly in async methods.
-/// This is acceptable because the intended runtime is single-threaded
-/// (`current_thread`) with no concurrent async work.
+/// The install pipeline uses [`futures::future::try_join_all`] to prefetch
+/// payloads concurrently.  On a `current_thread` runtime, downloads
+/// interleave at await points, but blocking I/O (blob store, extraction)
+/// runs inline and serialises other in-flight futures for its duration.
+/// This is acceptable because the primary latency gain comes from
+/// overlapping network requests, not filesystem operations.
 pub struct Orchestrator<R, D> {
     repo: R,
     downloader: D,
@@ -119,6 +148,12 @@ struct InstallContext<'a, 'b> {
     operation: &'static str,
     requested: &'a HashSet<&'b str>,
     blob_store: &'a BlobStore,
+}
+
+/// Bundles a resolved install method with its prefetched payload.
+struct ResolvedPayload {
+    method: InstallMethod,
+    payload: PrefetchedPayload,
 }
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
@@ -175,6 +210,12 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns the names of formulae actually installed (excludes already-installed).
     ///
+    /// The pipeline is split into two phases:
+    /// 1. **Prefetch**: download, verify, store, and extract all payloads.
+    ///    No prefix mutation occurs. Failures here abort before any install state changes.
+    /// 2. **Finalize**: materialize, relocate, post-install, link, and write receipts
+    ///    in topological order. Previously finalized formulae remain intact on failure.
+    ///
     /// # Errors
     ///
     /// Returns [`BrewdockError`] if any step fails. Unsupported formulae are
@@ -197,8 +238,46 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 requested: &requested,
                 blob_store: &blob_store,
             };
-            for name in to_install.iter().map(String::as_str) {
-                self.install_single(name, &cache, &install_context).await?;
+
+            // Phase 1: Resolve install methods, then prefetch all payloads
+            // concurrently (no prefix mutation).
+            let resolved_methods: Vec<_> = to_install
+                .iter()
+                .map(|name| {
+                    let formula = cache
+                        .get(name)
+                        .ok_or_else(|| FormulaError::NotFound { name: name.clone() })?;
+                    let method =
+                        Self::instrument_phase("install", "resolve-install-method", name, || {
+                            self.resolve_install_method(formula)
+                        })?;
+                    Ok((method, formula))
+                })
+                .collect::<Result<Vec<_>, BrewdockError>>()?;
+
+            let prefetch_futures: Vec<_> = resolved_methods
+                .iter()
+                .map(|(method, formula)| {
+                    Self::instrument_async_phase(
+                        "install",
+                        "prefetch-payload",
+                        &formula.name,
+                        self.prefetch_payload("install", formula, method, &blob_store),
+                    )
+                })
+                .collect();
+
+            let payloads = try_join_all(prefetch_futures).await?;
+
+            // Phase 2: Finalize in topological order (prefix-mutating).
+            for ((method, formula), payload) in resolved_methods.into_iter().zip(payloads) {
+                self.finalize_single(
+                    formula,
+                    &cache,
+                    &install_context,
+                    ResolvedPayload { method, payload },
+                )
+                .await?;
             }
 
             Ok(to_install)
@@ -512,57 +591,165 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     }
 
     /// Runs the install step of an upgrade: resolves deps for source builds,
-    /// then installs each formula in order.
+    /// then prefetches and finalizes each formula in order.
     async fn run_upgrade_install(
         &self,
         candidate: &UpgradeCandidate,
         install_context: &InstallContext<'_, '_>,
     ) -> Result<(), BrewdockError> {
-        if matches!(candidate.method, InstallMethod::Source(_)) {
-            let (to_install, cache) = self.resolve_upgrade_install_list(candidate).await?;
-            for name in to_install.iter().map(String::as_str) {
-                self.install_single(name, &cache, install_context).await?;
-            }
+        let (to_install, cache) = if matches!(candidate.method, InstallMethod::Source(_)) {
+            self.resolve_upgrade_install_list(candidate).await?
         } else {
             let mut cache = FormulaCache::new();
             cache.insert(candidate.formula.clone());
-            self.install_single(&candidate.name, &cache, install_context)
-                .await?;
+            (vec![candidate.name.clone()], cache)
+        };
+
+        for name in to_install.iter().map(String::as_str) {
+            let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
+                name: name.to_owned(),
+            })?;
+            let method = Self::instrument_phase(
+                install_context.operation,
+                "resolve-install-method",
+                name,
+                || self.resolve_install_method(formula),
+            )?;
+            let payload = Self::instrument_async_phase(
+                install_context.operation,
+                "prefetch-payload",
+                name,
+                self.prefetch_payload(
+                    install_context.operation,
+                    formula,
+                    &method,
+                    install_context.blob_store,
+                ),
+            )
+            .await?;
+            self.finalize_single(
+                formula,
+                &cache,
+                install_context,
+                ResolvedPayload { method, payload },
+            )
+            .await?;
         }
         Ok(())
     }
 
-    /// Installs a single formula (download → extract → materialize → link → receipt).
-    async fn install_single(
+    /// Prefetches a formula's payload without mutating the prefix.
+    ///
+    /// For bottles: downloads, verifies, stores in blob store, and extracts.
+    /// For source: downloads and extracts the source archive.
+    /// No files are written to Cellar, opt, or prefix directories.
+    async fn prefetch_payload(
         &self,
-        name: &str,
+        operation: &'static str,
+        formula: &Formula,
+        method: &InstallMethod,
+        blob_store: &BlobStore,
+    ) -> Result<PrefetchedPayload, BrewdockError> {
+        match method {
+            InstallMethod::Bottle(selected_bottle) => {
+                let data = Self::instrument_async_phase(
+                    operation,
+                    "download-bottle",
+                    &formula.name,
+                    self.downloader
+                        .download_verified(&selected_bottle.url, &selected_bottle.sha256),
+                )
+                .await?;
+
+                Self::instrument_phase(operation, "store-bottle-blob", &formula.name, || {
+                    blob_store.put(&selected_bottle.sha256, &data)
+                })?;
+
+                let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
+                let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
+                Self::instrument_phase(operation, "extract-bottle", &formula.name, || {
+                    extract_tar_gz(&blob_path, &extract_dir)
+                })?;
+
+                let version_str = pkg_version(&formula.versions.stable, formula.revision);
+                let source_dir = extract_dir.join(&formula.name).join(&version_str);
+                let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
+                let relocation_scope =
+                    if matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
+                        RelocationScope::TextOnly
+                    } else {
+                        RelocationScope::Full
+                    };
+
+                Ok(PrefetchedPayload::Bottle {
+                    source_dir,
+                    keg_path,
+                    relocation_scope,
+                })
+            }
+            InstallMethod::Source(plan) => {
+                let checksum = plan.source_checksum.as_deref().ok_or_else(|| {
+                    SourceBuildError::MissingSourceChecksum(plan.formula_name.clone())
+                })?;
+                let data = Self::instrument_async_phase(
+                    operation,
+                    "download-source-archive",
+                    &plan.formula_name,
+                    self.downloader
+                        .download_verified(&plan.source_url, checksum),
+                )
+                .await?;
+
+                let parent = self.layout.cache_dir().join("sources");
+                std::fs::create_dir_all(&parent)?;
+                let tempdir = tempfile::tempdir_in(parent)?;
+                let archive_path = tempdir
+                    .path()
+                    .join(source_archive_filename(&plan.source_url).unwrap_or("source.tar.gz"));
+                Self::instrument_phase(
+                    operation,
+                    "persist-source-archive",
+                    &plan.formula_name,
+                    || std::fs::write(&archive_path, &data),
+                )?;
+
+                let source_root = Self::instrument_phase(
+                    operation,
+                    "extract-source-archive",
+                    &plan.formula_name,
+                    || extract_source_archive(&archive_path, tempdir.path()),
+                )?;
+
+                Ok(PrefetchedPayload::Source {
+                    source_root,
+                    plan: plan.clone(),
+                    _tempdir: tempdir,
+                })
+            }
+        }
+    }
+
+    /// Finalizes a single formula from prefetched payload.
+    ///
+    /// Performs prefix-mutating operations: materialize, relocate, post-install,
+    /// link, and receipt write. On failure, cleans up only this formula.
+    async fn finalize_single(
+        &self,
+        formula: &Formula,
         cache: &FormulaCache,
         install_context: &InstallContext<'_, '_>,
+        resolved: ResolvedPayload,
     ) -> Result<(), BrewdockError> {
-        let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
-            name: name.to_owned(),
-        })?;
-        let method = Self::instrument_phase(
-            install_context.operation,
-            "resolve-install-method",
-            name,
-            || self.resolve_install_method(formula),
-        )?;
+        let name = formula.name.as_str();
 
         tracing::info!(name, "installing formula");
 
-        let keg_path = Self::instrument_async_phase(
+        let keg_path = Self::instrument_phase(
             install_context.operation,
-            "install-payload",
+            "materialize-payload",
             name,
-            self.install_payload(
-                install_context.operation,
-                formula,
-                &method,
-                install_context.blob_store,
-            ),
+            || self.materialize_payload(install_context.operation, formula, resolved.payload),
         )
-        .await
         .inspect_err(|_| {
             let _ = cleanup_failed_install(
                 &self
@@ -575,6 +762,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 &formula.name,
             );
         })?;
+
         let post_install_transaction = Self::instrument_async_phase(
             install_context.operation,
             "post-install",
@@ -593,7 +781,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         let is_requested = install_context.requested.contains(formula.name.as_str());
         let receipt = build_receipt(
-            &method,
+            &resolved.method,
             if is_requested {
                 InstallReason::OnRequest
             } else {
@@ -628,52 +816,51 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(())
     }
 
-    async fn install_payload(
+    /// Materializes a prefetched payload into the Cellar and relocates it.
+    ///
+    /// For bottles: copies extracted content to keg and patches binaries.
+    /// For source: runs the build and refreshes the opt link.
+    fn materialize_payload(
         &self,
         operation: &'static str,
         formula: &Formula,
-        method: &InstallMethod,
-        blob_store: &BlobStore,
+        payload: PrefetchedPayload,
     ) -> Result<PathBuf, BrewdockError> {
-        match method {
-            InstallMethod::Bottle(selected_bottle) => {
-                let data = Self::instrument_async_phase(
-                    operation,
-                    "download-bottle",
-                    &formula.name,
-                    self.downloader
-                        .download_verified(&selected_bottle.url, &selected_bottle.sha256),
-                )
-                .await?;
-
-                Self::instrument_phase(operation, "store-bottle-blob", &formula.name, || {
-                    blob_store.put(&selected_bottle.sha256, &data)
-                })?;
-
-                let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
-                let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
-                Self::instrument_phase(operation, "extract-bottle", &formula.name, || {
-                    extract_tar_gz(&blob_path, &extract_dir)
-                })?;
-
-                let version_str = pkg_version(&formula.versions.stable, formula.revision);
-                let source = extract_dir.join(&formula.name).join(&version_str);
-                let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
+        match payload {
+            PrefetchedPayload::Bottle {
+                source_dir,
+                keg_path,
+                relocation_scope,
+            } => {
                 Self::instrument_phase(operation, "materialize-keg", &formula.name, || {
-                    materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)
+                    materialize(
+                        &source_dir,
+                        &keg_path,
+                        &self.layout.opt_dir(),
+                        &formula.name,
+                    )
                 })?;
-                let scope = if matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
-                    RelocationScope::TextOnly
-                } else {
-                    RelocationScope::Full
-                };
                 Self::instrument_phase(operation, "relocate-keg", &formula.name, || {
-                    relocate_keg(&keg_path, self.layout.prefix(), scope)
+                    relocate_keg(&keg_path, self.layout.prefix(), relocation_scope)
                 })?;
                 Ok(keg_path)
             }
-            InstallMethod::Source(plan) => {
-                self.install_source_formula(operation, formula, plan).await
+            PrefetchedPayload::Source {
+                source_root,
+                plan,
+                _tempdir: _guard,
+            } => {
+                Self::instrument_phase(operation, "build-from-source", &formula.name, || {
+                    run_source_build(&source_root, &plan, self.layout.prefix())
+                })?;
+                Self::instrument_phase(operation, "refresh-opt-link", &formula.name, || {
+                    refresh_opt_link(
+                        &plan.cellar_path,
+                        &self.layout.opt_dir(),
+                        &plan.formula_name,
+                    )
+                })?;
+                Ok(plan.cellar_path)
             }
         }
     }
@@ -884,57 +1071,6 @@ enum SourceArchiveKind {
 }
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
-    async fn install_source_formula(
-        &self,
-        operation: &'static str,
-        _formula: &Formula,
-        plan: &SourceBuildPlan,
-    ) -> Result<PathBuf, BrewdockError> {
-        let checksum = plan
-            .source_checksum
-            .as_deref()
-            .ok_or_else(|| SourceBuildError::MissingSourceChecksum(plan.formula_name.clone()))?;
-        let data = Self::instrument_async_phase(
-            operation,
-            "download-source-archive",
-            &plan.formula_name,
-            self.downloader
-                .download_verified(&plan.source_url, checksum),
-        )
-        .await?;
-
-        let parent = self.layout.cache_dir().join("sources");
-        std::fs::create_dir_all(&parent)?;
-        let tempdir = tempfile::tempdir_in(parent)?;
-        let archive_path = tempdir
-            .path()
-            .join(source_archive_filename(&plan.source_url).unwrap_or("source.tar.gz"));
-        Self::instrument_phase(
-            operation,
-            "persist-source-archive",
-            &plan.formula_name,
-            || std::fs::write(&archive_path, &data),
-        )?;
-
-        let source_root = Self::instrument_phase(
-            operation,
-            "extract-source-archive",
-            &plan.formula_name,
-            || extract_source_archive(&archive_path, tempdir.path()),
-        )?;
-        Self::instrument_phase(operation, "build-from-source", &plan.formula_name, || {
-            run_source_build(&source_root, plan, self.layout.prefix())
-        })?;
-        Self::instrument_phase(operation, "refresh-opt-link", &plan.formula_name, || {
-            refresh_opt_link(
-                &plan.cellar_path,
-                &self.layout.opt_dir(),
-                &plan.formula_name,
-            )
-        })?;
-        Ok(plan.cellar_path.clone())
-    }
-
     async fn instrument_operation<T, F>(
         operation: &'static str,
         request: &[&str],
@@ -2978,6 +3114,128 @@ install:
 
         assert_eq!(download_count.load(Ordering::SeqCst), 1);
         assert!(layout.cellar().join("locky/1.0/bin/tool").exists());
+        Ok(())
+    }
+
+    // --- Parallel install tests ---
+
+    #[tokio::test]
+    async fn test_install_independent_formulae_all_installed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let formula_a = make_formula("alpha", "1.0", &[], sha_a);
+        let formula_b = make_formula("bravo", "2.0", &[], sha_b);
+        let formula_c = make_formula("charlie", "3.0", &[], sha_c);
+
+        let tar_a =
+            create_bottle_tar_gz("alpha", "1.0", &[("bin/alpha_tool", b"#!/bin/sh\necho a")])?;
+        let tar_b =
+            create_bottle_tar_gz("bravo", "2.0", &[("bin/bravo_tool", b"#!/bin/sh\necho b")])?;
+        let tar_c = create_bottle_tar_gz(
+            "charlie",
+            "3.0",
+            &[("bin/charlie_tool", b"#!/bin/sh\necho c")],
+        )?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula_a, formula_b, formula_c],
+            vec![(sha_a, tar_a), (sha_b, tar_b), (sha_c, tar_c)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["alpha", "bravo", "charlie"]).await?;
+
+        assert_eq!(installed.len(), 3);
+        assert_installed(&layout, "alpha");
+        assert_installed(&layout, "bravo");
+        assert_installed(&layout, "charlie");
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_finalize_failure_preserves_completed_installs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        // alpha installs bin/tool, charlie also installs bin/tool → link collision on charlie
+        let formula_a = make_formula("alpha", "1.0", &[], sha_a);
+        let formula_b = make_formula("bravo", "2.0", &[], sha_b);
+        let formula_c = make_formula("charlie", "3.0", &[], sha_c);
+
+        let tar_a = create_bottle_tar_gz("alpha", "1.0", &[("bin/tool", b"#!/bin/sh\necho a")])?;
+        let tar_b =
+            create_bottle_tar_gz("bravo", "2.0", &[("bin/bravo_tool", b"#!/bin/sh\necho b")])?;
+        // charlie collides with alpha on bin/tool
+        let tar_c = create_bottle_tar_gz("charlie", "3.0", &[("bin/tool", b"#!/bin/sh\necho c")])?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula_a, formula_b, formula_c],
+            vec![(sha_a, tar_a), (sha_b, tar_b), (sha_c, tar_c)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["alpha", "bravo", "charlie"]).await;
+
+        // charlie fails due to link collision
+        assert!(result.is_err());
+
+        // alpha and bravo were finalized before charlie, so they remain installed
+        assert_installed(&layout, "alpha");
+        assert_installed(&layout, "bravo");
+        // charlie was rolled back
+        assert_not_installed(&layout, "charlie");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_download_failure_prevents_prefix_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sha_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let formula_a = make_formula("alpha", "1.0", &[], sha_a);
+        let formula_b = make_formula("bravo", "2.0", &[], sha_b);
+        let formula_c = make_formula("charlie", "3.0", &[], sha_c);
+
+        let tar_a =
+            create_bottle_tar_gz("alpha", "1.0", &[("bin/alpha_tool", b"#!/bin/sh\necho a")])?;
+        let tar_b =
+            create_bottle_tar_gz("bravo", "2.0", &[("bin/bravo_tool", b"#!/bin/sh\necho b")])?;
+        // charlie has NO bottle data → download fails
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula_a, formula_b, formula_c],
+            vec![(sha_a, tar_a), (sha_b, tar_b)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let result = orchestrator.install(&["alpha", "bravo", "charlie"]).await;
+
+        assert!(result.is_err());
+        // With prefetch-first architecture: no prefix mutation should have occurred
+        // because all downloads happen before any finalization
+        assert_not_installed(&layout, "alpha");
+        assert_not_installed(&layout, "bravo");
+        assert_not_installed(&layout, "charlie");
         Ok(())
     }
 }

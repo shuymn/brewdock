@@ -13,6 +13,7 @@ description = "Core types and orchestration for brewdock"
 thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+futures.workspace = true
 brewdock-formula = { path = "../formula" }
 brewdock-bottle = { path = "../bottle" }
 brewdock-cellar = { path = "../cellar" }
