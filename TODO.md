@@ -389,7 +389,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: concurrency bounding だけ先に入れても partial publish contract が曖昧なら fail-closed 境界が閉じず、逆に persistence contract だけ先に変えても benchmark replay で wall 改善を判定できない
   - Escalate if: bounded acquire を導入するために blob/store API か benchmark harness に広い破壊的変更が必要になる場合
 
-- [ ] Theme: Source-build admission into staged executor
+- [x] Theme: Source-build admission into staged executor
   - Outcome: bottle staged executor Theme の直後に、source fallback も同じ `ExecutionPlan` と phase contract に編入され、install path が bottle/source で二重化しない
   - Goal: staged bottle executor Theme 完了直後の follow-up として、source build を同じ plan artifact に載せて ad-hoc な finalize-only path を閉じる
   - Must Not Break: linked dependency 前提の source build correctness を壊さない; rollback と Homebrew-visible finalize contract を弱めない; unsupported requirement は fail-closed のままにする; `task check` green
