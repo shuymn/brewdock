@@ -38,7 +38,7 @@ pub fn materialize(
         std::fs::remove_dir_all(&temp_keg)?;
     }
 
-    copy_dir_recursive(source, &temp_keg)?;
+    copy_tree(source, &temp_keg)?;
 
     // Idempotent: remove existing keg before atomic rename.
     if keg_path.exists() {
@@ -86,6 +86,40 @@ pub fn atomic_symlink_replace(target: &Path, link_path: &Path) -> Result<(), Cel
 
     std::os::unix::fs::symlink(target, &temp_link)?;
     std::fs::rename(&temp_link, link_path)?;
+    Ok(())
+}
+
+/// Copies a directory tree, trying `clonefile(2)` first on macOS, falling back
+/// to recursive copy.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    #[cfg(target_os = "macos")]
+    if brewdock_sys::clone_path(src, dst).is_ok() {
+        tracing::debug!(
+            src = %src.display(),
+            dst = %dst.display(),
+            "clonefile succeeded"
+        );
+        reject_absolute_symlinks(dst)?;
+        return Ok(());
+    }
+    copy_dir_recursive(src, dst)
+}
+
+/// Walks `root` and returns an error if any symlink has an absolute target.
+fn reject_absolute_symlinks(root: &Path) -> Result<(), std::io::Error> {
+    for path in fs::walk_entries(root)? {
+        let meta = path.symlink_metadata()?;
+        if meta.is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            if target.is_absolute() {
+                return Err(std::io::Error::other(format!(
+                    "absolute symlink in bottle: {} -> {}",
+                    path.display(),
+                    target.display()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
