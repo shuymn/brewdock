@@ -6,6 +6,8 @@
 
 Rust CLI (`bd`) that installs Homebrew `homebrew/core` formulae to `/opt/homebrew` on Apple Silicon macOS, preferring compatible stable bottles and falling back to a minimal source build path when needed.
 
+The command surface may expand beyond `install` / `update` / `upgrade`, but the core concept remains coexistence with Homebrew-visible on-disk state rather than replacing Homebrew with a separate prefix or runtime model.
+
 ## Constraints
 
 - Apple Silicon macOS + `/opt/homebrew`
@@ -16,6 +18,10 @@ Rust CLI (`bd`) that installs Homebrew `homebrew/core` formulae to `/opt/homebre
 - `formulae.brew.sh` JSON API (no tap clone)
 - Homebrew-compatible file layout, receipt, linking (`/opt/homebrew` paths always flow through `Layout`; Ruby API compatibility is non-goal)
 - `unsafe_code` forbidden; `unwrap`/`expect`/`todo`/`dbg!` denied
+
+Design note: third-party taps are still out of scope, but metadata/cache boundaries and formula identity should not be painted into a `homebrew/core`-only corner if that would make a future limited `tap/name` read/install path impossible to add without redoing the architecture.
+
+Design note: if Ruby execution is ever introduced as a compatibility escape hatch, it should remain an explicit last-resort fallback rather than the default path. The primary contract stays a native, fail-closed pipeline; any Ruby-backed fallback should be opt-in, clearly visible in logs/state, and isolated so it does not redefine the performance or trust model of the main path.
 
 ## Core Boundaries
 
@@ -65,6 +71,7 @@ None blocking. Decision record: [ADR 0001](adr/0001-nanobrew-install-method.md).
 - Need to support Linux runtime or Intel Mac
 - Need to support cask or external taps
 - Formula count exceeds JSON API scalability
+- Read-heavy commands such as `search`, `info`, `list`, or `outdated` become first-class enough that metadata cache design dominates user-facing latency
 - Need Homebrew Formula DSL compatibility beyond restricted AST lowering and schema normalization
 - Generic source build fallback cannot cover target formulae without Ruby formula execution
 
