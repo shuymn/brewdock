@@ -4,6 +4,18 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
 
 ## Open Questions
 
+- Question: multi-formula install の高速化を進める際、download/extract/materialize/finalize のどこまでを並列化しても `/opt/homebrew` の最終状態と rollback 契約を壊さないか
+  - Class: `risk-bearing`
+  - Resolution: `spike`
+  - Status: `resolved`
+- Question: `update` / 将来の search/info/cask 対応を見据えた metadata cache を、full snapshot 前提のまま拡張するか、差分/分割 cache へ切り替えるか
+  - Class: `risk-bearing`
+  - Resolution: `decision`
+  - Status: `resolved`
+- Question: `bd` の次の command surface は `brew` 代替の網羅性より、metadata/state 再利用で高速化の恩恵を受けやすい read-heavy / maintenance 系 (`outdated`, `search`, `info`, `list`, `cleanup`, `doctor`) を優先すべきか
+  - Class: `risk-bearing`
+  - Resolution: `decision`
+  - Status: `resolved`
 - Question: Homebrew-visible install state compatibility を閉じる前に、bottle materialization / link / relocate が keg 内 symlink を保持したまま動作する必要があるか
   - Class: `risk-bearing`
   - Resolution: `decision`
@@ -251,3 +263,65 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Executable doc: `cargo test -p brewdock-cellar -- post_install`; `cargo test -p brewdock-core -- post_install`; `./tests/vm-smoke-test.sh --formula agent-browser --formula vim`
   - Why not split vertically further?: `node` と `ruby` を別々に閉じても VM 上の user-visible contract は依存 chain 単位でしか確認できず、known blocker の解消判定が揺れる
   - Escalate if: `node` または `ruby` の reachable runtime semantics が schema normalization では吸収できず、formula-specific behavior か arbitrary Ruby execution を要求する場合
+
+- [ ] Theme: Pipeline baseline and bottleneck evidence for install/update/upgrade
+  - Outcome: `install` / `update` / `upgrade` の主要フェーズごとの所要時間と replay 手順が固定され、今後の最適化前後比較で同じ baseline を再利用できる
+  - Goal: 現行 pipeline の wall-clock baseline と phase breakdown を、single install / multi install / update / upgrade の user-visible 経路ごとに取得して保存する
+  - Must Not Break: `/opt/homebrew` 共存の contract を変えない; benchmark は brewdock に有利な特別条件を入れない; destructive 操作は VM 内に限定する
+  - Non-goals: この Theme では高速化を実装しない; cache format の変更; cask install の実装
+  - Acceptance (EARS):
+    - When representative commands such as `bd install tree`, `bd install jq wget`, `bd update`, and `bd upgrade` are replayed, the system shall produce reusable timing evidence with the same command surface the user runs
+    - When benchmark evidence is reviewed later, the system shall show phase-level bottlenecks rather than only a single total duration
+    - If a benchmark scenario cannot be replayed without ambiguous setup or tool-specific bias, the system shall fail the Theme rather than record a misleading baseline
+  - Evidence: `run=./tests/vm-benchmark.sh --formula tree --formula wget --formula ffmpeg --formula-set jq,wget && cargo build --release -p brewdock-cli && <targeted update/upgrade replay command>; oracle=baseline table plus phase-attributed measurements for install/update/upgrade on a disposable VM; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=targeted replay notes checked into repo; notes=baseline must stay tool-neutral and Homebrew-coexisting`
+  - Gates: `static`, `benchmark`, `system`
+  - Executable doc: `./tests/vm-benchmark.sh --formula tree --formula wget --formula ffmpeg --formula-set jq,wget`; `cargo run -p brewdock-cli -- update`; `cargo run -p brewdock-cli -- upgrade --dry-run`
+  - Why not split vertically further?: install/update/upgrade の baseline が別々だと pipeline 再設計の優先順位を比較できず、optimization Theme の blocker 判定が揺れる
+  - Escalate if: phase breakdown を取るために user-visible contract を変える必要が出る場合
+
+- [ ] Theme: Parallelizable install executor with Homebrew-visible finalize boundary
+  - Outcome: 複数 formula install が dependency DAG に従ってより並列に進み、`/opt/homebrew` の最終 state と rollback 契約は維持される
+  - Goal: install pipeline を `plan -> fetch/extract -> materialize/relocate -> finalize` に再編し、prefix 競合がない区間だけを並列化する
+  - Must Not Break: Homebrew-visible receipt/Cellar/opt/link contract を維持する; rollback は failure 時に壊れた prefix を残さない; unsupported formula は fail-closed のままにする; `task check` green
+  - Non-goals: dedicated prefix への移行; Homebrew 非互換な store-first runtime; uninstall 実装; cask install 実装
+  - Acceptance (EARS):
+    - When independent formulae are requested in one `bd install` invocation, the system shall allow non-conflicting pre-finalize work to proceed without waiting for unrelated formulae
+    - When a formula reaches the finalize boundary, the system shall serialize only the prefix-mutating steps required to preserve Homebrew-visible state
+    - If one formula fails during a parallel install, the system shall rollback that formula safely and shall not leave unrelated successful formulae in an inconsistent linked state
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-benchmark.sh --formula-set jq,wget --manager brewdock; oracle=integration tests cover executor ordering/rollback and VM replay shows multi-install latency improvement without state regression; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=existing VM smoke replay for install-state compatibility; notes=finalize boundary is the Homebrew-visible correctness wall`
+  - Gates: `static`, `integration`, `benchmark`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- install`; `./tests/vm-smoke-test.sh --formula jq --formula wget`; `./tests/vm-benchmark.sh --formula-set jq,wget --manager brewdock`
+  - Why not split vertically further?: executor 並列化だけ先に入れても finalize 境界と rollback 契約が固定されなければ `/opt/homebrew` 共存 contract を閉じられない
+  - Escalate if: prefix-mutating stepsを分離しても Homebrew-visible state の整合を保てない場合
+
+- [ ] Theme: Metadata cache redesign for update and future formula/cask scale
+  - Outcome: `update` と将来の search/info/install planning が full snapshot 一本足ではなくなり、formula/cask 件数が増えても metadata path が支配的ボトルネックになりにくい
+  - Goal: Homebrew 互換 install state を維持したまま、metadata 取得と local cache の責務を再設計して `update` を将来の scale に備えさせる
+  - Must Not Break: install/upgrade の correctness を metadata cache 変更で壊さない; offline stale cache では fail-open せず明示的に扱う; `task check` green
+  - Non-goals: cask install の実装; Formula DSL 互換拡張; analytics や telemetry; この Theme で `brew` 互換 command surface を網羅すること
+  - Acceptance (EARS):
+    - When `bd update` is executed repeatedly without relevant upstream change, the system shall avoid unnecessary full refresh work where the chosen metadata contract permits it
+    - When install planning needs formula metadata, the system shall reuse the redesigned local metadata layer instead of requiring a fresh network-only path
+    - When future read-heavy commands such as `bd search`, `bd info`, `bd list`, or `bd outdated` are added, the system shall expose the redesigned metadata layer without requiring a second cache architecture
+    - If metadata freshness or integrity cannot be established, the system shall fail explicitly or refresh safely rather than planning from ambiguous state
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && <update replay benchmark>; oracle=metadata cache tests plus replayed update/install planning timings before/after redesign; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=baseline Theme evidence for update path; notes=this Theme keeps Homebrew coexistence but decouples metadata scale from install correctness`
+  - Gates: `static`, `integration`, `benchmark`
+  - Executable doc: `cargo test -p brewdock-formula --all-targets --all-features`; `cargo run -p brewdock-cli -- update`; `cargo run -p brewdock-cli -- --dry-run install jq`
+  - Why not split vertically further?: update path だけ速くしても install planning が別 metadata path を持つと将来の formula/cask scale で同じ問題を再導入する
+  - Escalate if: Homebrew upstream metadata contract に差分更新や分割 cache の前提がなく、安全な freshness 判定を設計できない場合
+
+- [ ] Theme: Read-heavy command surface on shared metadata and install-state layers
+  - Outcome: `bd outdated`, `bd search`, `bd info`, `bd list`, `bd cleanup`, `bd doctor` の優先コマンドが、install/update/upgrade と同じ metadata/state 基盤を再利用して追加できる
+  - Goal: 高速化の恩恵を受けやすい read-heavy / maintenance 系 command surface を、共存コンセプトを崩さずに追加するための最小 contract を定義して閉じる
+  - Must Not Break: `/opt/homebrew` 共存を維持する; Homebrew-visible install state を正本にする方針を崩さない; `task check` green
+  - Non-goals: `brew` command surface の全面再実装; `bd uninstall` の優先実装; cask install 実装; 専用 prefix への移行
+  - Acceptance (EARS):
+    - When `bd outdated` is executed, the system shall derive results from the same install-state and metadata layers used by `bd upgrade`
+    - When `bd search`, `bd info`, or `bd list` is executed, the system shall answer from the shared metadata/state layers without requiring ad-hoc one-off fetch paths
+    - When `bd cleanup` or `bd doctor` is executed, the system shall operate on brewdock-owned cache/store/state surfaces without assuming exclusive ownership of `/opt/homebrew`
+    - If a candidate command cannot reuse shared metadata/state layers cleanly, the system shall defer that command rather than introducing a second architecture
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && <targeted command replay>; oracle=CLI/integration tests prove shared metadata/state reuse for prioritized commands and no second cache/state path is introduced; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=metadata cache redesign evidence; notes=priority order is outdated -> search -> info -> list -> cleanup -> doctor; uninstall remains lower priority`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-cli -- commands`; `cargo run -p brewdock-cli -- --help`; `cargo run -p brewdock-cli -- outdated`
+  - Why not split vertically further?: command ごとに個別追加すると metadata/state の重複経路が増え、性能設計と共存 contract の両方が崩れやすい
+  - Escalate if: prioritized command のどれかが Homebrew-visible state だけでは閉じず、別の永続モデルを要求する場合
