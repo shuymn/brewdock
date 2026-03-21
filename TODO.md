@@ -404,7 +404,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: bottle path だけ staged executor に載せたまま source path を別制御に残すと phase contract が二重化し、いつ source build を編入すべきかが再び未決になる
   - Escalate if: shared `ExecutionPlan` に source build を載せるために finalize boundary 以外の Homebrew-visible contract を変更する必要がある場合
 
-- [ ] Theme: Copy-strategy spike for manifest-aware materialize/relocate
+- [x] Theme: Copy-strategy spike for manifest-aware materialize/relocate
   - Outcome: bottle materialize/relocate の高コスト区間に対し、`clonefile` first + fallback copy と targeted relocation manifest の可否が evidence 付きで判断できる
   - Goal: warm/cold install の支配コストである full-tree copy と full-tree relocation walk を安全に減らせる候補を spike で見極める
   - Must Not Break: store を mutation source にしない; rollback / fail-closed policy を崩さない; `task check` green
@@ -413,8 +413,24 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
     - When the spike is replayed on representative bottles, the system shall produce evidence comparing current copy+walk against `clonefile`-first and manifest-targeted relocation candidates
     - If a candidate strategy can mutate shared store state or weakens rollback guarantees, the system shall reject that strategy explicitly
     - When the spike concludes, the system shall leave a single next implementation choice rather than an open-ended option list
-  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md; oracle=spike evidence identifies one safe next copy/relocation strategy with measured cost on representative bottle installs; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget`
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md; oracle=spike evidence identifies manifest-targeted relocation as the safe next copy/relocation strategy on representative bottle installs, while hardlink-first is rejected and clonefile-first is deferred; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget`
   - Gates: `static`, `benchmark`, `system`
   - Executable doc: `./tests/vm-pipeline-baseline.sh --output docs/pipeline-baseline.md`; `./tests/vm-smoke-test.sh --formula jq --formula wget`
   - Why not split vertically further?: copy strategy と relocation targeting を別 spike にすると store mutation risk と wall-clock benefit の比較軸がずれる
   - Escalate if: `clonefile` 系の候補が macOS VM 上で一貫して使えず、copy cost 改善に別の長距離 architectural bet が必要になる場合
+
+- [ ] Theme: Production manifest-targeted relocation and spike removal
+  - Outcome: bottle install の materialize/relocate は extracted payload から導いた manifest を使って full-tree placeholder scan を避け、spike-only harness は production path に吸収されて削除される
+  - Goal: manifest-targeted relocation を本実装に入れ、representative bottle install の `materialize-payload` wall を下げつつ spike artifact を不要にする
+  - Must Not Break: store は read-only source のままにする; rollback / fail-closed policy を崩さない; text placeholder relocation と Mach-O relocation の correctness を壊さない; `task check` green
+  - Non-goals: `clonefile`-first copy の導入; source build path 最適化; store format の大幅変更; dedicated prefix への移行
+  - Acceptance (EARS):
+    - When a bottle payload is prepared for finalize, the system shall derive and carry a relocation manifest from extracted content so relocate work does not depend on a full keg tree scan at finalize time
+    - When representative bottle installs such as `jq` and `wget` are replayed, the system shall show lower `materialize-payload` wall time than the current baseline without regressing Homebrew-visible correctness
+    - If a file is absent from the relocation manifest, the system shall not skip a required placeholder or Mach-O rewrite that Homebrew-visible runtime still depends on
+    - When the production implementation closes the optimization path, the system shall remove the benchmark-only copy-strategy spike harness instead of keeping parallel decision code
+  - Evidence: `run=task check && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --runs 3 --output docs/pipeline-baseline.md; oracle=integration tests prove production bottle finalize uses manifest-targeted relocation without weakening rollback semantics, 3-run pipeline replay shows lower median materialize-payload wall for install-jq-wget, and no spike-only harness remains; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget; notes=compare against the 2026-03-22 baseline before this Theme, where install-jq-wget materialize-payload was 1422.2ms in the 1-run replay and the spike appendix selected manifest-targeted relocation as the next step`
+  - Gates: `static`, `integration`, `benchmark`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- install`; `./tests/vm-pipeline-baseline.sh --runs 3 --output docs/pipeline-baseline.md`; `./tests/vm-smoke-test.sh --formula jq --formula wget`
+  - Why not split vertically further?: production manifest wiring だけ先に入れても benchmark-only spike harness を残すと optimization path が二重化し、逆に spike removal だけ先にやっても user-visible latency 改善を replay で閉じられない
+  - Escalate if: extracted payload から作る manifest だけでは required relocation 対象を fail-closed に復元できず、store format 変更か broader copy-strategy redesign が必要になる場合
