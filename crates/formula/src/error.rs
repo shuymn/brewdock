@@ -27,6 +27,13 @@ pub enum FormulaError {
     #[error("JSON parse error: {0}")]
     Parse(#[from] serde_json::Error),
 
+    /// The raw Ruby source path is invalid.
+    #[error("invalid ruby source path: {path}")]
+    InvalidRubySourcePath {
+        /// The invalid raw source path.
+        path: String,
+    },
+
     /// A dependency cycle was detected.
     #[error("cyclic dependency: {0}")]
     CyclicDependency(DependencyCycle),

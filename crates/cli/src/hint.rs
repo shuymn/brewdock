@@ -19,7 +19,9 @@ const fn hint_for_formula(err: &FormulaError) -> Option<&'static str> {
         FormulaError::NotFound { .. } => Some("run `bd update` to refresh the formula index"),
         FormulaError::Unsupported { .. } => Some("this formula cannot be installed as a bottle"),
         FormulaError::Network(_) => Some("check your internet connection"),
-        FormulaError::Parse(_) | FormulaError::CyclicDependency(_) => None,
+        FormulaError::Parse(_)
+        | FormulaError::CyclicDependency(_)
+        | FormulaError::InvalidRubySourcePath { .. } => None,
     }
 }
 

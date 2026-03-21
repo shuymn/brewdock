@@ -106,7 +106,7 @@ impl FormulaRepository for HttpFormulaRepository {
     }
 
     async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
-        let path = ruby_source_path.trim_start_matches('/');
+        let path = validate_ruby_source_path(ruby_source_path)?;
         let url = format!("{}/{}", self.core_raw_base_url, path);
         let response = self.client.get(&url).send().await?;
         let response = response.error_for_status()?;
@@ -114,8 +114,38 @@ impl FormulaRepository for HttpFormulaRepository {
     }
 }
 
+fn validate_ruby_source_path(ruby_source_path: &str) -> Result<&str, FormulaError> {
+    if ruby_source_path.is_empty()
+        || ruby_source_path.starts_with('/')
+        || !ruby_source_path.starts_with("Formula/")
+        || ruby_source_path.contains('%')
+    {
+        return Err(FormulaError::InvalidRubySourcePath {
+            path: ruby_source_path.to_owned(),
+        });
+    }
+
+    for segment in ruby_source_path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(FormulaError::InvalidRubySourcePath {
+                path: ruby_source_path.to_owned(),
+            });
+        }
+    }
+
+    Ok(ruby_source_path)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
+
     use httpmock::{Method::GET, MockServer};
 
     use super::*;
@@ -127,6 +157,66 @@ mod tests {
 
     fn make_repo(server: &MockServer) -> HttpFormulaRepository {
         HttpFormulaRepository::with_urls(server.base_url(), server.base_url())
+    }
+
+    type CapturedPath = Arc<Mutex<Option<String>>>;
+
+    fn spawn_capture_server() -> Result<(String, CapturedPath), std::io::Error> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let captured_path = Arc::new(Mutex::new(None));
+        let captured_path_for_thread = Arc::clone(&captured_path);
+
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 4096];
+                        let Ok(bytes_read) = stream.read(&mut buffer) else {
+                            break;
+                        };
+                        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                        let first_line = request.lines().next().unwrap_or("");
+                        let path = first_line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .to_owned();
+
+                        if let Ok(mut guard) = captured_path_for_thread.lock() {
+                            *guard = Some(path.clone());
+                        }
+
+                        let body = if path == "/root/secret.rb" {
+                            "safe"
+                        } else if path == "/secret.rb" {
+                            "secret"
+                        } else {
+                            "missing"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body,
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok((format!("http://{addr}"), captured_path))
     }
 
     #[tokio::test]
@@ -281,6 +371,38 @@ mod tests {
 
         source.assert();
         assert!(result.contains("class Test < Formula"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_ruby_source_rejects_encoded_traversal() {
+        let server = MockServer::start();
+        let repo = make_repo(&server);
+
+        let result = repo.get_ruby_source("Formula/%2e%2e/secret.rb").await;
+
+        assert!(matches!(
+            result,
+            Err(FormulaError::InvalidRubySourcePath { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_ruby_source_does_not_escape_raw_source_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (base_url, captured_path) = spawn_capture_server()?;
+        let repo = HttpFormulaRepository::with_urls(base_url.clone(), format!("{base_url}/root"));
+
+        let result = repo.get_ruby_source("../secret.rb").await;
+        let request_path = captured_path
+            .lock()
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .clone();
+
+        assert_ne!(request_path.as_deref(), Some("/secret.rb"));
+        if let Ok(body) = result {
+            assert_eq!(body, "safe");
+        }
         Ok(())
     }
 }
