@@ -156,6 +156,43 @@ struct ResolvedPayload {
     payload: PrefetchedPayload,
 }
 
+/// Bundles a resolved install method with its materialized payload.
+struct MaterializedFormula {
+    method: InstallMethod,
+    materialized: MaterializedPayload,
+}
+
+/// Bundles method and keg path for finalization.
+struct FinalizeContext<'a> {
+    method: &'a InstallMethod,
+    keg_path: &'a Path,
+}
+
+/// Result of the materialize/relocate phase for a single formula.
+///
+/// Bottles are materialized and relocated in a parallel phase before finalize.
+/// Source builds are deferred to the serial finalize phase because they may
+/// depend on other formulae being linked first.
+enum MaterializedPayload {
+    /// A bottle was materialized into its keg and relocated.
+    Bottle {
+        /// Target keg path (`Cellar/name/version`).
+        keg_path: PathBuf,
+    },
+    /// Source build is deferred to the finalize phase.
+    PendingSource(Box<PendingSourcePayload>),
+}
+
+/// Payload for a source build that is deferred to the finalize phase.
+struct PendingSourcePayload {
+    /// Extracted source root directory.
+    source_root: PathBuf,
+    /// Build plan with all metadata needed for the build.
+    plan: SourceBuildPlan,
+    /// Tempdir guard — dropped after finalize to clean up extracted source.
+    _tempdir: tempfile::TempDir,
+}
+
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Creates a new orchestrator.
     #[must_use]
@@ -210,11 +247,15 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns the names of formulae actually installed (excludes already-installed).
     ///
-    /// The pipeline is split into two phases:
-    /// 1. **Prefetch**: download, verify, store, and extract all payloads.
-    ///    No prefix mutation occurs. Failures here abort before any install state changes.
-    /// 2. **Finalize**: materialize, relocate, post-install, link, and write receipts
-    ///    in topological order. Previously finalized formulae remain intact on failure.
+    /// The pipeline is split into three phases:
+    /// 1. **Prefetch**: download, verify, store, and extract all payloads
+    ///    concurrently. No prefix mutation occurs. Blob store and extract dir
+    ///    hits skip download and extraction respectively (warm-path).
+    /// 2. **Materialize/Relocate**: copy extracted bottle contents into per-keg
+    ///    Cellar paths and patch binaries/text concurrently. Each keg is
+    ///    independent so no serialization is needed. Source builds are deferred.
+    /// 3. **Finalize**: post-install, link, and write receipts in topological
+    ///    order. Source builds run here because they may need linked dependencies.
     ///
     /// # Errors
     ///
@@ -269,13 +310,63 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
             let payloads = try_join_all(prefetch_futures).await?;
 
-            // Phase 2: Finalize in topological order (prefix-mutating).
-            for ((method, formula), payload) in resolved_methods.into_iter().zip(payloads) {
-                self.finalize_single(
+            // Phase 2: Each keg writes only to its own Cellar/name/version
+            // and opt/name, so independent kegs can be materialized
+            // concurrently via spawn_blocking.
+            let opt_dir = self.layout.opt_dir();
+            let prefix = self.layout.prefix().to_path_buf();
+            let materialize_futures: Vec<_> = resolved_methods
+                .iter()
+                .zip(payloads)
+                .map(|((_, formula), payload)| {
+                    let opt_dir = opt_dir.clone();
+                    let prefix = prefix.clone();
+                    let name = formula.name.clone();
+                    async move {
+                        let span = tracing::info_span!(
+                            "bd.phase",
+                            operation = "install",
+                            phase = "materialize-payload",
+                            target = name.as_str(),
+                        );
+                        tokio::task::spawn_blocking(move || {
+                            let _entered = span.enter();
+                            materialize_prefetched_payload(payload, &name, &opt_dir, &prefix)
+                        })
+                        .await
+                        .map_err(|err| BrewdockError::from(std::io::Error::other(err)))?
+                    }
+                })
+                .collect();
+
+            let materialized = try_join_all(materialize_futures).await.inspect_err(|_| {
+                // On materialize failure, clean up any kegs that were created.
+                for (_, formula) in &resolved_methods {
+                    let version = pkg_version(&formula.versions.stable, formula.revision);
+                    let keg = self.layout.cellar().join(&formula.name).join(&version);
+                    if keg.exists() {
+                        let _ = cleanup_failed_install(
+                            &keg,
+                            self.layout.prefix(),
+                            &self.layout.opt_dir(),
+                            &formula.name,
+                        );
+                    }
+                }
+            })?;
+
+            // Phase 3: Finalize in topological order (prefix-mutating).
+            for ((method, formula), materialized_payload) in
+                resolved_methods.into_iter().zip(materialized)
+            {
+                self.finalize_materialized(
                     formula,
                     &cache,
                     &install_context,
-                    ResolvedPayload { method, payload },
+                    MaterializedFormula {
+                        method,
+                        materialized: materialized_payload,
+                    },
                 )
                 .await?;
             }
@@ -652,27 +743,45 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ) -> Result<PrefetchedPayload, BrewdockError> {
         match method {
             InstallMethod::Bottle(selected_bottle) => {
-                let data = Self::instrument_async_phase(
-                    operation,
-                    "download-bottle",
-                    &formula.name,
-                    self.downloader
-                        .download_verified(&selected_bottle.url, &selected_bottle.sha256),
-                )
-                .await?;
+                let blob_hit =
+                    Self::instrument_phase(operation, "check-blob-store", &formula.name, || {
+                        blob_store.has(&selected_bottle.sha256)
+                    })?;
 
-                Self::instrument_phase(operation, "store-bottle-blob", &formula.name, || {
-                    blob_store.put(&selected_bottle.sha256, &data)
-                })?;
+                if blob_hit {
+                    tracing::info!(
+                        name = formula.name,
+                        sha256 = selected_bottle.sha256,
+                        "blob store hit, skipping download"
+                    );
+                } else {
+                    let data = Self::instrument_async_phase(
+                        operation,
+                        "download-bottle",
+                        &formula.name,
+                        self.downloader
+                            .download_verified(&selected_bottle.url, &selected_bottle.sha256),
+                    )
+                    .await?;
 
-                let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
-                let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
-                Self::instrument_phase(operation, "extract-bottle", &formula.name, || {
-                    extract_tar_gz(&blob_path, &extract_dir)
-                })?;
+                    Self::instrument_phase(operation, "store-bottle-blob", &formula.name, || {
+                        blob_store.put(&selected_bottle.sha256, &data)
+                    })?;
+                }
 
                 let version_str = pkg_version(&formula.versions.stable, formula.revision);
+                let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
                 let source_dir = extract_dir.join(&formula.name).join(&version_str);
+
+                if source_dir.exists() {
+                    tracing::info!(name = formula.name, "extract dir hit, skipping extraction");
+                } else {
+                    let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
+                    Self::instrument_phase(operation, "extract-bottle", &formula.name, || {
+                        extract_tar_gz(&blob_path, &extract_dir)
+                    })?;
+                }
+
                 let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
                 let relocation_scope =
                     if matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
@@ -729,10 +838,44 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         }
     }
 
+    /// Finalizes a single formula from a materialized payload.
+    ///
+    /// For bottles: runs post-install, link, and receipt write (keg is already
+    /// materialized and relocated).
+    /// For source: builds from source first, then runs the same finalize steps.
+    async fn finalize_materialized(
+        &self,
+        formula: &Formula,
+        cache: &FormulaCache,
+        install_context: &InstallContext<'_, '_>,
+        resolved: MaterializedFormula,
+    ) -> Result<(), BrewdockError> {
+        let name = formula.name.as_str();
+
+        tracing::info!(name, "installing formula");
+
+        let keg_path = match resolved.materialized {
+            MaterializedPayload::Bottle { keg_path } => keg_path,
+            MaterializedPayload::PendingSource(pending) => {
+                self.build_source_to_keg(install_context.operation, name, *pending)?
+            }
+        };
+
+        self.finalize_with_keg(
+            formula,
+            cache,
+            install_context,
+            FinalizeContext {
+                method: &resolved.method,
+                keg_path: &keg_path,
+            },
+        )
+        .await
+    }
+
     /// Finalizes a single formula from prefetched payload.
     ///
-    /// Performs prefix-mutating operations: materialize, relocate, post-install,
-    /// link, and receipt write. On failure, cleans up only this formula.
+    /// Used by the upgrade path where materialize and finalize are not split.
     async fn finalize_single(
         &self,
         formula: &Formula,
@@ -763,16 +906,74 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             );
         })?;
 
+        self.finalize_with_keg(
+            formula,
+            cache,
+            install_context,
+            FinalizeContext {
+                method: &resolved.method,
+                keg_path: &keg_path,
+            },
+        )
+        .await
+    }
+
+    /// Builds source into a keg and refreshes the opt link.
+    fn build_source_to_keg(
+        &self,
+        operation: &'static str,
+        name: &str,
+        pending: PendingSourcePayload,
+    ) -> Result<PathBuf, BrewdockError> {
+        let PendingSourcePayload {
+            source_root,
+            plan,
+            _tempdir: tempdir_guard,
+        } = pending;
+        Self::instrument_phase(operation, "build-from-source", name, || {
+            run_source_build(&source_root, &plan, self.layout.prefix())
+        })
+        .inspect_err(|_| {
+            let _ = cleanup_failed_install(
+                &plan.cellar_path,
+                self.layout.prefix(),
+                &self.layout.opt_dir(),
+                name,
+            );
+        })?;
+        // Tempdir kept alive until after build completes; drops here.
+        drop(tempdir_guard);
+        Self::instrument_phase(operation, "refresh-opt-link", name, || {
+            refresh_opt_link(
+                &plan.cellar_path,
+                &self.layout.opt_dir(),
+                &plan.formula_name,
+            )
+        })?;
+        Ok(plan.cellar_path)
+    }
+
+    /// Shared finalize logic: post-install, receipt, link, and transaction management.
+    async fn finalize_with_keg(
+        &self,
+        formula: &Formula,
+        cache: &FormulaCache,
+        install_context: &InstallContext<'_, '_>,
+        finalize_ctx: FinalizeContext<'_>,
+    ) -> Result<(), BrewdockError> {
+        let name = formula.name.as_str();
+        let keg_path = finalize_ctx.keg_path;
+
         let post_install_transaction = Self::instrument_async_phase(
             install_context.operation,
             "post-install",
             name,
-            self.execute_post_install(install_context.operation, formula, &keg_path),
+            self.execute_post_install(install_context.operation, formula, keg_path),
         )
         .await
         .inspect_err(|_| {
             let _ = cleanup_failed_install(
-                &keg_path,
+                keg_path,
                 self.layout.prefix(),
                 &self.layout.opt_dir(),
                 &formula.name,
@@ -781,7 +982,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         let is_requested = install_context.requested.contains(formula.name.as_str());
         let receipt = build_receipt(
-            &resolved.method,
+            finalize_ctx.method,
             if is_requested {
                 InstallReason::OnRequest
             } else {
@@ -793,14 +994,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         );
         if let Err(error) =
             Self::instrument_phase(install_context.operation, "finalize-install", name, || {
-                self.finalize_installed_formula(formula, &keg_path, &receipt)
+                self.finalize_installed_formula(formula, keg_path, &receipt)
             })
         {
             if let Some(transaction) = post_install_transaction {
                 transaction.rollback()?;
             }
             cleanup_failed_install(
-                &keg_path,
+                keg_path,
                 self.layout.prefix(),
                 &self.layout.opt_dir(),
                 &formula.name,
@@ -832,36 +1033,29 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 keg_path,
                 relocation_scope,
             } => {
-                Self::instrument_phase(operation, "materialize-keg", &formula.name, || {
-                    materialize(
-                        &source_dir,
-                        &keg_path,
-                        &self.layout.opt_dir(),
-                        &formula.name,
-                    )
-                })?;
-                Self::instrument_phase(operation, "relocate-keg", &formula.name, || {
-                    relocate_keg(&keg_path, self.layout.prefix(), relocation_scope)
-                })?;
+                materialize_and_relocate_bottle(
+                    &source_dir,
+                    &keg_path,
+                    &self.layout.opt_dir(),
+                    self.layout.prefix(),
+                    &formula.name,
+                    relocation_scope,
+                )?;
                 Ok(keg_path)
             }
             PrefetchedPayload::Source {
                 source_root,
                 plan,
-                _tempdir: _guard,
-            } => {
-                Self::instrument_phase(operation, "build-from-source", &formula.name, || {
-                    run_source_build(&source_root, &plan, self.layout.prefix())
-                })?;
-                Self::instrument_phase(operation, "refresh-opt-link", &formula.name, || {
-                    refresh_opt_link(
-                        &plan.cellar_path,
-                        &self.layout.opt_dir(),
-                        &plan.formula_name,
-                    )
-                })?;
-                Ok(plan.cellar_path)
-            }
+                _tempdir: tempdir,
+            } => self.build_source_to_keg(
+                operation,
+                &formula.name,
+                PendingSourcePayload {
+                    source_root,
+                    plan,
+                    _tempdir: tempdir,
+                },
+            ),
         }
     }
 
@@ -1128,6 +1322,66 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             let _ = link(old_keg, self.layout.prefix());
         }
         let _ = refresh_opt_link(old_keg, &self.layout.opt_dir(), &candidate.name);
+    }
+}
+
+/// Copies extracted bottle content into a keg and patches binaries/text.
+///
+/// Shared by both the parallel install path and the serial upgrade path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "thin delegation to materialize + relocate_keg"
+)]
+fn materialize_and_relocate_bottle(
+    source_dir: &Path,
+    keg_path: &Path,
+    opt_dir: &Path,
+    prefix: &Path,
+    formula_name: &str,
+    relocation_scope: RelocationScope,
+) -> Result<(), BrewdockError> {
+    materialize(source_dir, keg_path, opt_dir, formula_name)?;
+    relocate_keg(keg_path, prefix, relocation_scope)?;
+    Ok(())
+}
+
+/// Materializes a prefetched payload into a [`MaterializedPayload`].
+///
+/// This is a free function (not a method) so it can be moved into
+/// [`tokio::task::spawn_blocking`] without borrowing the orchestrator.
+fn materialize_prefetched_payload(
+    payload: PrefetchedPayload,
+    formula_name: &str,
+    opt_dir: &Path,
+    prefix: &Path,
+) -> Result<MaterializedPayload, BrewdockError> {
+    match payload {
+        PrefetchedPayload::Bottle {
+            source_dir,
+            keg_path,
+            relocation_scope,
+        } => {
+            materialize_and_relocate_bottle(
+                &source_dir,
+                &keg_path,
+                opt_dir,
+                prefix,
+                formula_name,
+                relocation_scope,
+            )?;
+            Ok(MaterializedPayload::Bottle { keg_path })
+        }
+        PrefetchedPayload::Source {
+            source_root,
+            plan,
+            _tempdir: tempdir,
+        } => Ok(MaterializedPayload::PendingSource(Box::new(
+            PendingSourcePayload {
+                source_root,
+                plan,
+                _tempdir: tempdir,
+            },
+        ))),
     }
 }
 
@@ -3198,6 +3452,126 @@ install:
         assert_installed(&layout, "bravo");
         // charlie was rolled back
         assert_not_installed(&layout, "charlie");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_skips_download_when_blob_exists_in_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let formula_a = make_formula("a", "1.0", &[], sha_a);
+        let tar_a = create_simple_bottle("a", "1.0")?;
+
+        // Pre-populate blob store so download should be skipped.
+        let blob_store = BlobStore::new(&layout.blob_dir());
+        blob_store.put(sha_a, &tar_a)?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula_a],
+            vec![(sha_a, tar_a)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["a"]).await?;
+
+        assert_eq!(installed, vec!["a"]);
+        assert_installed(&layout, "a");
+        // Download should have been skipped because blob already existed.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "download should be skipped when blob exists in store"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_skips_extract_when_extract_dir_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let formula_a = make_formula("a", "1.0", &[], sha_a);
+        let tar_a = create_bottle_tar_gz("a", "1.0", &[("bin/tool", b"#!/bin/sh\necho ok\n")])?;
+
+        // Pre-populate blob store and extract dir so both download and extract are skipped.
+        let blob_store = BlobStore::new(&layout.blob_dir());
+        blob_store.put(sha_a, &tar_a)?;
+        let blob_path = blob_store.blob_path(sha_a)?;
+
+        let extract_dir = layout.store_dir().join(sha_a);
+        extract_tar_gz(&blob_path, &extract_dir)?;
+        // Extract dir now has a/1.0/bin/tool
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula_a],
+            vec![(sha_a, tar_a)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["a"]).await?;
+
+        assert_eq!(installed, vec!["a"]);
+        assert_installed(&layout, "a");
+        // Download and extract were both skipped.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "download should be skipped when blob exists"
+        );
+        // Formula should still be correctly installed from cached extract.
+        assert!(layout.cellar().join("a/1.0/bin/tool").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_warm_path_with_multiple_formulae()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let formula_a = make_formula("a", "1.0", &[], sha_a);
+        let formula_b = make_formula("b", "2.0", &[], sha_b);
+
+        let tar_a = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh\necho a")])?;
+        let tar_b = create_bottle_tar_gz("b", "2.0", &[("bin/b_tool", b"#!/bin/sh\necho b")])?;
+
+        // Pre-populate blob store for both.
+        let blob_store = BlobStore::new(&layout.blob_dir());
+        blob_store.put(sha_a, &tar_a)?;
+        blob_store.put(sha_b, &tar_b)?;
+
+        // Pre-populate extract dirs for both.
+        let blob_a = blob_store.blob_path(sha_a)?;
+        let blob_b = blob_store.blob_path(sha_b)?;
+        extract_tar_gz(&blob_a, &layout.store_dir().join(sha_a))?;
+        extract_tar_gz(&blob_b, &layout.store_dir().join(sha_b))?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula_a, formula_b],
+            vec![(sha_a, tar_a), (sha_b, tar_b)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["a", "b"]).await?;
+
+        assert_eq!(installed.len(), 2);
+        assert_installed(&layout, "a");
+        assert_installed(&layout, "b");
+        // Zero downloads — all warm cache hits.
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
