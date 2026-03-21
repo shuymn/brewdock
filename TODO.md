@@ -326,7 +326,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: update path だけ速くしても install planning が別 metadata path を持つと将来の formula/cask scale で同じ問題を再導入する
   - Escalate if: Homebrew upstream metadata contract に差分更新や分割 cache の前提がなく、安全な freshness 判定を設計できない場合
 
-- [ ] Theme: Read-heavy command surface on shared metadata and install-state layers
+- [x] Theme: Read-heavy command surface on shared metadata and install-state layers
   - Outcome: `bd outdated`, `bd search`, `bd info`, `bd list`, `bd cleanup`, `bd doctor` の優先コマンドが、install/update/upgrade と同じ metadata/state 基盤を再利用して追加できる
   - Goal: 高速化の恩恵を受けやすい read-heavy / maintenance 系 command surface を、共存コンセプトを崩さずに追加するための最小 contract を定義して閉じる
   - Must Not Break: `/opt/homebrew` 共存を維持する; Homebrew-visible install state を正本にする方針を崩さない; `task check` green

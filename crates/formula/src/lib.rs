@@ -38,6 +38,9 @@ mod test_support {
         Formula {
             name: name.to_owned(),
             full_name: name.to_owned(),
+            desc: None,
+            homepage: None,
+            license: None,
             versions: Versions {
                 stable: "1.0.0".to_owned(),
                 head: None,

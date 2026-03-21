@@ -94,6 +94,78 @@ pub struct SourceBuildPlan {
     pub cellar_path: PathBuf,
 }
 
+/// An outdated formula with current and latest version information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutdatedEntry {
+    /// Formula name.
+    pub name: String,
+    /// Currently installed version.
+    pub current_version: String,
+    /// Latest available version.
+    pub latest_version: String,
+}
+
+/// Formula information for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormulaInfo {
+    /// Formula name.
+    pub name: String,
+    /// Stable version.
+    pub version: String,
+    /// Short description.
+    pub desc: Option<String>,
+    /// Homepage URL.
+    pub homepage: Option<String>,
+    /// License identifier.
+    pub license: Option<String>,
+    /// Whether the formula is keg-only.
+    pub keg_only: bool,
+    /// Runtime dependencies.
+    pub dependencies: Vec<String>,
+    /// Whether a bottle is available for the host tag.
+    pub bottle_available: bool,
+    /// Currently installed version, if any.
+    pub installed_version: Option<String>,
+}
+
+/// Result of a cleanup operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupResult {
+    /// Number of blob files removed.
+    pub blobs_removed: u64,
+    /// Number of extracted store directories removed.
+    pub stores_removed: u64,
+    /// Total bytes freed.
+    pub bytes_freed: u64,
+}
+
+/// A diagnostic finding from the doctor command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticEntry {
+    /// Category of the finding.
+    pub category: DiagnosticCategory,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Category of a diagnostic finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticCategory {
+    /// Everything is fine.
+    Ok,
+    /// Something that might cause issues.
+    Warning,
+}
+
+impl std::fmt::Display for DiagnosticCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Warning => f.write_str("warning"),
+        }
+    }
+}
+
 /// Result of the prefetch phase for a single formula.
 ///
 /// Contains all downloaded and extracted data needed to finalize
@@ -198,6 +270,11 @@ pub(crate) struct PendingSourcePayload {
 }
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
+    /// Maximum age in seconds before the metadata cache is considered stale.
+    ///
+    /// Matches Homebrew's default staleness window (7 days).
+    const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
     /// Creates a new orchestrator.
     #[must_use]
     pub fn new(repo: R, downloader: D, layout: Layout, host_tag: HostTag) -> Self {
@@ -561,6 +638,24 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             }
             Ok(kegs)
         }
+    }
+
+    /// Ensures the metadata cache is populated and fresh.
+    ///
+    /// If the cache is empty or older than [`Self::CACHE_MAX_AGE_SECS`],
+    /// fetches the formula index from the network (equivalent to `bd update`).
+    async fn ensure_fresh_cache(&self) -> Result<(), BrewdockError> {
+        let needs_refresh = match self.metadata_store.load_metadata() {
+            Ok(Some(meta)) if meta.formula_count > 0 => {
+                let age = unix_now().as_secs().saturating_sub(meta.fetched_at);
+                age > Self::CACHE_MAX_AGE_SECS
+            }
+            _ => true,
+        };
+        if needs_refresh {
+            self.update().await?;
+        }
+        Ok(())
     }
 
     /// Resolves the install list: fetch, check supportability, resolve order,
@@ -1270,6 +1365,260 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             })
             .collect()
     }
+
+    // --- Read-heavy query methods ---
+
+    /// Lists outdated formulae by comparing installed versions against the
+    /// metadata cache.
+    ///
+    /// Reuses the same install-state discovery and metadata layers as `upgrade`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if discovery or metadata lookup fails.
+    pub async fn outdated(&self, names: &[&str]) -> Result<Vec<OutdatedEntry>, BrewdockError> {
+        self.ensure_fresh_cache().await?;
+        let installed = self.fetch_installed_kegs(names)?;
+        let mut entries = Vec::new();
+
+        for keg in installed {
+            let formula = match self.resolve_formula(&keg.name).await {
+                Ok(f) => f,
+                Err(err) => {
+                    tracing::warn!(name = keg.name, %err, "skipping: cannot resolve formula");
+                    continue;
+                }
+            };
+            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
+            if keg.pkg_version != latest_version {
+                entries.push(OutdatedEntry {
+                    name: keg.name,
+                    current_version: keg.pkg_version,
+                    latest_version,
+                });
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Searches for formulae by name pattern using the metadata cache.
+    ///
+    /// The pattern is matched as a substring (wrapped in `%pattern%` for SQL
+    /// LIKE). Returns matching formula names sorted alphabetically.
+    ///
+    /// If the metadata cache is empty, fetches the formula index from the
+    /// network first (equivalent to `bd update`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if the metadata cache cannot be read or the
+    /// network fetch fails.
+    pub async fn search(&self, pattern: &str) -> Result<Vec<String>, BrewdockError> {
+        self.ensure_fresh_cache().await?;
+        let escaped = pattern
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_pattern = format!("%{escaped}%");
+        Ok(self.metadata_store.search_formulae_escaped(&like_pattern)?)
+    }
+
+    /// Returns detailed information about a formula.
+    ///
+    /// Looks up the formula from the metadata cache (falling back to network)
+    /// and checks install state from the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if the formula cannot be found or metadata
+    /// cannot be read.
+    pub async fn info(&self, name: &str) -> Result<FormulaInfo, BrewdockError> {
+        let formula = self.resolve_formula(name).await?;
+        let host_tag = self.host_tag.as_str();
+        let bottle_available = select_bottle(&formula, host_tag).is_some();
+
+        let installed_keg =
+            find_installed_keg(name, &self.layout.cellar(), &self.layout.opt_dir())?;
+
+        Ok(FormulaInfo {
+            name: formula.name,
+            version: pkg_version(&formula.versions.stable, formula.revision),
+            desc: formula.desc,
+            homepage: formula.homepage,
+            license: formula.license,
+            keg_only: formula.keg_only,
+            dependencies: formula.dependencies,
+            bottle_available,
+            installed_version: installed_keg.map(|k| k.pkg_version),
+        })
+    }
+
+    /// Lists all installed formulae from Homebrew-visible filesystem state.
+    ///
+    /// Reuses the same install-state discovery as `upgrade`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if scanning the Cellar fails.
+    pub fn list(&self) -> Result<Vec<InstalledKeg>, BrewdockError> {
+        self.fetch_installed_kegs(&[])
+    }
+
+    /// Cleans up brewdock-owned caches and extracted stores.
+    ///
+    /// Removes blob files and extracted store directories that are no longer
+    /// needed. Does NOT touch `/opt/homebrew/Cellar` or any Homebrew-visible
+    /// state.
+    ///
+    /// If `dry_run` is true, returns the sizes without deleting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if cleanup I/O fails.
+    pub fn cleanup(&self, dry_run: bool) -> Result<CleanupResult, BrewdockError> {
+        let mut result = CleanupResult {
+            blobs_removed: 0,
+            stores_removed: 0,
+            bytes_freed: 0,
+        };
+
+        let installed = self.fetch_installed_kegs(&[])?;
+        let installed_shas: HashSet<String> = installed
+            .iter()
+            .filter_map(|keg| {
+                let formula = self.metadata_store.load_formula(&keg.name).ok()??;
+                let bottle = select_bottle(&formula, self.host_tag.as_str())?;
+                Some(bottle.sha256)
+            })
+            .collect();
+
+        let blob_dir = self.layout.blob_dir();
+        if blob_dir.is_dir() {
+            let (removed, freed) = cleanup_directory_tree(&blob_dir, &installed_shas, dry_run)?;
+            result.blobs_removed = removed;
+            result.bytes_freed += freed;
+        }
+
+        let store_dir = self.layout.store_dir();
+        if store_dir.is_dir() {
+            let (removed, freed) = cleanup_directory_tree(&store_dir, &installed_shas, dry_run)?;
+            result.stores_removed = removed;
+            result.bytes_freed += freed;
+        }
+
+        Ok(result)
+    }
+
+    /// Runs diagnostic checks on the brewdock environment.
+    ///
+    /// Checks metadata cache freshness, broken opt symlinks, and missing
+    /// receipts. Operates only on brewdock-owned surfaces and
+    /// Homebrew-visible install state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrewdockError`] if diagnostic I/O fails.
+    pub fn doctor(&self) -> Result<Vec<DiagnosticEntry>, BrewdockError> {
+        let mut diagnostics = Vec::new();
+
+        // Check metadata cache
+        match self.metadata_store.load_metadata() {
+            Ok(Some(meta)) => {
+                let now = unix_now().as_secs();
+                let age_hours = now.saturating_sub(meta.fetched_at) / 3600;
+                if age_hours > 24 {
+                    diagnostics.push(DiagnosticEntry {
+                        category: DiagnosticCategory::Warning,
+                        message: format!(
+                            "formula index is {age_hours} hours old ({count} formulae); run `bd update`",
+                            count = meta.formula_count,
+                        ),
+                    });
+                } else {
+                    diagnostics.push(DiagnosticEntry {
+                        category: DiagnosticCategory::Ok,
+                        message: format!(
+                            "formula index is up to date ({count} formulae, {age_hours}h old)",
+                            count = meta.formula_count,
+                        ),
+                    });
+                }
+            }
+            Ok(None) => {
+                diagnostics.push(DiagnosticEntry {
+                    category: DiagnosticCategory::Warning,
+                    message: "no formula index cached; run `bd update`".to_owned(),
+                });
+            }
+            Err(err) => {
+                diagnostics.push(DiagnosticEntry {
+                    category: DiagnosticCategory::Warning,
+                    message: format!("cannot read formula index: {err}"),
+                });
+            }
+        }
+
+        // Check for broken opt symlinks
+        let opt_dir = self.layout.opt_dir();
+        if opt_dir.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&opt_dir)
+        {
+            let mut broken_count: u32 = 0;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_symlink() && !path.exists() {
+                    broken_count += 1;
+                }
+            }
+            if broken_count > 0 {
+                diagnostics.push(DiagnosticEntry {
+                    category: DiagnosticCategory::Warning,
+                    message: format!("{broken_count} broken symlink(s) in opt directory"),
+                });
+            }
+        }
+
+        // Check for kegs without receipts using fetch_installed_kegs for efficiency
+        let cellar = self.layout.cellar();
+        if cellar.is_dir()
+            && let Ok(cellar_entries) = std::fs::read_dir(&cellar)
+        {
+            let valid_kegs: HashSet<String> = self
+                .fetch_installed_kegs(&[])?
+                .into_iter()
+                .map(|k| k.name)
+                .collect();
+            let mut missing_receipt_count: u32 = 0;
+            for entry in cellar_entries.flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !valid_kegs.contains(name)
+                    && cellar
+                        .join(name)
+                        .read_dir()
+                        .is_ok_and(|mut d| d.next().is_some())
+                {
+                    missing_receipt_count += 1;
+                }
+            }
+            if missing_receipt_count > 0 {
+                diagnostics.push(DiagnosticEntry {
+                    category: DiagnosticCategory::Warning,
+                    message: format!(
+                        "{missing_receipt_count} keg(s) without valid receipt or opt symlink"
+                    ),
+                });
+            }
+        }
+
+        Ok(diagnostics)
+    }
 }
 
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
@@ -1348,6 +1697,87 @@ pub(crate) fn pkg_version(version: &str, revision: u32) -> String {
     } else {
         version.to_owned()
     }
+}
+
+/// Walks a directory tree and removes entries whose names are not in
+/// `keep_shas`. Returns the number of entries removed.
+///
+/// For the blob store, top-level entries are 2-char prefix directories;
+/// for the extracted store, they are SHA-based directories. In both
+/// cases we check leaf names against `keep_shas`.
+/// Walks a directory tree and removes entries not in `keep_shas`.
+///
+/// Returns `(entries_removed, bytes_freed)`.
+fn cleanup_directory_tree(
+    root: &Path,
+    keep_shas: &HashSet<String>,
+    dry_run: bool,
+) -> Result<(u64, u64), BrewdockError> {
+    let mut removed: u64 = 0;
+    let mut freed: u64 = 0;
+
+    for top_entry in std::fs::read_dir(root)?.flatten() {
+        let top_path = top_entry.path();
+        if top_path.is_dir() {
+            for sub_entry in std::fs::read_dir(&top_path)?.flatten() {
+                let sub_path = sub_entry.path();
+                let name = sub_entry.file_name().to_string_lossy().into_owned();
+                if !keep_shas.contains(&name) {
+                    freed += dir_size(&sub_path);
+                    if !dry_run {
+                        remove_path(&sub_path);
+                    }
+                    removed += 1;
+                }
+            }
+            if !dry_run {
+                let _ = std::fs::remove_dir(&top_path);
+            }
+        } else {
+            let name = top_entry.file_name().to_string_lossy().into_owned();
+            if !keep_shas.contains(&name) {
+                freed += top_entry.metadata().map_or(0, |m| m.len());
+                if !dry_run {
+                    remove_path(&top_path);
+                }
+                removed += 1;
+            }
+        }
+    }
+
+    Ok((removed, freed))
+}
+
+/// Removes a path regardless of whether it is a file or directory.
+fn remove_path(path: &Path) {
+    // Try remove_dir_all first; fall back to remove_file on error.
+    if std::fs::remove_dir_all(path).is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Returns the total size of a directory tree using a single metadata call per entry.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let mut total: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let Ok(entry_meta) = entry.metadata() else {
+                continue;
+            };
+            if entry_meta.is_dir() {
+                total += dir_size(&entry.path());
+            } else {
+                total += entry_meta.len();
+            }
+        }
+    }
+    total
 }
 
 /// Returns the current duration since Unix epoch.
@@ -3084,6 +3514,272 @@ install:
             "should fetch all from network when no cache"
         );
         assert_eq!(plan.len(), 2);
+        Ok(())
+    }
+
+    // --- Outdated tests ---
+
+    #[tokio::test]
+    async fn test_outdated_returns_outdated_formulae() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        setup_installed_keg(&layout, "a", "1.0", true)?;
+        setup_installed_keg(&layout, "b", "2.0", true)?;
+
+        let formulae = vec![
+            make_formula("a", "2.0", &[], PLAN_SHA),
+            make_formula("b", "2.0", &[], PLAN_SHA),
+        ];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(formulae, vec![], counter, layout)?;
+
+        let entries = orchestrator.outdated(&[]).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a");
+        assert_eq!(entries[0].current_version, "1.0");
+        assert_eq!(entries[0].latest_version, "2.0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_outdated_returns_empty_when_all_up_to_date()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        setup_installed_keg(&layout, "a", "1.0", true)?;
+
+        let formulae = vec![make_formula("a", "1.0", &[], PLAN_SHA)];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(formulae, vec![], counter, layout)?;
+
+        let entries = orchestrator.outdated(&[]).await?;
+        assert!(entries.is_empty());
+        Ok(())
+    }
+
+    // --- Search tests ---
+
+    #[tokio::test]
+    async fn test_search_uses_metadata_store() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // Populate metadata store with a fresh timestamp so it won't be stale.
+        let store = MetadataStore::new(layout.cache_dir());
+        let meta = brewdock_formula::IndexMetadata {
+            etag: None,
+            fetched_at: unix_now().as_secs(),
+            formula_count: 3,
+        };
+        store.save_index(
+            &[
+                make_formula("jq", "1.7", &[], PLAN_SHA),
+                make_formula("jql", "7.0", &[], PLAN_SHA),
+                make_formula("wget", "1.24", &[], PLAN_SHA),
+            ],
+            &meta,
+        )?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let results = orchestrator.search("jq").await?;
+        assert_eq!(results, vec!["jq", "jql"]);
+
+        let results = orchestrator.search("nonexistent").await?;
+        assert!(results.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_auto_fetches_when_cache_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // No metadata cache populated, but MockRepo has formulae.
+        let formulae = vec![
+            make_formula("jq", "1.7", &[], PLAN_SHA),
+            make_formula("wget", "1.24", &[], PLAN_SHA),
+        ];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(formulae, vec![], counter, layout.clone())?;
+
+        // Should auto-fetch and populate cache, then find jq.
+        let results = orchestrator.search("jq").await?;
+        assert_eq!(results, vec!["jq"]);
+
+        // Cache should now be populated.
+        let store = MetadataStore::new(layout.cache_dir());
+        assert_eq!(store.formula_count()?, 2);
+        Ok(())
+    }
+
+    // --- Info tests ---
+
+    #[tokio::test]
+    async fn test_info_returns_formula_details() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        setup_installed_keg(&layout, "a", "1.0", true)?;
+
+        let formulae = vec![make_formula("a", "1.0", &["b"], PLAN_SHA)];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(formulae, vec![], counter, layout)?;
+
+        let info = orchestrator.info("a").await?;
+        assert_eq!(info.name, "a");
+        assert_eq!(info.version, "1.0");
+        assert_eq!(info.dependencies, vec!["b"]);
+        assert!(info.bottle_available);
+        assert_eq!(info.installed_version, Some("1.0".to_owned()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_info_not_installed() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let formulae = vec![make_formula("a", "1.0", &[], PLAN_SHA)];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(formulae, vec![], counter, layout)?;
+
+        let info = orchestrator.info("a").await?;
+        assert!(info.installed_version.is_none());
+        Ok(())
+    }
+
+    // --- List tests ---
+
+    #[test]
+    fn test_list_returns_installed_kegs() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        setup_installed_keg(&layout, "a", "1.0", true)?;
+        setup_installed_keg(&layout, "b", "2.0", false)?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let kegs = orchestrator.list()?;
+        assert_eq!(kegs.len(), 2);
+        assert_eq!(kegs[0].name, "a");
+        assert_eq!(kegs[1].name, "b");
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_returns_empty_when_nothing_installed() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let kegs = orchestrator.list()?;
+        assert!(kegs.is_empty());
+        Ok(())
+    }
+
+    // --- Doctor tests ---
+
+    #[test]
+    fn test_doctor_warns_when_no_metadata_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let diagnostics = orchestrator.doctor()?;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.category == DiagnosticCategory::Warning
+                    && d.message.contains("no formula index cached"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_doctor_detects_broken_opt_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // Create a broken opt symlink
+        let opt_dir = layout.opt_dir();
+        std::fs::create_dir_all(&opt_dir)?;
+        std::os::unix::fs::symlink("/nonexistent/path", opt_dir.join("broken"))?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let diagnostics = orchestrator.doctor()?;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.category == DiagnosticCategory::Warning
+                    && d.message.contains("broken symlink"))
+        );
+        Ok(())
+    }
+
+    // --- Cleanup tests ---
+
+    #[test]
+    fn test_cleanup_nothing_to_clean() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let result = orchestrator.cleanup(false)?;
+        assert_eq!(result.blobs_removed, 0);
+        assert_eq!(result.stores_removed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cleanup_removes_orphan_blobs() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // Create an orphan blob (not referenced by any installed formula)
+        let blob_dir = layout.blob_dir();
+        let orphan_path = blob_dir.join("ab").join("abcdef1234567890");
+        std::fs::create_dir_all(orphan_path.parent().ok_or("no parent")?)?;
+        std::fs::write(&orphan_path, b"orphan data")?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let result = orchestrator.cleanup(false)?;
+        assert!(result.blobs_removed > 0);
+        assert!(!orphan_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_cleanup_dry_run_does_not_delete() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let blob_dir = layout.blob_dir();
+        let orphan_path = blob_dir.join("ab").join("abcdef1234567890");
+        std::fs::create_dir_all(orphan_path.parent().ok_or("no parent")?)?;
+        std::fs::write(&orphan_path, b"orphan data")?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(vec![], vec![], counter, layout)?;
+
+        let result = orchestrator.cleanup(true)?;
+        assert!(result.blobs_removed > 0);
+        assert!(orphan_path.exists(), "dry run should not delete files");
         Ok(())
     }
 }

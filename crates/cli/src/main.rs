@@ -61,6 +61,27 @@ enum Commands {
         /// Formula names to upgrade (all if empty).
         formulae: Vec<String>,
     },
+    /// Show outdated formulae.
+    Outdated {
+        /// Formula names to check (all if empty).
+        formulae: Vec<String>,
+    },
+    /// Search available formulae.
+    Search {
+        /// Search pattern (substring match).
+        pattern: String,
+    },
+    /// Show formula information.
+    Info {
+        /// Formula name.
+        formula: String,
+    },
+    /// List installed formulae.
+    List,
+    /// Remove stale caches and downloads.
+    Cleanup,
+    /// Check for potential problems.
+    Doctor,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -92,6 +113,16 @@ async fn main() -> Result<()> {
             ))
             .await
         }
+        Commands::Outdated { formulae } => {
+            commands::outdated::run(&orchestrator, &formulae, verbosity).await
+        }
+        Commands::Search { pattern } => {
+            commands::search::run(&orchestrator, &pattern, verbosity).await
+        }
+        Commands::Info { formula } => commands::info::run(&orchestrator, &formula, verbosity).await,
+        Commands::List => commands::list::run(&orchestrator, verbosity),
+        Commands::Cleanup => commands::cleanup::run(&orchestrator, cli.dry_run, verbosity),
+        Commands::Doctor => commands::doctor::run(&orchestrator, verbosity),
     };
 
     if let Err(err) = &result
@@ -193,5 +224,78 @@ mod tests {
     fn test_verbose_and_quiet_conflict() {
         let result = Cli::try_parse_from(["bd", "--verbose", "--quiet", "install", "jq"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_outdated_parses_without_args() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "outdated"])?;
+        assert!(matches!(
+            cli.command,
+            Commands::Outdated { ref formulae } if formulae.is_empty()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_outdated_parses_with_formula() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "outdated", "jq"])?;
+        assert!(matches!(
+            cli.command,
+            Commands::Outdated { ref formulae } if formulae.len() == 1 && formulae[0] == "jq"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_parses() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "search", "jq"])?;
+        assert!(matches!(
+            cli.command,
+            Commands::Search { ref pattern } if pattern == "jq"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_requires_pattern() {
+        let result = Cli::try_parse_from(["bd", "search"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_info_parses() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "info", "jq"])?;
+        assert!(matches!(
+            cli.command,
+            Commands::Info { ref formula } if formula == "jq"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_info_requires_formula() {
+        let result = Cli::try_parse_from(["bd", "info"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_parses() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "list"])?;
+        assert!(matches!(cli.command, Commands::List));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cleanup_parses() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "cleanup"])?;
+        assert!(matches!(cli.command, Commands::Cleanup));
+        Ok(())
+    }
+
+    #[test]
+    fn test_doctor_parses() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["bd", "doctor"])?;
+        assert!(matches!(cli.command, Commands::Doctor));
+        Ok(())
     }
 }

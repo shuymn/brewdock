@@ -185,6 +185,27 @@ impl MetadataStore {
             .map_err(FormulaError::Database)
     }
 
+    /// Searches for formula names matching a SQL LIKE pattern with backslash
+    /// escaping.
+    ///
+    /// The caller must pre-escape `%`, `_`, and `\` in the pattern.
+    ///
+    /// Returns an empty list if the database does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database exists but cannot be read.
+    pub fn search_formulae_escaped(&self, pattern: &str) -> Result<Vec<String>, FormulaError> {
+        let Some(conn) = self.open_if_exists()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt =
+            conn.prepare("SELECT name FROM formulae WHERE name LIKE ?1 ESCAPE '\\' ORDER BY name")?;
+        let rows = stmt.query_map(rusqlite::params![pattern], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(FormulaError::Database)
+    }
+
     /// Opens the database, creating it and the cache directory if needed.
     fn open_or_create(&self) -> Result<Connection, FormulaError> {
         std::fs::create_dir_all(&self.cache_dir)?;

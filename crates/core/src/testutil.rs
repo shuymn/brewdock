@@ -133,6 +133,9 @@ pub fn make_formula(name: &str, version: &str, deps: &[&str], sha256: &str) -> F
     Formula {
         name: name.to_owned(),
         full_name: name.to_owned(),
+        desc: None,
+        homepage: None,
+        license: None,
         versions: Versions {
             stable: version.to_owned(),
             head: None,

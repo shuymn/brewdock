@@ -21,6 +21,18 @@ pub struct Formula {
     /// Fully qualified name including tap (e.g., `jq`).
     pub full_name: String,
 
+    /// Short description of the formula.
+    #[serde(default)]
+    pub desc: Option<String>,
+
+    /// Homepage URL.
+    #[serde(default)]
+    pub homepage: Option<String>,
+
+    /// Software license identifier.
+    #[serde(default)]
+    pub license: Option<String>,
+
     /// Version information.
     pub versions: Versions,
 
