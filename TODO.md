@@ -279,7 +279,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: install/update/upgrade の baseline が別々だと pipeline 再設計の優先順位を比較できず、optimization Theme の blocker 判定が揺れる
   - Escalate if: phase breakdown を取るために user-visible contract を変える必要が出る場合
 
-- [ ] Theme: Parallelizable install executor with Homebrew-visible finalize boundary
+- [x] Theme: Parallelizable install executor with Homebrew-visible finalize boundary
   - Outcome: 複数 formula install が dependency DAG に従ってより並列に進み、`/opt/homebrew` の最終 state と rollback 契約は維持される
   - Goal: install pipeline を `plan -> fetch/extract -> materialize/relocate -> finalize` に再編し、prefix 競合がない区間だけを並列化する
   - Must Not Break: Homebrew-visible receipt/Cellar/opt/link contract を維持する; rollback は failure 時に壊れた prefix を残さない; unsupported formula は fail-closed のままにする; `task check` green
