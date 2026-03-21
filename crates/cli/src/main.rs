@@ -3,10 +3,10 @@
 use anyhow::{Context, Result};
 use brewdock_core::{HostTag, HttpBottleDownloader, HttpFormulaRepository, Layout, Orchestrator};
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
 
 mod commands;
 mod hint;
+pub mod trace;
 
 #[cfg(test)]
 mod testutil;
@@ -52,7 +52,7 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    init_tracing(cli.verbose, cli.quiet);
+    trace::init_tracing(cli.verbose, cli.quiet).context("tracing init failed")?;
 
     let layout = Layout::production();
     let host_tag = HostTag::detect().context("platform detection failed")?;
@@ -69,7 +69,13 @@ async fn main() -> Result<()> {
         }
         Commands::Update => commands::update::run(&orchestrator, cli.dry_run, cli.quiet).await,
         Commands::Upgrade { formulae } => {
-            commands::upgrade::run(&orchestrator, &formulae, cli.dry_run, cli.quiet).await
+            Box::pin(commands::upgrade::run(
+                &orchestrator,
+                &formulae,
+                cli.dry_run,
+                cli.quiet,
+            ))
+            .await
         }
     };
 
@@ -81,23 +87,6 @@ async fn main() -> Result<()> {
 
     result
 }
-
-/// Initializes the tracing subscriber based on verbosity flags.
-fn init_tracing(verbose: bool, quiet: bool) {
-    let level = if verbose {
-        "debug"
-    } else if quiet {
-        "error"
-    } else {
-        "info"
-    };
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
-    // Intentionally discard: fails harmlessly if a subscriber is already set (e.g., in tests).
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

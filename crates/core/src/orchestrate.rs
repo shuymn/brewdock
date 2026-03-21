@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -16,6 +17,7 @@ use brewdock_formula::{
     CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
     SelectedBottle, UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
 };
+use tracing::Instrument;
 
 use crate::{BrewdockError, HostTag, Layout, error::SourceBuildError, lock::FileLock};
 
@@ -113,6 +115,12 @@ struct UpgradeCandidate {
     method: InstallMethod,
 }
 
+struct InstallContext<'a, 'b> {
+    operation: &'static str,
+    requested: &'a HashSet<&'b str>,
+    blob_store: &'a BlobStore,
+}
+
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Creates a new orchestrator.
     #[must_use]
@@ -134,22 +142,33 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if resolution or validation fails.
     pub async fn plan_install(&self, names: &[&str]) -> Result<Vec<PlanEntry>, BrewdockError> {
-        let _lock = self.acquire_lock()?;
-        let (to_install, cache) = self.resolve_install_list(names).await?;
-        let entries = to_install
-            .iter()
-            .map(|name| {
-                let f = cache
-                    .get(name)
-                    .ok_or_else(|| FormulaError::NotFound { name: name.clone() })?;
-                Ok(PlanEntry {
-                    name: name.clone(),
-                    version: pkg_version(&f.versions.stable, f.revision),
-                    method: self.resolve_install_method(f)?,
-                })
+        Self::instrument_operation("install-plan", names, async {
+            let label = request_label(names);
+            let _lock = self.acquire_lock()?;
+            let (to_install, cache) = Self::instrument_async_phase(
+                "install-plan",
+                "resolve-install-list",
+                &label,
+                self.resolve_install_list(names),
+            )
+            .await?;
+            Self::instrument_phase("install-plan", "resolve-methods", &label, || {
+                to_install
+                    .iter()
+                    .map(|name| {
+                        let f = cache
+                            .get(name)
+                            .ok_or_else(|| FormulaError::NotFound { name: name.clone() })?;
+                        Ok(PlanEntry {
+                            name: name.clone(),
+                            version: pkg_version(&f.versions.stable, f.revision),
+                            method: self.resolve_install_method(f)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, BrewdockError>>()
             })
-            .collect::<Result<Vec<_>, BrewdockError>>()?;
-        Ok(entries)
+        })
+        .await
     }
 
     /// Installs the requested formulae and all their dependencies.
@@ -161,18 +180,30 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Returns [`BrewdockError`] if any step fails. Unsupported formulae are
     /// rejected before any download begins.
     pub async fn install(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
-        let _lock = self.acquire_lock()?;
-        let (to_install, cache) = self.resolve_install_list(names).await?;
+        Self::instrument_operation("install", names, async {
+            let _lock = self.acquire_lock()?;
+            let (to_install, cache) = Self::instrument_async_phase(
+                "install",
+                "resolve-install-list",
+                &request_label(names),
+                self.resolve_install_list(names),
+            )
+            .await?;
 
-        // Install each in order.
-        let requested: HashSet<&str> = names.iter().copied().collect();
-        let blob_store = BlobStore::new(&self.layout.blob_dir());
-        for name in &to_install {
-            self.install_single(name, &cache, &requested, &blob_store)
-                .await?;
-        }
+            let requested: HashSet<&str> = names.iter().copied().collect();
+            let blob_store = BlobStore::new(&self.layout.blob_dir());
+            let install_context = InstallContext {
+                operation: "install",
+                requested: &requested,
+                blob_store: &blob_store,
+            };
+            for name in to_install.iter().map(String::as_str) {
+                self.install_single(name, &cache, &install_context).await?;
+            }
 
-        Ok(to_install)
+            Ok(to_install)
+        })
+        .await
     }
 
     /// Fetches the formula index and caches it locally.
@@ -183,14 +214,31 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if the fetch or file write fails.
     pub async fn update(&self) -> Result<usize, BrewdockError> {
-        let formulae = self.repo.get_all_formulae().await?;
-        let count = formulae.len();
-        let json = serde_json::to_vec(&formulae).map_err(FormulaError::from)?;
-        let cache_dir = self.layout.cache_dir();
-        std::fs::create_dir_all(&cache_dir)?;
-        std::fs::write(cache_dir.join("formula.json"), json)?;
-        tracing::info!(count, "formula index cached");
-        Ok(count)
+        Self::instrument_operation("update", &[], async {
+            let formulae = Self::instrument_async_phase(
+                "update",
+                "fetch-formula-index",
+                "formula-index",
+                self.repo.get_all_formulae(),
+            )
+            .await?;
+            let count = formulae.len();
+            Self::instrument_phase(
+                "update",
+                "persist-formula-index",
+                "formula-index",
+                || -> Result<(), BrewdockError> {
+                    let json = serde_json::to_vec(&formulae).map_err(FormulaError::from)?;
+                    let cache_dir = self.layout.cache_dir();
+                    std::fs::create_dir_all(&cache_dir)?;
+                    std::fs::write(cache_dir.join("formula.json"), &json)?;
+                    Ok(())
+                },
+            )?;
+            tracing::info!(count, "formula index cached");
+            Ok(count)
+        })
+        .await
     }
 
     /// Returns the upgrade plan without executing it.
@@ -202,17 +250,26 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         names: &[&str],
     ) -> Result<Vec<UpgradePlanEntry>, BrewdockError> {
-        let _lock = self.acquire_lock()?;
-        let candidates = self.collect_upgrade_candidates(names).await?;
-        Ok(candidates
-            .into_iter()
-            .map(|candidate| UpgradePlanEntry {
-                name: candidate.name,
-                from_version: candidate.current_version,
-                to_version: candidate.latest_version,
-                method: candidate.method,
-            })
-            .collect())
+        Self::instrument_operation("upgrade-plan", names, async {
+            let _lock = self.acquire_lock()?;
+            let candidates = Self::instrument_async_phase(
+                "upgrade-plan",
+                "collect-upgrade-candidates",
+                &request_label(names),
+                self.collect_upgrade_candidates(names),
+            )
+            .await?;
+            Ok(candidates
+                .into_iter()
+                .map(|candidate| UpgradePlanEntry {
+                    name: candidate.name,
+                    from_version: candidate.current_version,
+                    to_version: candidate.latest_version,
+                    method: candidate.method,
+                })
+                .collect())
+        })
+        .await
     }
 
     /// Upgrades installed formulae to their latest versions.
@@ -226,60 +283,73 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Returns [`BrewdockError`] if any step fails.
     pub async fn upgrade(&self, names: &[&str]) -> Result<Vec<String>, BrewdockError> {
-        let _lock = self.acquire_lock()?;
-        let candidates = self.collect_upgrade_candidates(names).await?;
+        Self::instrument_operation("upgrade", names, async {
+            let _lock = self.acquire_lock()?;
+            let candidates = Self::instrument_async_phase(
+                "upgrade",
+                "collect-upgrade-candidates",
+                &request_label(names),
+                self.collect_upgrade_candidates(names),
+            )
+            .await?;
 
-        let mut upgraded = Vec::new();
-        let blob_store = BlobStore::new(&self.layout.blob_dir());
+            let mut upgraded = Vec::new();
+            let blob_store = BlobStore::new(&self.layout.blob_dir());
 
-        for candidate in candidates {
-            tracing::info!(
-                name = candidate.name,
-                from = candidate.current_version,
-                to = candidate.latest_version,
-                "upgrading formula"
-            );
+            for candidate in candidates {
+                tracing::info!(
+                    name = candidate.name,
+                    from = candidate.current_version,
+                    to = candidate.latest_version,
+                    "upgrading formula"
+                );
 
-            // Unlink old keg; the directory is kept for rollback on failure.
-            let old_keg = self
-                .layout
-                .cellar()
-                .join(&candidate.name)
-                .join(&candidate.current_version);
-            if old_keg.exists() {
-                unlink(&old_keg, self.layout.prefix())?;
-            }
+                let old_keg = self
+                    .layout
+                    .cellar()
+                    .join(&candidate.name)
+                    .join(&candidate.current_version);
+                if old_keg.exists() {
+                    Self::instrument_phase("upgrade", "unlink-old-keg", &candidate.name, || {
+                        unlink(&old_keg, self.layout.prefix())
+                    })?;
+                }
 
-            let requested: HashSet<&str> = if candidate.installed_on_request {
-                std::iter::once(candidate.name.as_str()).collect()
-            } else {
-                HashSet::new()
-            };
+                let requested: HashSet<&str> = if candidate.installed_on_request {
+                    std::iter::once(candidate.name.as_str()).collect()
+                } else {
+                    HashSet::new()
+                };
+                let install_context = InstallContext {
+                    operation: "upgrade",
+                    requested: &requested,
+                    blob_store: &blob_store,
+                };
 
-            let install_result = self
-                .run_upgrade_install(&candidate, &requested, &blob_store)
+                let install_result = Self::instrument_async_phase(
+                    "upgrade",
+                    "install-target-version",
+                    &candidate.name,
+                    self.run_upgrade_install(&candidate, &install_context),
+                )
                 .await;
 
-            // Re-link old keg on failure to avoid leaving the formula broken.
-            if let Err(error) = install_result {
-                tracing::warn!(
-                    name = candidate.name,
-                    %error,
-                    "upgrade failed, restoring previous version"
-                );
-                if old_keg.exists() {
-                    if !candidate.formula.keg_only {
-                        let _ = link(&old_keg, self.layout.prefix());
-                    }
-                    let _ = refresh_opt_link(&old_keg, &self.layout.opt_dir(), &candidate.name);
+                if let Err(error) = install_result {
+                    tracing::warn!(
+                        name = candidate.name,
+                        %error,
+                        "upgrade failed, restoring previous version"
+                    );
+                    self.restore_previous_upgrade(&candidate, &old_keg);
+                    return Err(error);
                 }
-                return Err(error);
+
+                upgraded.push(candidate.name);
             }
 
-            upgraded.push(candidate.name);
-        }
-
-        Ok(upgraded)
+            Ok(upgraded)
+        })
+        .await
     }
 
     /// Discovers installed kegs from Homebrew-visible filesystem state.
@@ -362,12 +432,23 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         names: &[&str],
     ) -> Result<Vec<UpgradeCandidate>, BrewdockError> {
-        let installed = self.fetch_installed_kegs(names)?;
+        let installed = Self::instrument_phase(
+            "upgrade-discovery",
+            "discover-installed-kegs",
+            &request_label(names),
+            || self.fetch_installed_kegs(names),
+        )?;
         let host_tag = self.host_tag.as_str();
         let mut candidates = Vec::new();
 
         for keg in installed {
-            let formula = self.repo.get_formula(&keg.name).await?;
+            let formula = Self::instrument_async_phase(
+                "upgrade-discovery",
+                "fetch-formula-metadata",
+                &keg.name,
+                self.repo.get_formula(&keg.name),
+            )
+            .await?;
             check_supportability(&formula, host_tag)?;
             let method = self.resolve_install_method(&formula)?;
 
@@ -376,7 +457,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 continue;
             }
 
-            if let Err(error) = self.check_post_install_viability(&formula).await {
+            if let Err(error) = Self::instrument_async_phase(
+                "upgrade-discovery",
+                "check-post-install-viability",
+                &keg.name,
+                self.check_post_install_viability(&formula),
+            )
+            .await
+            {
                 tracing::warn!(
                     name = keg.name,
                     %error,
@@ -428,19 +516,17 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     async fn run_upgrade_install(
         &self,
         candidate: &UpgradeCandidate,
-        requested: &HashSet<&str>,
-        blob_store: &BlobStore,
+        install_context: &InstallContext<'_, '_>,
     ) -> Result<(), BrewdockError> {
         if matches!(candidate.method, InstallMethod::Source(_)) {
             let (to_install, cache) = self.resolve_upgrade_install_list(candidate).await?;
-            for name in &to_install {
-                self.install_single(name, &cache, requested, blob_store)
-                    .await?;
+            for name in to_install.iter().map(String::as_str) {
+                self.install_single(name, &cache, install_context).await?;
             }
         } else {
             let mut cache = FormulaCache::new();
             cache.insert(candidate.formula.clone());
-            self.install_single(&candidate.name, &cache, requested, blob_store)
+            self.install_single(&candidate.name, &cache, install_context)
                 .await?;
         }
         Ok(())
@@ -451,44 +537,61 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         name: &str,
         cache: &FormulaCache,
-        requested: &HashSet<&str>,
-        blob_store: &BlobStore,
+        install_context: &InstallContext<'_, '_>,
     ) -> Result<(), BrewdockError> {
         let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
             name: name.to_owned(),
         })?;
-        let method = self.resolve_install_method(formula)?;
+        let method = Self::instrument_phase(
+            install_context.operation,
+            "resolve-install-method",
+            name,
+            || self.resolve_install_method(formula),
+        )?;
 
         tracing::info!(name, "installing formula");
 
-        let keg_path = self
-            .install_payload(formula, &method, blob_store)
-            .await
-            .inspect_err(|_| {
-                let _ = cleanup_failed_install(
-                    &self
-                        .layout
-                        .cellar()
-                        .join(&formula.name)
-                        .join(pkg_version(&formula.versions.stable, formula.revision)),
-                    self.layout.prefix(),
-                    &self.layout.opt_dir(),
-                    &formula.name,
-                );
-            })?;
-        let post_install_transaction = self
-            .execute_post_install(formula, &keg_path)
-            .await
-            .inspect_err(|_| {
-                let _ = cleanup_failed_install(
-                    &keg_path,
-                    self.layout.prefix(),
-                    &self.layout.opt_dir(),
-                    &formula.name,
-                );
-            })?;
+        let keg_path = Self::instrument_async_phase(
+            install_context.operation,
+            "install-payload",
+            name,
+            self.install_payload(
+                install_context.operation,
+                formula,
+                &method,
+                install_context.blob_store,
+            ),
+        )
+        .await
+        .inspect_err(|_| {
+            let _ = cleanup_failed_install(
+                &self
+                    .layout
+                    .cellar()
+                    .join(&formula.name)
+                    .join(pkg_version(&formula.versions.stable, formula.revision)),
+                self.layout.prefix(),
+                &self.layout.opt_dir(),
+                &formula.name,
+            );
+        })?;
+        let post_install_transaction = Self::instrument_async_phase(
+            install_context.operation,
+            "post-install",
+            name,
+            self.execute_post_install(install_context.operation, formula, &keg_path),
+        )
+        .await
+        .inspect_err(|_| {
+            let _ = cleanup_failed_install(
+                &keg_path,
+                self.layout.prefix(),
+                &self.layout.opt_dir(),
+                &formula.name,
+            );
+        })?;
 
-        let is_requested = requested.contains(formula.name.as_str());
+        let is_requested = install_context.requested.contains(formula.name.as_str());
         let receipt = build_receipt(
             &method,
             if is_requested {
@@ -500,9 +603,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             build_receipt_deps(formula, cache),
             build_receipt_source(formula),
         );
-        let finalize_install = self.finalize_installed_formula(formula, &keg_path, &receipt);
-
-        if let Err(error) = finalize_install {
+        if let Err(error) =
+            Self::instrument_phase(install_context.operation, "finalize-install", name, || {
+                self.finalize_installed_formula(formula, &keg_path, &receipt)
+            })
+        {
             if let Some(transaction) = post_install_transaction {
                 transaction.rollback()?;
             }
@@ -525,36 +630,51 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
     async fn install_payload(
         &self,
+        operation: &'static str,
         formula: &Formula,
         method: &InstallMethod,
         blob_store: &BlobStore,
     ) -> Result<PathBuf, BrewdockError> {
         match method {
             InstallMethod::Bottle(selected_bottle) => {
-                let data = self
-                    .downloader
-                    .download_verified(&selected_bottle.url, &selected_bottle.sha256)
-                    .await?;
+                let data = Self::instrument_async_phase(
+                    operation,
+                    "download-bottle",
+                    &formula.name,
+                    self.downloader
+                        .download_verified(&selected_bottle.url, &selected_bottle.sha256),
+                )
+                .await?;
 
-                blob_store.put(&selected_bottle.sha256, &data)?;
+                Self::instrument_phase(operation, "store-bottle-blob", &formula.name, || {
+                    blob_store.put(&selected_bottle.sha256, &data)
+                })?;
 
                 let extract_dir = self.layout.store_dir().join(&selected_bottle.sha256);
                 let blob_path = blob_store.blob_path(&selected_bottle.sha256)?;
-                extract_tar_gz(&blob_path, &extract_dir)?;
+                Self::instrument_phase(operation, "extract-bottle", &formula.name, || {
+                    extract_tar_gz(&blob_path, &extract_dir)
+                })?;
 
                 let version_str = pkg_version(&formula.versions.stable, formula.revision);
                 let source = extract_dir.join(&formula.name).join(&version_str);
                 let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
-                materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
+                Self::instrument_phase(operation, "materialize-keg", &formula.name, || {
+                    materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)
+                })?;
                 let scope = if matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
                     RelocationScope::TextOnly
                 } else {
                     RelocationScope::Full
                 };
-                relocate_keg(&keg_path, self.layout.prefix(), scope)?;
+                Self::instrument_phase(operation, "relocate-keg", &formula.name, || {
+                    relocate_keg(&keg_path, self.layout.prefix(), scope)
+                })?;
                 Ok(keg_path)
             }
-            InstallMethod::Source(plan) => self.install_source_formula(formula, plan).await,
+            InstallMethod::Source(plan) => {
+                self.install_source_formula(operation, formula, plan).await
+            }
         }
     }
 
@@ -572,16 +692,31 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
     async fn execute_post_install(
         &self,
+        operation: &'static str,
         formula: &Formula,
         keg_path: &Path,
     ) -> Result<Option<PostInstallTransaction>, BrewdockError> {
-        let Some(ruby_source) = self.fetch_post_install_source(formula).await? else {
+        let Some(ruby_source) = Self::instrument_async_phase(
+            operation,
+            "fetch-post-install-source",
+            &formula.name,
+            self.fetch_post_install_source(formula),
+        )
+        .await?
+        else {
             return Ok(None);
         };
-        let transaction = run_post_install(
-            &ruby_source,
-            &PostInstallContext::new(self.layout.prefix(), keg_path, &formula.versions.stable),
-        )?;
+        let transaction =
+            Self::instrument_phase(operation, "run-post-install", &formula.name, || {
+                run_post_install(
+                    &ruby_source,
+                    &PostInstallContext::new(
+                        self.layout.prefix(),
+                        keg_path,
+                        &formula.versions.stable,
+                    ),
+                )
+            })?;
         Ok(Some(transaction))
     }
 
@@ -751,6 +886,7 @@ enum SourceArchiveKind {
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     async fn install_source_formula(
         &self,
+        operation: &'static str,
         _formula: &Formula,
         plan: &SourceBuildPlan,
     ) -> Result<PathBuf, BrewdockError> {
@@ -758,10 +894,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             .source_checksum
             .as_deref()
             .ok_or_else(|| SourceBuildError::MissingSourceChecksum(plan.formula_name.clone()))?;
-        let data = self
-            .downloader
-            .download_verified(&plan.source_url, checksum)
-            .await?;
+        let data = Self::instrument_async_phase(
+            operation,
+            "download-source-archive",
+            &plan.formula_name,
+            self.downloader
+                .download_verified(&plan.source_url, checksum),
+        )
+        .await?;
 
         let parent = self.layout.cache_dir().join("sources");
         std::fs::create_dir_all(&parent)?;
@@ -769,16 +909,97 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let archive_path = tempdir
             .path()
             .join(source_archive_filename(&plan.source_url).unwrap_or("source.tar.gz"));
-        std::fs::write(&archive_path, data)?;
-
-        let source_root = extract_source_archive(&archive_path, tempdir.path())?;
-        run_source_build(&source_root, plan, self.layout.prefix())?;
-        refresh_opt_link(
-            &plan.cellar_path,
-            &self.layout.opt_dir(),
+        Self::instrument_phase(
+            operation,
+            "persist-source-archive",
             &plan.formula_name,
+            || std::fs::write(&archive_path, &data),
         )?;
+
+        let source_root = Self::instrument_phase(
+            operation,
+            "extract-source-archive",
+            &plan.formula_name,
+            || extract_source_archive(&archive_path, tempdir.path()),
+        )?;
+        Self::instrument_phase(operation, "build-from-source", &plan.formula_name, || {
+            run_source_build(&source_root, plan, self.layout.prefix())
+        })?;
+        Self::instrument_phase(operation, "refresh-opt-link", &plan.formula_name, || {
+            refresh_opt_link(
+                &plan.cellar_path,
+                &self.layout.opt_dir(),
+                &plan.formula_name,
+            )
+        })?;
         Ok(plan.cellar_path.clone())
+    }
+
+    async fn instrument_operation<T, F>(
+        operation: &'static str,
+        request: &[&str],
+        future: F,
+    ) -> Result<T, BrewdockError>
+    where
+        F: Future<Output = Result<T, BrewdockError>>,
+    {
+        future
+            .instrument(tracing::info_span!(
+                "bd.operation",
+                operation,
+                request = %request_label(request)
+            ))
+            .await
+    }
+
+    async fn instrument_async_phase<T, E, F>(
+        operation: &'static str,
+        phase: &'static str,
+        target: &str,
+        future: F,
+    ) -> Result<T, BrewdockError>
+    where
+        E: Into<BrewdockError>,
+        F: Future<Output = Result<T, E>>,
+    {
+        future
+            .instrument(tracing::info_span!("bd.phase", operation, phase, target))
+            .await
+            .map_err(Into::into)
+    }
+
+    fn instrument_phase<T, E, F>(
+        operation: &'static str,
+        phase: &'static str,
+        target: &str,
+        work: F,
+    ) -> Result<T, BrewdockError>
+    where
+        E: Into<BrewdockError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        let span = tracing::info_span!("bd.phase", operation, phase, target);
+        let _entered = span.enter();
+        work().map_err(Into::into)
+    }
+
+    fn restore_previous_upgrade(&self, candidate: &UpgradeCandidate, old_keg: &Path) {
+        if !old_keg.exists() {
+            return;
+        }
+
+        if !candidate.formula.keg_only {
+            let _ = link(old_keg, self.layout.prefix());
+        }
+        let _ = refresh_opt_link(old_keg, &self.layout.opt_dir(), &candidate.name);
+    }
+}
+
+fn request_label(names: &[&str]) -> String {
+    if names.is_empty() {
+        "all".to_owned()
+    } else {
+        names.join(",")
     }
 }
 
