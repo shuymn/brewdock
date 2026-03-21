@@ -89,7 +89,11 @@ pub fn atomic_symlink_replace(target: &Path, link_path: &Path) -> Result<(), Cel
     Ok(())
 }
 
-/// Recursively copies a directory tree from `src` to `dst`.
+/// Recursively copies a directory tree from `src` to `dst`, preserving symlinks.
+///
+/// Symlinks are recreated rather than followed, keeping the keg layout intact.
+/// Absolute symlink targets are rejected — bottle entries should always use
+/// relative targets.
 ///
 /// If the destination file already exists and is read-only (e.g., from a
 /// previous bottle pour), it is made writable before overwriting.
@@ -99,8 +103,23 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&src_path)?;
+            if target.is_absolute() {
+                return Err(std::io::Error::other(format!(
+                    "absolute symlink in bottle: {} -> {}",
+                    src_path.display(),
+                    target.display()
+                )));
+            }
+            // Remove stale entry before recreating (idempotent re-pour).
+            if dst_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&dst_path)?;
+            }
+            std::os::unix::fs::symlink(&target, &dst_path)?;
         } else {
             util::make_writable(&dst_path)?;
             std::fs::copy(&src_path, &dst_path)?;
@@ -237,6 +256,63 @@ mod tests {
         assert!(keg_path.join("file.txt").exists());
         assert!(!stale_temp.exists());
         assert!(opt_dir.join("formula").is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_preserves_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+        let opt_dir = prefix.join("opt");
+
+        // Create a regular file and a symlink pointing to it.
+        std::fs::create_dir_all(source.join("bin"))?;
+        std::fs::write(source.join("bin/tool"), "#!/bin/sh")?;
+        std::os::unix::fs::symlink("tool", source.join("bin/tool-link"))?;
+
+        // Create a relative symlink across directories.
+        std::fs::create_dir_all(source.join("lib"))?;
+        std::fs::write(source.join("lib/libfoo.1.0.dylib"), "fake-dylib")?;
+        std::os::unix::fs::symlink("libfoo.1.0.dylib", source.join("lib/libfoo.dylib"))?;
+
+        materialize(&source, &keg_path, &opt_dir, "formula")?;
+
+        // The symlinks should be symlinks in the keg, not regular files.
+        let tool_link = keg_path.join("bin/tool-link");
+        assert!(tool_link.is_symlink(), "tool-link should be a symlink");
+        assert_eq!(
+            std::fs::read_link(&tool_link)?,
+            std::path::PathBuf::from("tool")
+        );
+
+        let lib_link = keg_path.join("lib/libfoo.dylib");
+        assert!(lib_link.is_symlink(), "libfoo.dylib should be a symlink");
+        assert_eq!(
+            std::fs::read_link(&lib_link)?,
+            std::path::PathBuf::from("libfoo.1.0.dylib")
+        );
+
+        // The symlink should resolve to the correct content.
+        assert_eq!(std::fs::read_to_string(&tool_link)?, "#!/bin/sh");
+        assert_eq!(std::fs::read_to_string(&lib_link)?, "fake-dylib");
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_rejects_absolute_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+        let opt_dir = prefix.join("opt");
+
+        std::fs::create_dir_all(source.join("bin"))?;
+        std::os::unix::fs::symlink("/usr/bin/env", source.join("bin/bad-link"))?;
+
+        let result = materialize(&source, &keg_path, &opt_dir, "formula");
+        assert!(result.is_err(), "absolute symlink should be rejected");
         Ok(())
     }
 

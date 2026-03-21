@@ -26,11 +26,24 @@ pub fn make_writable(path: &Path) -> Result<(), std::io::Error> {
 /// Symlinked directories are not descended into.
 pub fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut files = Vec::new();
-    walk_files_inner(dir, &mut files)?;
+    walk_inner(dir, &mut files, false)?;
     Ok(files)
 }
 
-fn walk_files_inner(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
+/// Recursively collects all regular file **and symlink** paths under `dir`.
+///
+/// Symlinked directories are not descended into.
+pub fn walk_entries(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut entries = Vec::new();
+    walk_inner(dir, &mut entries, true)?;
+    Ok(entries)
+}
+
+fn walk_inner(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    include_symlinks: bool,
+) -> Result<(), std::io::Error> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => return Ok(()),
@@ -41,11 +54,10 @@ fn walk_files_inner(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), std::io:
         let path = entry.path();
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            walk_files_inner(&path, files)?;
-        } else if ft.is_file() {
-            files.push(path);
+            walk_inner(&path, out, include_symlinks)?;
+        } else if ft.is_file() || (include_symlinks && ft.is_symlink()) {
+            out.push(path);
         }
-        // Symlinks skipped — they point to other files handled directly.
     }
     Ok(())
 }

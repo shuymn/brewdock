@@ -23,9 +23,9 @@ pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             continue;
         }
 
-        let files = util::walk_files(&keg_subdir)?;
-        for file in files {
-            let relative = file
+        let entries = util::walk_entries(&keg_subdir)?;
+        for entry in entries {
+            let relative = entry
                 .strip_prefix(&keg_subdir)
                 .map_err(std::io::Error::other)?;
             let link_path = prefix.join(dir_name).join(relative);
@@ -47,7 +47,7 @@ pub fn link(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
                     .ok_or_else(|| CellarError::MissingParentDirectory {
                         path: link_path.clone(),
                     })?,
-                &file,
+                &entry,
             );
             std::os::unix::fs::symlink(rel_target, &link_path)?;
         }
@@ -69,9 +69,9 @@ pub fn unlink(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
             continue;
         }
 
-        let files = util::walk_files(&keg_subdir)?;
-        for file in files {
-            let relative = file
+        let entries = util::walk_entries(&keg_subdir)?;
+        for entry in entries {
+            let relative = entry
                 .strip_prefix(&keg_subdir)
                 .map_err(std::io::Error::other)?;
             let link_path = prefix.join(dir_name).join(relative);
@@ -312,6 +312,92 @@ mod tests {
         link(&keg_path, &prefix)?;
         assert!(prefix.join("bin/tool").is_symlink());
         assert!(!prefix.join("lib").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_includes_keg_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+
+        // Create a regular file and a symlink in the keg.
+        std::fs::create_dir_all(keg_path.join("bin"))?;
+        std::fs::write(keg_path.join("bin/tool"), "#!/bin/sh")?;
+        std::os::unix::fs::symlink("tool", keg_path.join("bin/tool-link"))?;
+
+        // Create a symlink in lib.
+        std::fs::create_dir_all(keg_path.join("lib"))?;
+        std::fs::write(keg_path.join("lib/libfoo.1.0.dylib"), "fake")?;
+        std::os::unix::fs::symlink("libfoo.1.0.dylib", keg_path.join("lib/libfoo.dylib"))?;
+
+        link(&keg_path, &prefix)?;
+
+        // Both the file and the symlink should have prefix links.
+        let tool_link = prefix.join("bin/tool");
+        assert!(tool_link.is_symlink(), "tool should be linked");
+        let tool_sym_link = prefix.join("bin/tool-link");
+        assert!(
+            tool_sym_link.is_symlink(),
+            "tool-link should also be linked into prefix"
+        );
+
+        let lib_link = prefix.join("lib/libfoo.dylib");
+        assert!(
+            lib_link.is_symlink(),
+            "libfoo.dylib symlink should be linked into prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_link_treats_symlinked_directory_as_leaf() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+
+        // Create a real directory with a file, and a symlink to that directory.
+        std::fs::create_dir_all(keg_path.join("lib/real_dir"))?;
+        std::fs::write(keg_path.join("lib/real_dir/file.txt"), "data")?;
+        std::os::unix::fs::symlink("real_dir", keg_path.join("lib/link_dir"))?;
+
+        link(&keg_path, &prefix)?;
+
+        // The file inside the real directory should be linked.
+        assert!(
+            prefix.join("lib/real_dir/file.txt").is_symlink(),
+            "file in real dir should be linked"
+        );
+        // The symlinked directory should be linked as a single symlink (leaf),
+        // not expanded into a directory tree.
+        let link_dir = prefix.join("lib/link_dir");
+        assert!(link_dir.is_symlink(), "link_dir should be a symlink");
+        assert!(
+            !prefix.join("lib/link_dir/file.txt").is_symlink(),
+            "should not descend into symlinked directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlink_removes_keg_symlink_links() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+
+        std::fs::create_dir_all(keg_path.join("bin"))?;
+        std::fs::write(keg_path.join("bin/tool"), "#!/bin/sh")?;
+        std::os::unix::fs::symlink("tool", keg_path.join("bin/tool-link"))?;
+
+        link(&keg_path, &prefix)?;
+        assert!(prefix.join("bin/tool-link").is_symlink());
+
+        unlink(&keg_path, &prefix)?;
+        assert!(!prefix.join("bin/tool").exists(), "tool should be unlinked");
+        assert!(
+            !prefix.join("bin/tool-link").exists(),
+            "tool-link should be unlinked"
+        );
         Ok(())
     }
 

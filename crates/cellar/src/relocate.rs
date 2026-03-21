@@ -469,4 +469,35 @@ Load command 16
         assert_eq!(result, "prefix=/opt/homebrew\n");
         Ok(())
     }
+
+    #[test]
+    fn test_relocate_keg_skips_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+        std::fs::create_dir_all(keg_path.join("lib"))?;
+
+        // Create a regular file with a placeholder.
+        std::fs::write(
+            keg_path.join("lib/config.pc"),
+            "prefix=@@HOMEBREW_PREFIX@@\n",
+        )?;
+        // Create a symlink. It should be untouched by relocation.
+        std::os::unix::fs::symlink("config.pc", keg_path.join("lib/config-link.pc"))?;
+
+        relocate_keg(&keg_path, &prefix)?;
+
+        // The regular file should be relocated.
+        let relocated = std::fs::read_to_string(keg_path.join("lib/config.pc"))?;
+        assert_eq!(relocated, format!("prefix={}\n", prefix.display()));
+
+        // The symlink should still be a symlink with original target.
+        let link = keg_path.join("lib/config-link.pc");
+        assert!(link.is_symlink(), "symlink should still be a symlink");
+        assert_eq!(
+            std::fs::read_link(&link)?,
+            std::path::PathBuf::from("config.pc")
+        );
+        Ok(())
+    }
 }
