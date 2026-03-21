@@ -23,19 +23,20 @@ Rust CLI (`bd`) that acts as a performance-oriented, Homebrew-coexisting client 
 - Command surface (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`) reuses shared metadata/install-state layers; new commands should follow the same pattern instead of introducing parallel architectures
 - Third-party taps remain out of scope for now, but metadata/cache boundaries and formula identity should not assume `homebrew/core` so rigidly that a future limited `tap/name` read/install path becomes an architectural rewrite
 - If Ruby execution is ever introduced as a compatibility escape hatch, it must remain an explicit last-resort, opt-in fallback with visible diagnostics/state markers rather than the default path
-- `unsafe_code` forbidden; `unwrap`/`expect`/`todo`/`dbg!` denied
+- `unsafe_code` denied (allowed only in `brewdock-sys` for FFI); `unwrap`/`expect`/`todo`/`dbg!` denied
 
 ## Core Boundaries
 
-5-crate workspace:
+6-crate workspace:
 
 ```
-cli → core → {formula, bottle, cellar}
+cli → core → {formula, bottle, cellar → sys}
 ```
 
 - `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve, metadata cache and index. No core dependency.
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
-- `brewdock-cellar`: materialize, receipt, relocation, linking, keg discovery, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only).
+- `brewdock-sys`: platform-specific FFI wrappers (macOS `clonefile(2)`). No other crate dependency. Only crate where `unsafe` is allowed.
+- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only) and sys (macOS only).
 - `brewdock-core`: Layout, platform (`HostTag` auto-detection), lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, diagnostics, and user-facing progress event emission. Depends on formula, bottle, cellar.
 - `brewdock-cli`: clap commands (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`), tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only.
 
@@ -45,32 +46,25 @@ Install orchestration is stage-driven via an explicit execution plan:
 
 ```mermaid
 flowchart TD
-    R[Resolve deps + select install method] --> PA
+    R[Resolve deps + select install method] --> AQ
 
-    subgraph PA ["Prefetch — concurrent (max 4)"]
+    subgraph AQ ["Acquire — streaming, concurrent (max 4)"]
         direction LR
-        PA1[Formula A: download + SHA256] ~~~ PA2[Formula B: download + SHA256] ~~~ PA3[...]
+        AQ1["Bottle: download → verify → store → extract → materialize → relocate"]
+        AQ2["Source: download → extract (build deferred)"]
     end
 
-    PA -->|barrier: all complete| LP
-
-    subgraph LP ["Local Prepare — concurrent (max 4)"]
-        direction LR
-        LP1["Bottle: extract → CAS store → relocation manifest"] ~~~ LP2["Source: deferred (no-op)"]
-    end
-
-    LP -->|barrier: all complete| FN
+    AQ -->|barrier: all complete| FN
 
     subgraph FN ["Finalize — sequential (topological order)"]
         direction TB
-        FN1["Bottle: materialize → relocate → receipt → link → post_install"]
-        FN2["Source: build → receipt → link → post_install"]
-        FN1 --> FN2
+        FN1["Bottle: post_install → receipt → link"]
+        FN2["Source: build → post_install → receipt → link"]
     end
 ```
 
-Each stage is a batch barrier: all formulae complete stage N before any enters stage N+1. Network acquire and local prepare use `buffer_unordered`/`buffered` with max concurrency of 4. Source builds skip local prepare via `defer-to-finalize` entries and run the actual build during finalize. Blob/store publication happens only after checksum-complete success. Finalize remains the only Homebrew-visible mutation boundary and runs sequentially in topological order to preserve dependency ordering.
-Bottle finalize derives a relocation manifest from extracted store payloads before materialization and reuses it after copy so finalize avoids a second full-tree relocation scan; `clonefile`-first copy remains deferred until it demonstrates enough additional gain to justify its macOS/filesystem-specific fallback surface.
+The acquire stage merges download and materialization into a single streaming step per formula via `buffer_unordered(4)`. Each formula flows through its full acquire pipeline independently; as one formula's download completes, its materialization starts immediately rather than waiting for all downloads to finish. Source builds defer the actual build to finalize. Blob/store publication happens only after checksum-complete success. Finalize remains the only Homebrew-visible mutation boundary and runs sequentially in topological order to preserve dependency ordering.
+Bottle acquire derives a relocation manifest from extracted store payloads before materialization and reuses it after copy so the acquire step avoids a second full-tree relocation scan; `clonefile`-first copy remains deferred until it demonstrates enough additional gain to justify its macOS/filesystem-specific fallback surface.
 User-facing terminal output is not derived from the `tracing` subscriber. `brewdock-core` emits explicit progress events for CLI consumption, while `tracing` remains reserved for diagnostics and benchmark capture.
 
 Each crate owns a `thiserror` error enum. Core aggregates with `#[from]`.

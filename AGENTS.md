@@ -11,8 +11,8 @@
 - Focused test run: `cargo test -p brewdock-core -- layout`, `cargo test -p brewdock-formula -- types`, etc.
 - VM smoke test: `./tests/vm-smoke-test.sh [--keep] [--formula <name> ...]` runs destructive install verification inside a disposable Tart macOS VM so the local `/opt/homebrew` environment is not modified; prerequisites live in [tests/vm-smoke-test.sh](tests/vm-smoke-test.sh)
 - Prefer `cargo add` / editing `Cargo.toml` for dependencies; run `cargo build` or `task build` after manifest changes
-- `unsafe_code` is **forbidden** and `unwrap`/`expect`/`todo`/`dbg!` are **denied** via workspace `[lints]` — applies to all code including tests
-- 5-crate workspace: `brewdock-cli` (bin: `bd`), `brewdock-core`, `brewdock-formula`, `brewdock-bottle`, `brewdock-cellar` — see [docs/architecture.md](docs/architecture.md)
+- `unsafe_code` is **denied** via workspace `[lints]` and allowed only in `brewdock-sys` (FFI wrappers); `unwrap`/`expect`/`todo`/`dbg!` are **denied** — applies to all code including tests
+- 6-crate workspace: `brewdock-cli` (bin: `bd`), `brewdock-core`, `brewdock-formula`, `brewdock-bottle`, `brewdock-cellar`, `brewdock-sys` — see [docs/architecture.md](docs/architecture.md)
 
 ## Git Conventions
 
