@@ -13,16 +13,33 @@ const MH_MAGIC_64: [u8; 4] = [0xCF, 0xFA, 0xED, 0xFE];
 /// Fat binary magic (big-endian).
 const FAT_MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBA, 0xBE];
 
+/// Controls which relocation steps [`relocate_keg`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocationScope {
+    /// Replace `@@HOMEBREW_*@@` text placeholders only; skip Mach-O binary
+    /// relocation via `install_name_tool`.
+    ///
+    /// Used for bottles with `cellar: :any_skip_relocation`.
+    TextOnly,
+    /// Replace text placeholders **and** patch Mach-O load commands.
+    Full,
+}
+
 /// Rewrites `@@HOMEBREW_*@@` placeholders in all files under `keg_path`.
 ///
-/// - Mach-O binaries: uses `install_name_tool` to patch `LC_ID_DYLIB`,
-///   `LC_LOAD_DYLIB`, and `LC_RPATH` entries.
-/// - Text/data files: performs an in-place byte replacement.
+/// - When `scope` is [`RelocationScope::Full`], Mach-O binaries are patched
+///   with `install_name_tool` and text/data files undergo byte replacement.
+/// - When `scope` is [`RelocationScope::TextOnly`], Mach-O binaries are
+///   skipped and only text/data files are processed.
 ///
 /// # Errors
 ///
 /// Returns [`CellarError::Io`] on filesystem or subprocess failure.
-pub fn relocate_keg(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
+pub fn relocate_keg(
+    keg_path: &Path,
+    prefix: &Path,
+    scope: RelocationScope,
+) -> Result<(), CellarError> {
     let cellar = prefix.join("Cellar");
     let prefix_str = path_str(prefix)?.to_owned();
     let cellar_str = path_str(&cellar)?.to_owned();
@@ -45,7 +62,9 @@ pub fn relocate_keg(keg_path: &Path, prefix: &Path) -> Result<(), CellarError> {
         }
 
         if is_macho(&data) {
-            relocate_macho(&file, &replacements)?;
+            if scope == RelocationScope::Full {
+                relocate_macho(&file, &replacements)?;
+            }
         } else {
             relocate_text_file(&file, &data, &replacements)?;
         }
@@ -485,7 +504,7 @@ Load command 16
         // Create a symlink. It should be untouched by relocation.
         std::os::unix::fs::symlink("config.pc", keg_path.join("lib/config-link.pc"))?;
 
-        relocate_keg(&keg_path, &prefix)?;
+        relocate_keg(&keg_path, &prefix, RelocationScope::Full)?;
 
         // The regular file should be relocated.
         let relocated = std::fs::read_to_string(keg_path.join("lib/config.pc"))?;
@@ -498,6 +517,42 @@ Load command 16
             std::fs::read_link(&link)?,
             std::path::PathBuf::from("config.pc")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_relocate_keg_text_only_replaces_text_but_skips_macho()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+        std::fs::create_dir_all(keg_path.join("bin"))?;
+        std::fs::create_dir_all(keg_path.join("lib"))?;
+
+        // Text file with placeholder — should be relocated.
+        std::fs::write(
+            keg_path.join("bin/tool"),
+            "#!@@HOMEBREW_PREFIX@@/bin/python3\n",
+        )?;
+
+        // Fake Mach-O file (magic bytes + placeholder in "load command").
+        let mut macho_data = MH_MAGIC_64.to_vec();
+        macho_data.extend_from_slice(b"@@HOMEBREW_PREFIX@@/lib/libfoo.dylib");
+        std::fs::write(keg_path.join("lib/libfoo.dylib"), &macho_data)?;
+
+        relocate_keg(&keg_path, &prefix, RelocationScope::TextOnly)?;
+
+        // Text file should have placeholders replaced.
+        let text = std::fs::read_to_string(keg_path.join("bin/tool"))?;
+        assert_eq!(text, format!("#!{}/bin/python3\n", prefix.display()));
+
+        // Mach-O file should be untouched (no install_name_tool called).
+        let macho = std::fs::read(keg_path.join("lib/libfoo.dylib"))?;
+        assert_eq!(
+            macho, macho_data,
+            "Mach-O file must not be modified in TextOnly mode"
+        );
+
         Ok(())
     }
 }

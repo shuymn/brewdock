@@ -24,4 +24,4 @@ pub use receipt::{
     InstallReason, InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
     write_receipt,
 };
-pub use relocate::relocate_keg;
+pub use relocate::{RelocationScope, relocate_keg};

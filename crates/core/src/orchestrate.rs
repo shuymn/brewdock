@@ -8,9 +8,9 @@ use std::{
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
     InstallReason, InstallReceipt, InstalledKeg, PostInstallContext, PostInstallTransaction,
-    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, atomic_symlink_replace,
-    discover_installed_kegs, find_installed_keg, link, materialize, relocate_keg, run_post_install,
-    unlink, validate_post_install, write_receipt,
+    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, RelocationScope,
+    atomic_symlink_replace, discover_installed_kegs, find_installed_keg, link, materialize,
+    relocate_keg, run_post_install, unlink, validate_post_install, write_receipt,
 };
 use brewdock_formula::{
     CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
@@ -546,9 +546,12 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 let source = extract_dir.join(&formula.name).join(&version_str);
                 let keg_path = self.layout.cellar().join(&formula.name).join(&version_str);
                 materialize(&source, &keg_path, &self.layout.opt_dir(), &formula.name)?;
-                if !matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
-                    relocate_keg(&keg_path, self.layout.prefix())?;
-                }
+                let scope = if matches!(selected_bottle.cellar, CellarType::AnySkipRelocation) {
+                    RelocationScope::TextOnly
+                } else {
+                    RelocationScope::Full
+                };
+                relocate_keg(&keg_path, self.layout.prefix(), scope)?;
                 Ok(keg_path)
             }
             InstallMethod::Source(plan) => self.install_source_formula(formula, plan).await,
@@ -2491,7 +2494,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_any_skip_relocation_bottle_skips_relocation()
+    async fn test_install_any_skip_relocation_bottle_succeeds()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2516,6 +2519,56 @@ install:
         assert_eq!(installed, vec!["skip-reloc"]);
         assert!(layout.cellar().join("skip-reloc/1.0/bin/tool").exists());
         assert!(layout.opt_dir().join("skip-reloc").is_symlink());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_any_skip_relocation_bottle_relocates_text_placeholders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let mut formula = make_formula("pytools", "3.0", &[], sha);
+        set_bottle_cellar(&mut formula, CellarType::AnySkipRelocation);
+
+        let shebang = b"#!@@HOMEBREW_PREFIX@@/bin/python3\nimport sys\n";
+        let pth = b"@@HOMEBREW_CELLAR@@/pytools/3.0/lib/python3\n";
+        let tar = create_bottle_tar_gz(
+            "pytools",
+            "3.0",
+            &[("bin/tool", shebang), ("lib/python3/site.pth", pth)],
+        )?;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![formula],
+            vec![(sha, tar)],
+            counter.clone(),
+            layout.clone(),
+        )?;
+
+        orchestrator.install(&["pytools"]).await?;
+
+        let installed_shebang =
+            std::fs::read_to_string(layout.cellar().join("pytools/3.0/bin/tool"))?;
+        assert_eq!(
+            installed_shebang,
+            format!("#!{}/bin/python3\nimport sys\n", layout.prefix().display(),),
+            "text placeholders in shebang must be replaced for any_skip_relocation bottles",
+        );
+
+        let installed_pth =
+            std::fs::read_to_string(layout.cellar().join("pytools/3.0/lib/python3/site.pth"))?;
+        assert_eq!(
+            installed_pth,
+            format!(
+                "{}/Cellar/pytools/3.0/lib/python3\n",
+                layout.prefix().display()
+            ),
+            "text placeholders in .pth must be replaced for any_skip_relocation bottles",
+        );
+
         Ok(())
     }
 }
