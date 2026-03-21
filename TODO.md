@@ -373,7 +373,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: executor split だけ先に入れても `ExecutionPlan` と rollback closure が揃わなければ、source path 編入の入口条件も user-visible latency 改善も固定できない
   - Escalate if: pre-finalize で分離した local prepare が opt / Cellar mutation と実質的に競合し、finalize boundary の再定義が必要になる場合
 
-- [ ] Theme: Bounded network acquire for bottle prefetch
+- [x] Theme: Bounded network acquire for bottle prefetch
   - Outcome: multi-formula bottle install で `prefetch-payload` / `download-bottle` が bounded concurrency と fail-closed persistence contract の下で短縮され、`install-jq-wget` の wall bottleneck が network-heavy でも replay 可能に改善する
   - Goal: `ExecutionPlan` の pre-finalize acquire 側に明示的な download concurrency と persistence ownership を入れ、Homebrew-visible state を触らずに bottle fetch wall を減らす
   - Must Not Break: finalize boundary を壊さない; blob/store は incomplete payload を publish しない; checksum verification と fail-closed policy を弱めない; warm-path hit と rollback 成功系を壊さない; `task check` green
