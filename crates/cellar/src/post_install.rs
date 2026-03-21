@@ -1048,6 +1048,8 @@ fn lower_call_statement<'pr>(
                 helper_stack,
             )?)])
         }
+        // Homebrew logging helpers — purely informational, safe to ignore.
+        "ohai" | "opoo" | "odebug" => Ok(vec![]),
         helper if methods.contains_key(helper) => {
             lower_method(helper, parsed, methods, helper_stack, formula_version)
         }
@@ -2180,6 +2182,34 @@ end
 
         validate_post_install(ruby_source, "3.4.2")?;
         validate_post_install(node_source, "22.0.0")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_ignores_ohai_logging() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/fontconfig/2.16.0");
+        std::fs::create_dir_all(keg.join("bin"))?;
+        std::fs::write(keg.join("bin/fc-cache"), "#!/bin/sh\ntrue\n")?;
+        let mut perms = std::fs::metadata(keg.join("bin/fc-cache"))?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(keg.join("bin/fc-cache"), perms)?;
+
+        let source = r#"
+class Fontconfig < Formula
+  def post_install
+    ohai "Regenerating font cache, this may take a while"
+    system bin/"fc-cache", "--force"
+  end
+end
+"#;
+
+        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "2.16.0"))?.commit()?;
         Ok(())
     }
 }
