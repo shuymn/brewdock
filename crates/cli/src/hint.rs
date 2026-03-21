@@ -47,7 +47,7 @@ mod tests {
     #[test]
     fn test_hint_for_formula_not_found() {
         let err: anyhow::Error = BrewdockError::Formula(FormulaError::NotFound {
-            name: "missing".to_owned(),
+            name: brewdock_formula::FormulaName::from("missing"),
         })
         .into();
         let hint = for_error(&err);

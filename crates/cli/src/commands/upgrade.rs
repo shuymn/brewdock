@@ -3,6 +3,8 @@ use std::fmt::Write;
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator, UpgradePlanEntry};
 
+use crate::Verbosity;
+
 /// Runs the upgrade command.
 ///
 /// # Errors
@@ -12,7 +14,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     orchestrator: &Orchestrator<R, D>,
     formulae: &[String],
     dry_run: bool,
-    quiet: bool,
+    verbosity: Verbosity,
 ) -> Result<()> {
     let formula_names: Vec<&str> = formulae.iter().map(String::as_str).collect();
 
@@ -21,7 +23,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
             .plan_upgrade(&formula_names)
             .await
             .context("upgrade planning failed")?;
-        if !quiet {
+        if !verbosity.is_quiet() {
             print!("{}", render_upgrade_plan(&plan));
         }
         return Ok(());
@@ -31,7 +33,7 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
         .upgrade(&formula_names)
         .await
         .context("upgrade failed")?;
-    if !quiet {
+    if !verbosity.is_quiet() {
         if upgraded.is_empty() {
             println!("Already up-to-date");
         } else {
@@ -86,7 +88,7 @@ mod tests {
         let orchestrator =
             make_orchestrator(vec![formula], vec![(SHA_C, tar)], counter, layout.clone())?;
 
-        run(&orchestrator, &["a".to_owned()], false, false).await?;
+        run(&orchestrator, &["a".to_owned()], false, Verbosity::Normal).await?;
 
         assert!(layout.cellar().join("a/2.0/bin/a_tool").exists());
         Ok(())
@@ -104,7 +106,7 @@ mod tests {
         let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
 
         // Should succeed without error (nothing to upgrade).
-        run(&orchestrator, &["a".to_owned()], false, false).await?;
+        run(&orchestrator, &["a".to_owned()], false, Verbosity::Normal).await?;
         Ok(())
     }
 
@@ -127,7 +129,7 @@ mod tests {
             layout.clone(),
         )?;
 
-        run(&orchestrator, &["a".to_owned()], true, false).await?;
+        run(&orchestrator, &["a".to_owned()], true, Verbosity::Normal).await?;
 
         // dry_run: new version not installed
         assert!(!layout.cellar().join("a/2.0").exists());

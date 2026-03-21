@@ -9,8 +9,8 @@ use std::{
 use brewdock_bottle::BottleError;
 use brewdock_core::{BottleDownloader, FormulaRepository, HostTag, Layout, Orchestrator};
 use brewdock_formula::{
-    BottleFile, BottleSpec, BottleStable, CellarType, Formula, FormulaError, FormulaUrls,
-    StableUrl, Versions,
+    BottleFile, BottleSpec, BottleStable, CellarType, Formula, FormulaError, FormulaName,
+    FormulaUrls, StableUrl, Versions,
 };
 
 pub const HOST_TAG: &str = "arm64_sequoia";
@@ -34,25 +34,25 @@ impl MockRepo {
 }
 
 impl FormulaRepository for MockRepo {
-    async fn get_formula(&self, name: &str) -> Result<Formula, FormulaError> {
+    async fn formula(&self, name: &str) -> Result<Formula, FormulaError> {
         self.formulae
             .get(name)
             .cloned()
             .ok_or_else(|| FormulaError::NotFound {
-                name: name.to_owned(),
+                name: FormulaName::from(name),
             })
     }
 
-    async fn get_all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
+    async fn all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
         Ok(self.formulae.values().cloned().collect())
     }
 
-    async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
+    async fn ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
         self.ruby_sources
             .get(ruby_source_path)
             .cloned()
             .ok_or_else(|| FormulaError::NotFound {
-                name: ruby_source_path.to_owned(),
+                name: FormulaName::from(ruby_source_path),
             })
     }
 }

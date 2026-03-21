@@ -6,10 +6,13 @@ use clap::Parser;
 
 mod commands;
 mod hint;
-pub mod trace;
+mod trace;
+mod verbosity;
 
 #[cfg(test)]
 mod testutil;
+
+pub(crate) use verbosity::Verbosity;
 
 /// Fast Homebrew bottle installer.
 #[derive(Parser)]
@@ -29,6 +32,18 @@ struct Cli {
     /// Suppress non-error output.
     #[arg(long, global = true, conflicts_with = "verbose")]
     quiet: bool,
+}
+
+impl Cli {
+    const fn verbosity(&self) -> Verbosity {
+        if self.verbose {
+            Verbosity::Verbose
+        } else if self.quiet {
+            Verbosity::Quiet
+        } else {
+            Verbosity::Normal
+        }
+    }
 }
 
 #[derive(clap::Subcommand)]
@@ -52,7 +67,8 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    trace::init_tracing(cli.verbose, cli.quiet).context("tracing init failed")?;
+    let verbosity = cli.verbosity();
+    trace::init_tracing(verbosity).context("tracing init failed")?;
 
     let layout = Layout::production();
     let host_tag = HostTag::detect().context("platform detection failed")?;
@@ -62,18 +78,17 @@ async fn main() -> Result<()> {
         layout,
         host_tag,
     );
-
     let result = match cli.command {
         Commands::Install { formulae } => {
-            commands::install::run(&orchestrator, &formulae, cli.dry_run, cli.quiet).await
+            commands::install::run(&orchestrator, &formulae, cli.dry_run, verbosity).await
         }
-        Commands::Update => commands::update::run(&orchestrator, cli.dry_run, cli.quiet).await,
+        Commands::Update => commands::update::run(&orchestrator, cli.dry_run, verbosity).await,
         Commands::Upgrade { formulae } => {
             Box::pin(commands::upgrade::run(
                 &orchestrator,
                 &formulae,
                 cli.dry_run,
-                cli.quiet,
+                verbosity,
             ))
             .await
         }
@@ -163,16 +178,14 @@ mod tests {
     #[test]
     fn test_verbose_flag_parsed() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["bd", "--verbose", "install", "jq"])?;
-        assert!(cli.verbose);
-        assert!(!cli.quiet);
+        assert_eq!(cli.verbosity(), Verbosity::Verbose);
         Ok(())
     }
 
     #[test]
     fn test_quiet_flag_parsed() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["bd", "--quiet", "install", "jq"])?;
-        assert!(cli.quiet);
-        assert!(!cli.verbose);
+        assert_eq!(cli.verbosity(), Verbosity::Quiet);
         Ok(())
     }
 

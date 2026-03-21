@@ -5,6 +5,8 @@ use tracing_subscriber::{
     fmt::{self, format::FmtSpan},
 };
 
+use crate::Verbosity;
+
 const BENCHMARK_FILE_ENV: &str = "BREWDOCK_BENCHMARK_FILE";
 
 /// Initializes tracing output for normal CLI runs and benchmark captures.
@@ -13,8 +15,8 @@ const BENCHMARK_FILE_ENV: &str = "BREWDOCK_BENCHMARK_FILE";
 ///
 /// Returns an error when benchmark tracing is enabled and the configured output
 /// file cannot be opened for append.
-pub fn init_tracing(verbose: bool, quiet: bool) -> Result<(), std::io::Error> {
-    let subscriber = subscriber(verbose, quiet)?;
+pub fn init_tracing(verbosity: Verbosity) -> Result<(), std::io::Error> {
+    let subscriber = subscriber(verbosity)?;
 
     // Intentionally discard: fails harmlessly if a subscriber is already set (e.g., in tests).
     let _ = tracing::subscriber::set_global_default(subscriber);
@@ -22,10 +24,9 @@ pub fn init_tracing(verbose: bool, quiet: bool) -> Result<(), std::io::Error> {
 }
 
 fn subscriber(
-    verbose: bool,
-    quiet: bool,
+    verbosity: Verbosity,
 ) -> Result<Box<dyn tracing::Subscriber + Send + Sync>, std::io::Error> {
-    let filter = env_filter(verbose, quiet);
+    let filter = env_filter(verbosity);
 
     if let Some(path) = benchmark_log_path() {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -35,13 +36,11 @@ fn subscriber(
     }
 }
 
-fn env_filter(verbose: bool, quiet: bool) -> EnvFilter {
-    let level = if verbose {
-        "debug"
-    } else if quiet {
-        "error"
-    } else {
-        "info"
+fn env_filter(verbosity: Verbosity) -> EnvFilter {
+    let level = match verbosity {
+        Verbosity::Verbose => "debug",
+        Verbosity::Normal => "info",
+        Verbosity::Quiet => "error",
     };
 
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level))

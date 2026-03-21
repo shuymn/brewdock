@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 
+use crate::Verbosity;
+
 /// Runs the update command.
 ///
 /// # Errors
@@ -9,17 +11,17 @@ use brewdock_core::{BottleDownloader, FormulaRepository, Orchestrator};
 pub async fn run<R: FormulaRepository, D: BottleDownloader>(
     orchestrator: &Orchestrator<R, D>,
     dry_run: bool,
-    quiet: bool,
+    verbosity: Verbosity,
 ) -> Result<()> {
     if dry_run {
-        if !quiet {
+        if !verbosity.is_quiet() {
             println!("Would update formula index");
         }
         return Ok(());
     }
 
     let count = orchestrator.update().await.context("update failed")?;
-    if !quiet {
+    if !verbosity.is_quiet() {
         println!("Updated {count} formulae");
     }
     Ok(())
@@ -46,7 +48,7 @@ mod tests {
         let orchestrator =
             make_orchestrator(vec![formula_a, formula_b], vec![], counter, layout.clone())?;
 
-        run(&orchestrator, false, false).await?;
+        run(&orchestrator, false, Verbosity::Normal).await?;
 
         let cache_path = layout.cache_dir().join("formula.json");
         assert!(cache_path.exists());
@@ -66,7 +68,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
 
-        run(&orchestrator, true, false).await?;
+        run(&orchestrator, true, Verbosity::Normal).await?;
 
         let cache_path = layout.cache_dir().join("formula.json");
         assert!(!cache_path.exists(), "dry-run should not cache");
