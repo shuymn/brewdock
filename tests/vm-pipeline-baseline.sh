@@ -26,7 +26,6 @@ SSH_KEY=""
 VM_IP=""
 MOUNT_PATH="/Volumes/My Shared Files/brewdock"
 RESULTS=()
-COPY_STRATEGY_SAMPLE_DIR=""
 
 log()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 pass() { printf '\033[1;32m  PASS: %s\033[0m\n' "$*"; }
@@ -205,45 +204,6 @@ prepare_upgrade_fixture() {
   [ -n "$real_version" ] || fail "could not determine jq version for upgrade fixture"
   vm_ssh "mv /opt/homebrew/Cellar/jq/$real_version /opt/homebrew/Cellar/jq/0.0.0-fake && ln -sfn ../Cellar/jq/0.0.0-fake /opt/homebrew/opt/jq"
   pass "Upgrade fixture ready"
-}
-
-capture_copy_strategy_samples() {
-  COPY_STRATEGY_SAMPLE_DIR="$SHARE_DIR/copy-strategy-samples"
-  rm -rf "$COPY_STRATEGY_SAMPLE_DIR"
-  mkdir -p "$COPY_STRATEGY_SAMPLE_DIR"
-
-  log "Capturing representative extracted bottles for copy-strategy spike"
-  vm_ssh "
-    set -euo pipefail
-    STORE_ROOT='/opt/homebrew/var/brewdock/store'
-    DEST_ROOT='$MOUNT_PATH/copy-strategy-samples'
-    mkdir -p \"\$DEST_ROOT\"
-    for formula in jq wget; do
-      version_dir=\$(find \"\$STORE_ROOT\" -mindepth 3 -maxdepth 3 -type d -path \"*/\${formula}/*\" | head -1)
-      [ -n \"\$version_dir\" ] || {
-        echo \"missing extracted store dir for \$formula\" >&2
-        exit 1
-      }
-      rm -rf \"\$DEST_ROOT/\$formula\"
-      mkdir -p \"\$DEST_ROOT/\$formula\"
-      tar -C \"\$version_dir\" -cf - . | tar -C \"\$DEST_ROOT/\$formula\" -xf -
-    done
-  "
-  pass "Copy-strategy samples copied to $COPY_STRATEGY_SAMPLE_DIR"
-}
-
-run_copy_strategy_spike() {
-  local output_path="$SHARE_DIR/copy-strategy-spike.md"
-  [ -d "$COPY_STRATEGY_SAMPLE_DIR" ] || fail "copy-strategy sample dir missing"
-
-  log "Running host-side copy-strategy spike benchmark"
-  BREWDOCK_COPY_STRATEGY_SPIKE_ROOT="$COPY_STRATEGY_SAMPLE_DIR" \
-    BREWDOCK_COPY_STRATEGY_SPIKE_RUNS="$RUNS" \
-    BREWDOCK_COPY_STRATEGY_SPIKE_OUTPUT="$output_path" \
-    cargo test -p brewdock-cellar copy_strategy_spike_benchmark -- --ignored >/dev/null
-
-  [ -f "$output_path" ] || fail "copy-strategy spike output missing"
-  cat "$output_path"
 }
 
 render_markdown() {
@@ -551,9 +511,6 @@ for run_index in $(seq 1 "$RUNS"); do
 
   prepare_clean_prefix
   run_scenario "$run_index" "install-jq-wget" "/tmp/bd install jq wget"
-  if [ "$run_index" -eq "$RUNS" ]; then
-    capture_copy_strategy_samples
-  fi
 
   prepare_clean_prefix
   prepare_upgrade_fixture
@@ -561,10 +518,6 @@ for run_index in $(seq 1 "$RUNS"); do
 done
 
 markdown=$(render_markdown)
-spike_markdown=$(run_copy_strategy_spike)
-markdown="${markdown}
-
-${spike_markdown}"
 printf '%s\n' "$markdown"
 
 if [ -n "$OUTPUT_PATH" ]; then
