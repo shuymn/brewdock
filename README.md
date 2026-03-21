@@ -1,6 +1,6 @@
 # brewdock
 
-`brewdock` is an experimental Rust CLI (`bd`) for installing Homebrew `homebrew/core` formulae into `/opt/homebrew` on Apple Silicon macOS. It prefers stable bottles and falls back to a minimal source build path when needed.
+An experimental Rust CLI for fast Homebrew bottle installation on Apple Silicon macOS. It installs `homebrew/core` formulae directly into `/opt/homebrew` and coexists with an existing Homebrew environment.
 
 > [!WARNING]
 > This is a hobby project.
@@ -8,109 +8,85 @@
 > Do not use it for practical, production, or machine-critical purposes.
 > If you care about keeping your Homebrew installation healthy, use Homebrew itself.
 
-## Status
+## What it does
 
-- Target platform: Apple Silicon macOS with `/opt/homebrew`
-- Scope: `homebrew/core` formulae only
-- Non-goals: casks, external taps, Linux runtime, Intel Mac runtime, compatibility with full Homebrew Formula DSL
+brewdock (`bd`) installs and manages `homebrew/core` formulae without going through Homebrew itself. It reuses Homebrew's ecosystem — the JSON API, pre-built bottles, and on-disk layout — while reimplementing the install pipeline natively in Rust for speed.
+
+- **Bottle-first install**: Fetches, verifies, and extracts pre-built binaries with host-tag fallback. Falls back to generic source builds (cmake/configure/meson/make) when no compatible bottle exists.
+- **Homebrew coexistence**: Installs land in the same Cellar/opt/bin layout Homebrew uses. Formulae installed by `bd` are visible to `brew` and vice versa.
+- **Ruby-free post_install**: Parses formula Ruby source via `ruby-prism` AST analysis and executes only allowlisted operations natively — no Ruby runtime dependency.
+- **Staged pipeline**: Executes in three phases — network acquire, local prepare, finalize — with bounded concurrency for the first two. Homebrew-visible mutations happen only at finalize.
+- **Content-addressable storage**: Manages downloaded bottles by SHA256, providing a foundation for deduplication and warm-path optimization.
+
+## Scope
+
+- Target: Apple Silicon macOS (`/opt/homebrew`)
+- `homebrew/core` formulae only
+- Non-goals: casks, external taps, Linux/Intel runtime, full Homebrew Formula DSL compatibility
 
 ## Usage
 
-Once `bd` is available on your `PATH`, use it directly:
-
 ```bash
-bd --help
+bd install jq wget    # Install formulae
+bd update             # Update formula index
+bd upgrade            # Upgrade all installed formulae
+bd outdated           # Show outdated formulae
+bd search <pattern>   # Search available formulae
+bd info <formula>     # Show formula details
+bd list               # List installed formulae
+bd cleanup            # Remove stale caches
+bd doctor             # Check for problems
 ```
 
-Main commands:
-
-```bash
-# Update formula index
-bd update
-
-# Install formulae
-bd install jq wget
-
-# Upgrade everything currently installed by brewdock
-bd upgrade
-
-# Upgrade specific formulae
-bd upgrade jq
-```
-
-Useful global flags:
-
-```bash
-# Preview actions without executing
-bd --dry-run install jq
-
-# Progress UI plus detailed phase messages
-bd --verbose install jq
-
-# Errors only
-bd --quiet install jq
-```
-
-Normal interactive runs use an `indicatif`-style progress UI for long-running commands (`install`, `update`, `upgrade`). When stderr is not a TTY, brewdock automatically falls back to plain line-oriented output so pipes and CI logs stay readable. Benchmark tracing via `BREWDOCK_BENCHMARK_FILE` is unchanged.
+`--dry-run`, `--verbose`, `--quiet` flags are available globally.
 
 ## Local Development
 
 This repository uses the toolchain pinned in `rust-toolchain.toml`.
 
-For development, run the CLI via Task or Cargo:
-
 ```bash
 task run -- --help
-cargo run -p brewdock-cli -- --help
-```
-
-```bash
 task build
-task build:release
 task test
 task lint
 task fmt
-task check
-task bench:vm -- --formula tree
+task check          # fmt + lint + test + doc + build
+task check:fast     # fmt + lint + build (no tests/docs)
 ```
 
 Rust-native equivalents:
 
 ```bash
 cargo build --workspace --locked
-cargo build --workspace --release --locked
 cargo test --workspace --all-targets --all-features --locked
-cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo doc --workspace --no-deps
+cargo fmt --all -- --check
 ```
 
-Optional: install [Lefthook](https://github.com/evilmartians/lefthook) and enable git hooks.
+Optional: install [Lefthook](https://github.com/evilmartians/lefthook) for git hooks (`lefthook install`).
 
-```bash
-lefthook install
-```
-
-For destructive runtime validation and comparative benchmarks, use the VM scripts so the local `/opt/homebrew` tree is not touched:
+VM-based validation (keeps local `/opt/homebrew` untouched):
 
 ```bash
 ./tests/vm-smoke-test.sh --formula jq
 ./tests/vm-benchmark.sh --formula tree --manager brewdock --manager homebrew
-./tests/vm-benchmark.sh --formula-set jq,wget
-./tests/vm-pipeline-baseline.sh --runs 3 --output docs/pipeline-baseline.md
+task bench:pipeline -- --runs 3 --output docs/pipeline-baseline.md
 ```
 
 ## Repository Layout
 
-- `crates/cli`: CLI entrypoint
-- `crates/core`: orchestration, layout, install flow
-- `crates/formula`: formula metadata and resolution
-- `crates/bottle`: bottle download, verification, extraction
-- `crates/cellar`: cellar materialization, linking, receipts, state
+5-crate workspace: `cli → core → {formula, bottle, cellar}`
+
+- `crates/cli`: CLI entrypoint (`bd`), argument parsing, progress rendering
+- `crates/core`: orchestration, layout, platform detection, install/upgrade flow
+- `crates/formula`: formula types, Homebrew JSON API client, bottle selection, dependency resolution, metadata cache
+- `crates/bottle`: bottle download, SHA256 verification, tar.gz extraction, content-addressable blob store
+- `crates/cellar`: keg materialization, binary relocation, symlink linking, install receipts, post_install execution, SQLite state
 
 ## Docs
 
-- [docs/architecture.md](docs/architecture.md)
-- [docs/coding.md](docs/coding.md)
-- [docs/testing.md](docs/testing.md)
-- [docs/tooling.md](docs/tooling.md)
+- [docs/architecture.md](docs/architecture.md) — crate boundaries, design decisions, constraints
+- [docs/coding.md](docs/coding.md) — Rust conventions, error handling, API design
+- [docs/testing.md](docs/testing.md) — test organization, VM scripts
+- [docs/tooling.md](docs/tooling.md) — Task interface, CI, hooks, Clippy policy
+- [docs/review.md](docs/review.md) — code review checklist
