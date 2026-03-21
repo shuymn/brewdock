@@ -259,6 +259,18 @@ mod tests {
     use super::*;
     use crate::test_support::test_formula;
 
+    fn minimal_formula_json(uses_from_macos: &str) -> String {
+        format!(
+            r#"{{
+            "name": "adversarial",
+            "full_name": "adversarial",
+            "versions": {{ "stable": "1.0.0", "head": null, "bottle": true }},
+            "pour_bottle_only_if": null,
+            "uses_from_macos": {uses_from_macos}
+        }}"#
+        )
+    }
+
     fn detailed_dependency(name: &str, contexts: &[&str]) -> MacOsDependency {
         MacOsDependency::Detailed(MacOsDependencyDetail {
             name: name.to_owned(),
@@ -492,5 +504,24 @@ mod tests {
                 .is_some_and(|stable| stable.files.contains_key("arm64_tahoe"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_deserialize_rejects_empty_uses_from_macos_object() {
+        let result: Result<Formula, _> = serde_json::from_str(&minimal_formula_json("[{}]"));
+        assert!(
+            result.is_err(),
+            "empty uses_from_macos object must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_multi_entry_uses_from_macos_object() {
+        let result: Result<Formula, _> =
+            serde_json::from_str(&minimal_formula_json(r#"[{"zlib":"build","curl":"test"}]"#));
+        assert!(
+            result.is_err(),
+            "multi-entry uses_from_macos object must fail closed"
+        );
     }
 }
