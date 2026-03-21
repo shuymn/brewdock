@@ -26,7 +26,7 @@
 #   2. Clones a disposable VM from the base image
 #   3. Boots the VM with a shared directory containing the keypair and binary
 #   4. Installs the public key into the VM via the mount, then uses key auth
-#   5. Runs: bd update -> installability sweep -> jq deep verification -> bd --dry-run
+#   5. Runs: bd update -> installability sweep -> deep verification (if jq requested) -> bd --dry-run
 #   6. Destroys the VM (unless --keep is passed)
 #
 set -euo pipefail
@@ -160,6 +160,11 @@ should_run_phase() {
     return 0
   fi
   printf '%s\n' "${PHASES[@]}" | grep -qx "$phase"
+}
+
+# Returns 0 if the formula is in the FORMULAE list.
+is_formula_requested() {
+  printf '%s\n' "${FORMULAE[@]}" | grep -qx "$1"
 }
 
 record_install_result() {
@@ -525,6 +530,8 @@ fi
 
 # --- Test: jq deep verification ----------------------------------------------
 
+if is_formula_requested "$PRIMARY_FORMULA"; then
+
 if printf '%s\n' "${FAILED_FORMULAE[@]}" | grep -qx "$PRIMARY_FORMULA"; then
   fail "$PRIMARY_FORMULA installability failed; skipping deep verification"
 fi
@@ -557,6 +564,10 @@ log "Verifying: oniguruma dependency installed"
 vm_ssh "test -d /opt/homebrew/Cellar/oniguruma" || fail "dependency oniguruma not installed"
 pass "oniguruma dependency present"
 
+else
+  log "Skipping $PRIMARY_FORMULA deep verification (not in --formula list)"
+fi
+
 fi # install phase
 
 # --- Test: bd upgrade (already up-to-date) -----------------------------------
@@ -574,52 +585,54 @@ fi
 
 # --- Test: bd upgrade (actual version bump) ----------------------------------
 
-log "Faking old jq version by renaming keg directory..."
-REAL_JQ_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/jq/ | head -1")
-vm_ssh "mv /opt/homebrew/Cellar/jq/$REAL_JQ_VERSION /opt/homebrew/Cellar/jq/0.0.0-fake"
-vm_ssh "ln -sfn ../Cellar/jq/0.0.0-fake /opt/homebrew/opt/jq"
-FAKED=$(vm_ssh "ls /opt/homebrew/Cellar/jq/ | head -1")
+if is_formula_requested "$PRIMARY_FORMULA"; then
+
+log "Faking old $PRIMARY_FORMULA version by renaming keg directory..."
+REAL_JQ_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/$PRIMARY_FORMULA/ | head -1")
+vm_ssh "mv /opt/homebrew/Cellar/$PRIMARY_FORMULA/$REAL_JQ_VERSION /opt/homebrew/Cellar/$PRIMARY_FORMULA/0.0.0-fake"
+vm_ssh "ln -sfn ../Cellar/$PRIMARY_FORMULA/0.0.0-fake /opt/homebrew/opt/$PRIMARY_FORMULA"
+FAKED=$(vm_ssh "ls /opt/homebrew/Cellar/$PRIMARY_FORMULA/ | head -1")
 if [ "$FAKED" != "0.0.0-fake" ]; then
   fail "failed to fake version in Cellar (got: $FAKED)"
 fi
 pass "Cellar faked to 0.0.0-fake"
 
-log "Running: bd upgrade jq (should download and install)"
-UPGRADE_OUTPUT=$(vm_ssh "/tmp/bd upgrade jq" 2>&1 || true)
+log "Running: bd upgrade $PRIMARY_FORMULA (should download and install)"
+UPGRADE_OUTPUT=$(vm_ssh "/tmp/bd upgrade $PRIMARY_FORMULA" 2>&1 || true)
 echo "$UPGRADE_OUTPUT"
-if echo "$UPGRADE_OUTPUT" | grep -q "Upgraded jq"; then
-  pass "bd upgrade jq"
+if echo "$UPGRADE_OUTPUT" | grep -q "Upgraded $PRIMARY_FORMULA"; then
+  pass "bd upgrade $PRIMARY_FORMULA"
 else
-  fail "bd upgrade jq did not report upgrade"
+  fail "bd upgrade $PRIMARY_FORMULA did not report upgrade"
 fi
 
-log "Verifying: jq still works after upgrade"
-JQ_POST_UPGRADE=$(vm_ssh "/opt/homebrew/bin/jq --version 2>&1" || true)
+log "Verifying: $PRIMARY_FORMULA still works after upgrade"
+JQ_POST_UPGRADE=$(vm_ssh "/opt/homebrew/bin/$PRIMARY_FORMULA --version 2>&1" || true)
 if [ -z "$JQ_POST_UPGRADE" ]; then
-  fail "jq --version failed after upgrade"
+  fail "$PRIMARY_FORMULA --version failed after upgrade"
 fi
-pass "jq after upgrade: $JQ_POST_UPGRADE"
+pass "$PRIMARY_FORMULA after upgrade: $JQ_POST_UPGRADE"
 
 log "Verifying: keg version updated"
-KEG_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/jq/ | grep -v fake | head -1" || true)
+KEG_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/$PRIMARY_FORMULA/ | grep -v fake | head -1" || true)
 if [ -z "$KEG_VERSION" ]; then
   fail "no real version keg found after upgrade"
 fi
 pass "keg version: $KEG_VERSION"
 
+else
+  log "Skipping $PRIMARY_FORMULA upgrade test (not in --formula list)"
+fi
+
 # --- Test: bd install --dry-run ----------------------------------------------
 
-log "Running: bd install --dry-run ripgrep"
+log "Running: bd install --dry-run $DRY_RUN_FORMULA"
 DRY_OUTPUT=$(vm_ssh "/tmp/bd install --dry-run $DRY_RUN_FORMULA" 2>&1 || true)
 echo "$DRY_OUTPUT"
 if echo "$DRY_OUTPUT" | grep -qE "(Would install|Nothing to install)"; then
   pass "bd install --dry-run"
 else
   fail "bd install --dry-run produced unexpected output"
-fi
-
-if [ "$DRY_RUN_FORMULA" = "ripgrep" ]; then
-  pass "dry-run output checked against $DRY_RUN_FORMULA"
 fi
 
 fi # upgrade phase
@@ -644,6 +657,9 @@ pass "brew update"
 
 log "Cross-test: bd → brew upgrade"
 for formula in "${CROSS_TEST_BD_TO_BREW[@]}"; do
+  if ! is_formula_requested "$formula"; then
+    continue
+  fi
   if printf '%s\n' "${FAILED_FORMULAE[@]}" | grep -qx "$formula"; then
     record_cross_result "bd→brew:$formula" "SKIP" "install failed"
     continue
