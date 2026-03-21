@@ -206,21 +206,36 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: install metadata 互換だけ先に入れても `bd upgrade` が別の state DB を見続けると user-visible contract が閉じず、逆に candidate selection だけ変えても `bd -> brew` / `brew -> bd` の往復 replay が通らなければ Goal を満たさない; ただし broader `post_install` support は別 contract に切り出す
   - Escalate if: Homebrew が認識する installed state に追加 metadata や linked-keg semantics が必要で、現行 VM script だけでは `bd -> brew` / `brew -> bd` の closure を判定できない場合
 
-- [ ] Theme: Preserve symlinks in bottle materialization and linking
+- [x] Theme: Preserve symlinks in bottle materialization and linking
   - Outcome: symlink-heavy な bottle を materialize / relocate / link しても keg 構造と runtime が壊れず、`certifi` を含む Python formula が既知の symlink 破壊で落ちなくなる
   - Goal: keg 内 symlink を保持したコピー、symlink を含む link/unlink 走査、relocate の対象判定を Homebrew bottle の実レイアウトに合わせる
   - Must Not Break: 既存の file-only bottle install 成功系を壊さない; relative symlink の link 互換を維持する; `task check` green
-  - Non-goals: arbitrary post-install support; Homebrew install-state adoption; source fallback 拡張
+  - Non-goals: arbitrary post-install support; Homebrew install-state adoption; source fallback 拡張; `any_skip_relocation` bottle の text relocation（次 Theme で対応）
   - Acceptance (EARS):
     - When a bottle contains internal symlinks, the system shall preserve those symlinks in the keg instead of dereferencing them into copied regular files
     - When link or unlink traverses a keg with symlinked entries, the system shall maintain Homebrew-compatible prefix links without skipping required artifacts
-    - When `certifi` and a dependent Python formula such as `httpie` or `semgrep` are installed, the resulting formula shall remain executable without manual repair of symlinked certificate or virtualenv paths
+    - When `certifi` and a dependent Python formula such as `semgrep` are installed, the resulting formula shall remain executable without manual repair of symlinked certificate paths
     - If a symlink points outside the supported install boundary and cannot be represented safely, the system shall fail explicitly before writing receipt or state
-  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula httpie --formula semgrep; oracle=cellar tests assert symlink-preserving materialization/linking, and VM replay shows the known `certifi`-adjacent failures no longer reproduce for representative Python formulae; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task test plus targeted VM replay; notes=investigation on 2026-03-21 indicates current failures are consistent with symlink loss in materialize/link/relocate rather than planning-time unsupported metadata`
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula semgrep; oracle=cellar tests assert symlink-preserving materialization/linking, and VM replay shows the known certifi-adjacent failures no longer reproduce for semgrep; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task test plus targeted VM replay; notes=httpie usability failure is caused by any_skip_relocation relocation skip, not symlink loss — tracked in next Theme`
   - Gates: `static`, `integration`, `system`
-  - Executable doc: `cargo test -p brewdock-cellar -- materialize`; `cargo test -p brewdock-cellar -- link`; `cargo test -p brewdock-core -- install`; `./tests/vm-smoke-test.sh --formula httpie --formula semgrep`
+  - Executable doc: `cargo test -p brewdock-cellar -- materialize`; `cargo test -p brewdock-cellar -- link`; `cargo test -p brewdock-core -- install`; `./tests/vm-smoke-test.sh --formula semgrep`
   - Why not split vertically further?: materialize だけ直しても link/unlink/relocate が symlink を無視すると Python and Node style bottle layoutsで contract が閉じない
   - Escalate if: Homebrew bottles rely on symlink semantics that require a broader cellar model than the current file-walk based implementation can represent safely
+
+- [ ] Theme: Always relocate text placeholders regardless of cellar type
+  - Outcome: `any_skip_relocation` bottle の Python virtualenv shebang や `.pth` ファイル内の `@@HOMEBREW_*@@` プレースホルダーが正しく置換され、httpie 等の Python formula が usable になる
+  - Goal: `relocate_keg` の呼び出し条件を Homebrew の実挙動に合わせ、text relocation を cellar type に関係なく常に実行する
+  - Must Not Break: 既存の bottle install 成功系を壊さない; Mach-O binary relocation の正常動作を維持する; `task check` green
+  - Non-goals: Homebrew の `pip_install_and_link` 全面互換; virtualenv 構造の検証や修復; Linux 対応
+  - Acceptance (EARS):
+    - When a bottle has `cellar: :any_skip_relocation` and its text files contain `@@HOMEBREW_*@@` placeholders, the system shall replace those placeholders with the actual prefix paths
+    - When a bottle has `cellar: :any_skip_relocation` and contains no Mach-O binaries, the system shall not invoke `install_name_tool`
+    - When `httpie` is installed, `http --version` shall succeed without unreplaced placeholders in shebangs
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-smoke-test.sh --formula httpie; oracle=core test asserts text relocation occurs for any_skip_relocation bottles, VM replay shows httpie usability passes; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=task test plus targeted VM replay; notes=discovered on 2026-03-21 during symlink theme VM smoke test; Homebrew always relocates text even for any_skip_relocation, only binary relocation is skipped`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- any_skip_relocation`; `./tests/vm-smoke-test.sh --formula httpie`
+  - Why not split vertically further?: text relocation の条件変更だけでは VM 上の usability が確認できず、httpie の動作確認とセットでないと contract が閉じない
+  - Escalate if: `any_skip_relocation` bottle に Homebrew が text relocation 以外の追加処理をしていて、text placeholder 置換だけでは httpie が動作しない場合
 
 - [ ] Theme: Expand restricted `post_install` support for dependency-critical formulae
   - Outcome: `node` と `ruby` のような依存の中核になる formula の `post_install` が restricted runtime で通り、`agent-browser` と `vim` の依存 chain が known blocker から外れる
