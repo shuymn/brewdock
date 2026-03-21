@@ -12,8 +12,8 @@ use brewdock_cellar::{
 };
 use brewdock_formula::{
     CellarType, FetchOutcome, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository,
-    IndexMetadata, MetadataStore, SelectedBottle, UnsupportedReason, check_supportability,
-    resolve_install_order, select_bottle,
+    IndexMetadata, MetadataStore, PkgVersion, SelectedBottle, UnsupportedReason,
+    check_supportability, resolve_install_order, select_bottle,
 };
 use futures::future::try_join_all;
 use tracing::Instrument;
@@ -775,7 +775,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             let method = self.resolve_install_method(&formula)?;
 
             let latest_version = pkg_version(&formula.versions.stable, formula.revision);
-            if keg.pkg_version == latest_version {
+            if !is_outdated(&keg.pkg_version, &latest_version) {
                 continue;
             }
 
@@ -1390,7 +1390,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 }
             };
             let latest_version = pkg_version(&formula.versions.stable, formula.revision);
-            if keg.pkg_version != latest_version {
+            if is_outdated(&keg.pkg_version, &latest_version) {
                 entries.push(OutdatedEntry {
                     name: keg.name,
                     current_version: keg.pkg_version,
@@ -1696,6 +1696,27 @@ pub(crate) fn pkg_version(version: &str, revision: u32) -> String {
         format!("{version}_{revision}")
     } else {
         version.to_owned()
+    }
+}
+
+/// Returns `true` when `installed` is strictly older than `latest`.
+///
+/// Falls back to string inequality if either version string cannot be
+/// parsed.  A warning is emitted so unparseable versions are visible
+/// in logs.
+fn is_outdated(installed: &str, latest: &str) -> bool {
+    if let (Ok(inst), Ok(lat)) = (
+        installed.parse::<PkgVersion>(),
+        latest.parse::<PkgVersion>(),
+    ) {
+        inst < lat
+    } else {
+        tracing::warn!(
+            installed,
+            latest,
+            "falling back to string comparison: version parse failed"
+        );
+        installed != latest
     }
 }
 
