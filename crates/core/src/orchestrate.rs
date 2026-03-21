@@ -15,7 +15,10 @@ use brewdock_formula::{
     IndexMetadata, MetadataStore, PkgVersion, SelectedBottle, UnsupportedReason,
     check_supportability, resolve_install_order, select_bottle,
 };
-use futures::future::try_join_all;
+use futures::{
+    future::try_join_all,
+    stream::{self, StreamExt, TryStreamExt},
+};
 use tracing::Instrument;
 
 use crate::{
@@ -139,6 +142,63 @@ pub struct CleanupResult {
     pub bytes_freed: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionPlan<'a> {
+    entries: Vec<ExecutionPlanEntry<'a>>,
+    local_prepare_concurrency: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionPlanEntry<'a> {
+    formula: &'a Formula,
+    method: InstallMethod,
+    prefetch: PrefetchStep,
+    local_prepare: LocalPrepareStep,
+    finalize: FinalizeStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefetchStep {
+    AcquireBottle,
+    AcquireSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPrepareStep {
+    MaterializeBottle,
+    DeferToFinalize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeStep {
+    FinalizeBottle,
+    BuildFromSource,
+}
+
+impl<'a> ExecutionPlanEntry<'a> {
+    const fn new(formula: &'a Formula, method: InstallMethod) -> Self {
+        let (prefetch, local_prepare, finalize) = match &method {
+            InstallMethod::Bottle(_) => (
+                PrefetchStep::AcquireBottle,
+                LocalPrepareStep::MaterializeBottle,
+                FinalizeStep::FinalizeBottle,
+            ),
+            InstallMethod::Source(_) => (
+                PrefetchStep::AcquireSource,
+                LocalPrepareStep::DeferToFinalize,
+                FinalizeStep::BuildFromSource,
+            ),
+        };
+        Self {
+            formula,
+            method,
+            prefetch,
+            local_prepare,
+            finalize,
+        }
+    }
+}
+
 /// A diagnostic finding from the doctor command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticEntry {
@@ -196,12 +256,11 @@ pub(crate) enum PrefetchedPayload {
 /// Generic over `R` (formula repository) and `D` (bottle downloader) for
 /// testability via mock implementations.
 ///
-/// The install pipeline uses [`futures::future::try_join_all`] to prefetch
-/// payloads concurrently.  On a `current_thread` runtime, downloads
-/// interleave at await points, but blocking I/O (blob store, extraction)
-/// runs inline and serialises other in-flight futures for its duration.
-/// This is acceptable because the primary latency gain comes from
-/// overlapping network requests, not filesystem operations.
+/// The install pipeline is driven by an explicit execution plan that fixes
+/// the `network acquire -> local prepare -> finalize` boundary per formula.
+/// `network acquire` runs concurrently, `local prepare` is bounded explicitly,
+/// and `finalize` remains serialized in topological order to preserve
+/// Homebrew-visible state transitions.
 pub struct Orchestrator<R, D> {
     repo: R,
     downloader: D,
@@ -235,6 +294,7 @@ struct ResolvedPayload {
 /// Bundles a resolved install method with its materialized payload.
 struct MaterializedFormula {
     method: InstallMethod,
+    finalize: FinalizeStep,
     materialized: MaterializedPayload,
 }
 
@@ -274,6 +334,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ///
     /// Matches Homebrew's default staleness window (7 days).
     const CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+    const MAX_LOCAL_PREPARE_CONCURRENCY: usize = 4;
 
     /// Creates a new orchestrator.
     #[must_use]
@@ -363,91 +424,42 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 blob_store: &blob_store,
             };
 
-            // Phase 1: Resolve install methods, then prefetch all payloads
-            // concurrently (no prefix mutation).
-            let resolved_methods: Vec<_> = to_install
-                .iter()
-                .map(|name| {
-                    let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
-                        name: FormulaName::from(name.clone()),
-                    })?;
-                    let method =
-                        Self::instrument_phase("install", "resolve-install-method", name, || {
-                            self.resolve_install_method(formula)
-                        })?;
-                    Ok((method, formula))
-                })
-                .collect::<Result<Vec<_>, BrewdockError>>()?;
+            let execution_plan =
+                Self::instrument_phase("install", "plan-execution", &request_label(names), || {
+                    self.build_execution_plan(&to_install, &cache)
+                })?;
 
-            let prefetch_futures: Vec<_> = resolved_methods
+            let prefetch_futures: Vec<_> = execution_plan
+                .entries
                 .iter()
-                .map(|(method, formula)| {
+                .map(|entry| {
                     Self::instrument_async_phase(
                         "install",
                         "prefetch-payload",
-                        &formula.name,
-                        self.prefetch_payload("install", formula, method, &blob_store),
+                        &entry.formula.name,
+                        self.prefetch_payload("install", entry.formula, &entry.method, &blob_store),
                     )
                 })
                 .collect();
 
             let payloads = try_join_all(prefetch_futures).await?;
 
-            // Phase 2: Each keg writes only to its own Cellar/name/version
-            // and opt/name, so independent kegs can be materialized
-            // concurrently via spawn_blocking.
-            let opt_dir = self.layout.opt_dir();
-            let prefix = self.layout.prefix().to_path_buf();
-            let materialize_futures: Vec<_> = resolved_methods
-                .iter()
-                .zip(payloads)
-                .map(|((_, formula), payload)| {
-                    let opt_dir = opt_dir.clone();
-                    let prefix = prefix.clone();
-                    let name = formula.name.clone();
-                    async move {
-                        let span = tracing::info_span!(
-                            "bd.phase",
-                            operation = "install",
-                            phase = "materialize-payload",
-                            target = name.as_str(),
-                        );
-                        tokio::task::spawn_blocking(move || {
-                            let _entered = span.enter();
-                            materialize_prefetched_payload(payload, &name, &opt_dir, &prefix)
-                        })
-                        .await
-                        .map_err(|err| BrewdockError::from(std::io::Error::other(err)))?
-                    }
-                })
-                .collect();
-
-            let materialized = try_join_all(materialize_futures).await.inspect_err(|_| {
-                // On materialize failure, clean up any kegs that were created.
-                for (_, formula) in &resolved_methods {
-                    let version = pkg_version(&formula.versions.stable, formula.revision);
-                    let keg = self.layout.cellar().join(&formula.name).join(&version);
-                    if keg.exists() {
-                        let _ = cleanup_failed_install(
-                            &keg,
-                            self.layout.prefix(),
-                            &self.layout.opt_dir(),
-                            &formula.name,
-                        );
-                    }
-                }
-            })?;
+            let materialized = self
+                .run_local_prepare_stage(&execution_plan, payloads)
+                .await
+                .inspect_err(|_| self.cleanup_materialized_kegs(&execution_plan))?;
 
             // Phase 3: Finalize in topological order (prefix-mutating).
-            for ((method, formula), materialized_payload) in
-                resolved_methods.into_iter().zip(materialized)
+            for (entry, materialized_payload) in
+                execution_plan.entries.into_iter().zip(materialized)
             {
                 self.finalize_materialized(
-                    formula,
+                    entry.formula,
                     &cache,
                     &install_context,
                     MaterializedFormula {
-                        method,
+                        method: entry.method,
+                        finalize: entry.finalize,
                         materialized: materialized_payload,
                     },
                 )
@@ -1023,10 +1035,16 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         tracing::info!(name, "installing formula");
 
-        let keg_path = match resolved.materialized {
-            MaterializedPayload::Bottle { keg_path } => keg_path,
-            MaterializedPayload::PendingSource(pending) => {
+        let keg_path = match (resolved.finalize, resolved.materialized) {
+            (FinalizeStep::FinalizeBottle, MaterializedPayload::Bottle { keg_path }) => keg_path,
+            (FinalizeStep::BuildFromSource, MaterializedPayload::PendingSource(pending)) => {
                 self.build_source_to_keg(install_context.operation, name, *pending)?
+            }
+            (FinalizeStep::FinalizeBottle, MaterializedPayload::PendingSource(_))
+            | (FinalizeStep::BuildFromSource, MaterializedPayload::Bottle { .. }) => {
+                return Err(BrewdockError::Io(std::io::Error::other(
+                    "execution plan finalize step does not match materialized payload",
+                )));
             }
         };
 
@@ -1366,6 +1384,98 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             .collect()
     }
 
+    fn build_execution_plan<'a>(
+        &self,
+        to_install: &[String],
+        cache: &'a FormulaCache,
+    ) -> Result<ExecutionPlan<'a>, BrewdockError> {
+        let entries = to_install
+            .iter()
+            .map(|name| {
+                let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
+                    name: FormulaName::from(name.clone()),
+                })?;
+                let method =
+                    Self::instrument_phase("install", "resolve-install-method", name, || {
+                        self.resolve_install_method(formula)
+                    })?;
+                Ok(ExecutionPlanEntry::new(formula, method))
+            })
+            .collect::<Result<Vec<_>, BrewdockError>>()?;
+
+        Ok(ExecutionPlan {
+            entries,
+            local_prepare_concurrency: Self::MAX_LOCAL_PREPARE_CONCURRENCY,
+        })
+    }
+
+    async fn run_local_prepare_stage(
+        &self,
+        execution_plan: &ExecutionPlan<'_>,
+        payloads: Vec<PrefetchedPayload>,
+    ) -> Result<Vec<MaterializedPayload>, BrewdockError> {
+        let opt_dir = self.layout.opt_dir();
+        let prefix = self.layout.prefix().to_path_buf();
+        let limit = execution_plan.local_prepare_concurrency.max(1);
+        stream::iter(
+            execution_plan
+                .entries
+                .iter()
+                .zip(payloads)
+                .map(|(entry, payload)| {
+                    let opt_dir = opt_dir.clone();
+                    let prefix = prefix.clone();
+                    let name = entry.formula.name.clone();
+                    let local_prepare = entry.local_prepare;
+                    async move {
+                        match local_prepare {
+                            LocalPrepareStep::MaterializeBottle => {
+                                let span = tracing::info_span!(
+                                    "bd.phase",
+                                    operation = "install",
+                                    phase = local_prepare.phase_name(),
+                                    target = name.as_str(),
+                                );
+                                tokio::task::spawn_blocking(move || {
+                                    let _entered = span.enter();
+                                    materialize_prefetched_payload(
+                                        payload, &name, &opt_dir, &prefix,
+                                    )
+                                })
+                                .await
+                                .map_err(|err| BrewdockError::from(std::io::Error::other(err)))?
+                            }
+                            LocalPrepareStep::DeferToFinalize => {
+                                materialize_prefetched_payload(payload, &name, &opt_dir, &prefix)
+                            }
+                        }
+                    }
+                }),
+        )
+        .buffered(limit)
+        .try_collect()
+        .await
+    }
+
+    fn cleanup_materialized_kegs(&self, execution_plan: &ExecutionPlan<'_>) {
+        for entry in &execution_plan.entries {
+            let version = pkg_version(&entry.formula.versions.stable, entry.formula.revision);
+            let keg = self
+                .layout
+                .cellar()
+                .join(&entry.formula.name)
+                .join(&version);
+            if keg.exists() {
+                let _ = cleanup_failed_install(
+                    &keg,
+                    self.layout.prefix(),
+                    &self.layout.opt_dir(),
+                    &entry.formula.name,
+                );
+            }
+        }
+    }
+
     // --- Read-heavy query methods ---
 
     /// Lists outdated formulae by comparing installed versions against the
@@ -1621,6 +1731,15 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     }
 }
 
+impl LocalPrepareStep {
+    const fn phase_name(self) -> &'static str {
+        match self {
+            Self::MaterializeBottle => "materialize-payload",
+            Self::DeferToFinalize => "defer-to-finalize",
+        }
+    }
+}
+
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     async fn instrument_operation<T, F>(
         operation: &'static str,
@@ -1833,7 +1952,7 @@ mod tests {
 
     use super::*;
     use crate::testutil::{
-        HOST_TAG, MockDownloader, PLAN_SHA, assert_installed, assert_not_installed,
+        HOST_TAG, MockDownloader, PLAN_SHA, SHA_B, assert_installed, assert_not_installed,
         create_bottle_tar_gz, create_simple_bottle, create_source_tar_gz,
         create_source_tar_gz_with_raw_paths, make_formula, make_orchestrator,
         make_orchestrator_with_sources, move_host_bottle_to_tag, setup_installed_keg,
@@ -2007,6 +2126,70 @@ mod tests {
         let plan = orchestrator.plan_install(&["a"]).await?;
         let entry = plan.first().ok_or("expected install plan entry")?;
         assert!(matches!(&entry.method, InstallMethod::Bottle(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_execution_plan_marks_bottle_and_source_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let bottle_formula = make_formula("bottle", "1.0", &[], PLAN_SHA);
+        let mut source_formula = make_formula("source", "2.0", &[], SHA_B);
+        source_formula.versions.bottle = false;
+        source_formula.bottle.stable = None;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![bottle_formula.clone(), source_formula.clone()],
+            vec![],
+            counter,
+            layout,
+        )?;
+
+        let mut cache = FormulaCache::new();
+        cache.insert(bottle_formula);
+        cache.insert(source_formula);
+
+        let plan = orchestrator
+            .build_execution_plan(&["bottle".to_owned(), "source".to_owned()], &cache)?;
+
+        assert_eq!(
+            plan.local_prepare_concurrency,
+            Orchestrator::<crate::testutil::MockRepo, crate::testutil::MockDownloader>::MAX_LOCAL_PREPARE_CONCURRENCY
+        );
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.formula.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bottle", "source"]
+        );
+        assert!(matches!(
+            (
+                plan.entries[0].prefetch,
+                plan.entries[0].local_prepare,
+                plan.entries[0].finalize
+            ),
+            (
+                PrefetchStep::AcquireBottle,
+                LocalPrepareStep::MaterializeBottle,
+                FinalizeStep::FinalizeBottle
+            )
+        ));
+        assert!(matches!(
+            (
+                plan.entries[1].prefetch,
+                plan.entries[1].local_prepare,
+                plan.entries[1].finalize
+            ),
+            (
+                PrefetchStep::AcquireSource,
+                LocalPrepareStep::DeferToFinalize,
+                FinalizeStep::BuildFromSource
+            )
+        ));
         Ok(())
     }
 
