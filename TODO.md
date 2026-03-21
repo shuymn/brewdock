@@ -357,7 +357,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: evidence contract を先に固めないと、後続 Theme の効果判定が `time.busy` 偏重で揺れる
   - Escalate if: wall / subprocess attribution の取得に benchmark harness か user-visible command の前提変更が必要になる場合
 
-- [ ] Theme: Two-stage bottle pre-finalize executor with explicit execution plan
+- [x] Theme: Two-stage bottle pre-finalize executor with explicit execution plan
   - Outcome: multi-formula bottle install が `network acquire -> local prepare -> materialize/relocate -> finalize` に再編され、`current_thread` runtime でも blocking I/O による不要な直列化が減る
   - Goal: bottle path を staged executor に載せ、phase contract と rollback ownership を `ExecutionPlan` に固定したうえで pre-finalize 並列性を上げる
   - Must Not Break: Homebrew-visible finalize boundary を壊さない; rollback は keg 単位で fail-closed のままにする; source build path の成功系を壊さない; `task check` green

@@ -53,7 +53,7 @@ tasks:
       Replays bd update / install / upgrade paths in a disposable Tart macOS VM and
       emits a markdown summary with tracing-derived phase breakdowns. Pass extra args
       after --, for example:
-      task bench:pipeline -- --output docs/pipeline-baseline.md
+      task bench:pipeline -- --runs 3 --output docs/pipeline-baseline.md
     cmds:
       - ./tests/vm-pipeline-baseline.sh {{.CLI_ARGS}}
 
