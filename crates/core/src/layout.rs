@@ -60,12 +60,6 @@ impl Layout {
         self.prefix.join("var/brewdock")
     }
 
-    /// `SQLite` database path (`{prefix}/var/brewdock/brewdock.db`).
-    #[must_use]
-    pub fn db_path(&self) -> PathBuf {
-        self.var_brewdock().join("brewdock.db")
-    }
-
     /// Formula cache directory (`{prefix}/var/brewdock/cache`).
     #[must_use]
     pub fn cache_dir(&self) -> PathBuf {
@@ -140,15 +134,6 @@ mod tests {
         assert_eq!(
             layout.var_brewdock(),
             PathBuf::from("/tmp/test/opt/homebrew/var/brewdock")
-        );
-    }
-
-    #[test]
-    fn test_layout_db_path() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
-            layout.db_path(),
-            PathBuf::from("/tmp/test/opt/homebrew/var/brewdock/brewdock.db")
         );
     }
 

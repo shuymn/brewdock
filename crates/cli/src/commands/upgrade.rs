@@ -63,11 +63,12 @@ fn render_upgrade_plan(plan: &[UpgradePlanEntry]) -> String {
 mod tests {
     use std::sync::{Arc, atomic::AtomicUsize};
 
-    use brewdock_cellar::{InstallRecord, StateDb};
     use brewdock_core::{InstallMethod, Layout, SourceBuildPlan, UpgradePlanEntry};
 
     use super::*;
-    use crate::testutil::{SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator};
+    use crate::testutil::{
+        SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator, setup_installed_keg,
+    };
 
     #[tokio::test]
     async fn test_commands_upgrade_installs_new_version() -> Result<(), Box<dyn std::error::Error>>
@@ -75,16 +76,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        // Pre-populate state DB with old version.
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "a".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        // Pre-populate filesystem state with old version.
+        setup_installed_keg(&layout, "a", "1.0", true)?;
 
         let formula = make_formula("a", "2.0", &[], SHA_C);
         let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
@@ -104,15 +97,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "a".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        setup_installed_keg(&layout, "a", "1.0", true)?;
 
         let formula = make_formula("a", "1.0", &[], SHA_A);
         let counter = Arc::new(AtomicUsize::new(0));
@@ -128,16 +113,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        // Pre-populate state DB with old version.
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "a".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        // Pre-populate filesystem state with old version.
+        setup_installed_keg(&layout, "a", "1.0", true)?;
 
         let formula = make_formula("a", "2.0", &[], SHA_C);
         let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
@@ -160,10 +137,10 @@ mod tests {
             "no downloads in dry-run"
         );
 
-        // Old state preserved
-        let state_db = StateDb::open(&layout.db_path())?;
-        let record = state_db.get("a")?.ok_or("expected record")?;
-        assert_eq!(record.version, "1.0");
+        // Old filesystem state preserved
+        let keg = brewdock_cellar::find_installed_keg("a", &layout.cellar(), &layout.opt_dir())?
+            .ok_or("expected keg")?;
+        assert_eq!(keg.pkg_version, "1.0");
         Ok(())
     }
 

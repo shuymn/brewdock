@@ -160,6 +160,48 @@ pub fn create_bottle_tar_gz(
     Ok(compressed)
 }
 
+/// Sets up filesystem install state for a formula (keg directory + receipt + opt symlink).
+pub fn setup_installed_keg(
+    layout: &Layout,
+    name: &str,
+    version: &str,
+    on_request: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use brewdock_cellar::{
+        InstallReason, InstallReceipt, ReceiptSource, ReceiptSourceVersions,
+        atomic_symlink_replace, write_receipt,
+    };
+
+    let keg_path = layout.cellar().join(name).join(version);
+    std::fs::create_dir_all(&keg_path)?;
+
+    let receipt = InstallReceipt::for_bottle(
+        if on_request {
+            InstallReason::OnRequest
+        } else {
+            InstallReason::AsDependency
+        },
+        Some(1_000.0),
+        Vec::new(),
+        ReceiptSource {
+            path: String::new(),
+            tap: "homebrew/core".to_owned(),
+            spec: "stable".to_owned(),
+            versions: ReceiptSourceVersions {
+                stable: version.to_owned(),
+                head: None,
+                version_scheme: 0,
+            },
+        },
+    );
+    write_receipt(&keg_path, &receipt)?;
+
+    std::fs::create_dir_all(layout.opt_dir())?;
+    let opt_link = layout.opt_dir().join(name);
+    atomic_symlink_replace(&keg_path, &opt_link)?;
+    Ok(())
+}
+
 pub fn make_orchestrator(
     formulae: Vec<Formula>,
     bottles: Vec<(&str, Vec<u8>)>,

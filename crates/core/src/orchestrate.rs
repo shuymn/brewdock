@@ -7,9 +7,10 @@ use std::{
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
-    InstallReason, InstallReceipt, InstallRecord, PostInstallContext, PostInstallTransaction,
-    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, StateDb, atomic_symlink_replace, link,
-    materialize, relocate_keg, run_post_install, unlink, write_receipt,
+    InstallReason, InstallReceipt, InstalledKeg, PostInstallContext, PostInstallTransaction,
+    ReceiptDependency, ReceiptSource, ReceiptSourceVersions, atomic_symlink_replace,
+    discover_installed_kegs, find_installed_keg, link, materialize, relocate_keg, run_post_install,
+    unlink, validate_post_install, write_receipt,
 };
 use brewdock_formula::{
     CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
@@ -92,7 +93,7 @@ pub struct SourceBuildPlan {
 /// Generic over `R` (formula repository) and `D` (bottle downloader) for
 /// testability via mock implementations.
 ///
-/// Blocking I/O (file operations, `SQLite`) is called directly in async methods.
+/// Blocking I/O (file operations) is called directly in async methods.
 /// This is acceptable because the intended runtime is single-threaded
 /// (`current_thread`) with no concurrent async work.
 pub struct Orchestrator<R, D> {
@@ -104,7 +105,8 @@ pub struct Orchestrator<R, D> {
 
 #[derive(Debug, Clone)]
 struct UpgradeCandidate {
-    record: InstallRecord,
+    name: String,
+    installed_on_request: bool,
     formula: Formula,
     current_version: String,
     latest_version: String,
@@ -205,7 +207,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(candidates
             .into_iter()
             .map(|candidate| UpgradePlanEntry {
-                name: candidate.record.name,
+                name: candidate.name,
                 from_version: candidate.current_version,
                 to_version: candidate.latest_version,
                 method: candidate.method,
@@ -232,68 +234,71 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         for candidate in candidates {
             tracing::info!(
-                name = candidate.record.name,
+                name = candidate.name,
                 from = candidate.current_version,
                 to = candidate.latest_version,
                 "upgrading formula"
             );
 
-            // Unlink old keg. The old keg directory is intentionally kept in the
-            // Cellar for potential rollback; cleanup is a separate concern.
+            // Unlink old keg; the directory is kept for rollback on failure.
             let old_keg = self
                 .layout
                 .cellar()
-                .join(&candidate.record.name)
+                .join(&candidate.name)
                 .join(&candidate.current_version);
             if old_keg.exists() {
                 unlink(&old_keg, self.layout.prefix())?;
             }
 
-            let requested: HashSet<&str> = if candidate.record.installed_on_request {
-                std::iter::once(candidate.record.name.as_str()).collect()
+            let requested: HashSet<&str> = if candidate.installed_on_request {
+                std::iter::once(candidate.name.as_str()).collect()
             } else {
                 HashSet::new()
             };
 
-            if matches!(candidate.method, InstallMethod::Source(_)) {
-                let (to_install, cache) = self.resolve_upgrade_install_list(&candidate).await?;
-                for name in &to_install {
-                    self.install_single(name, &cache, &requested, &blob_store)
-                        .await?;
+            let install_result = self
+                .run_upgrade_install(&candidate, &requested, &blob_store)
+                .await;
+
+            // Re-link old keg on failure to avoid leaving the formula broken.
+            if let Err(error) = install_result {
+                tracing::warn!(
+                    name = candidate.name,
+                    %error,
+                    "upgrade failed, restoring previous version"
+                );
+                if old_keg.exists() {
+                    if !candidate.formula.keg_only {
+                        let _ = link(&old_keg, self.layout.prefix());
+                    }
+                    let _ = refresh_opt_link(&old_keg, &self.layout.opt_dir(), &candidate.name);
                 }
-            } else {
-                let cache = {
-                    let mut c = FormulaCache::new();
-                    c.insert(candidate.formula);
-                    c
-                };
-                self.install_single(&candidate.record.name, &cache, &requested, &blob_store)
-                    .await?;
+                return Err(error);
             }
 
-            upgraded.push(candidate.record.name);
+            upgraded.push(candidate.name);
         }
 
         Ok(upgraded)
     }
 
-    /// Fetches installed records from the state database.
+    /// Discovers installed kegs from Homebrew-visible filesystem state.
     ///
-    /// If `names` is empty, returns all installed records. Otherwise, returns
-    /// only records matching the given names. `StateDb` is opened and dropped
-    /// within this call to avoid holding it across `.await` boundaries.
-    fn fetch_installed_records(&self, names: &[&str]) -> Result<Vec<InstallRecord>, BrewdockError> {
-        let state_db = StateDb::open(&self.layout.db_path())?;
+    /// If `names` is empty, discovers all installed kegs by scanning the Cellar
+    /// directory. Otherwise, looks up only the specified formula names.
+    fn fetch_installed_kegs(&self, names: &[&str]) -> Result<Vec<InstalledKeg>, BrewdockError> {
+        let cellar = self.layout.cellar();
+        let opt_dir = self.layout.opt_dir();
         if names.is_empty() {
-            Ok(state_db.list()?)
+            Ok(discover_installed_kegs(&cellar, &opt_dir)?)
         } else {
-            let mut records = Vec::new();
+            let mut kegs = Vec::new();
             for &name in names {
-                if let Some(record) = state_db.get(name)? {
-                    records.push(record);
+                if let Some(keg) = find_installed_keg(name, &cellar, &opt_dir)? {
+                    kegs.push(keg);
                 }
             }
-            Ok(records)
+            Ok(kegs)
         }
     }
 
@@ -313,10 +318,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         let order = resolve_install_order(&self.build_install_graph(&cache)?, names)?;
 
         let to_install = {
-            let state_db = StateDb::open(&self.layout.db_path())?;
+            let cellar = self.layout.cellar();
+            let opt_dir = self.layout.opt_dir();
             let mut pending = Vec::new();
             for name in order {
-                if state_db.get(&name)?.is_none() {
+                if find_installed_keg(&name, &cellar, &opt_dir)?.is_none() {
                     pending.push(name);
                 }
             }
@@ -356,25 +362,34 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         names: &[&str],
     ) -> Result<Vec<UpgradeCandidate>, BrewdockError> {
-        let installed = self.fetch_installed_records(names)?;
+        let installed = self.fetch_installed_kegs(names)?;
         let host_tag = self.host_tag.as_str();
         let mut candidates = Vec::new();
 
-        for record in installed {
-            let formula = self.repo.get_formula(&record.name).await?;
+        for keg in installed {
+            let formula = self.repo.get_formula(&keg.name).await?;
             check_supportability(&formula, host_tag)?;
             let method = self.resolve_install_method(&formula)?;
 
-            let current_version = pkg_version(&record.version, record.revision);
             let latest_version = pkg_version(&formula.versions.stable, formula.revision);
-            if current_version == latest_version {
+            if keg.pkg_version == latest_version {
+                continue;
+            }
+
+            if let Err(error) = self.check_post_install_viability(&formula).await {
+                tracing::warn!(
+                    name = keg.name,
+                    %error,
+                    "skipping upgrade: post_install not supported by bd, use `brew upgrade` instead"
+                );
                 continue;
             }
 
             candidates.push(UpgradeCandidate {
-                record,
+                name: keg.name,
+                installed_on_request: keg.installed_on_request,
                 formula,
-                current_version,
+                current_version: keg.pkg_version,
                 latest_version,
                 method,
             });
@@ -387,9 +402,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         &self,
         candidate: &UpgradeCandidate,
     ) -> Result<(Vec<String>, FormulaCache), BrewdockError> {
-        let cache = self
-            .fetch_with_deps(&[candidate.record.name.as_str()])
-            .await?;
+        let cache = self.fetch_with_deps(&[candidate.name.as_str()]).await?;
         let host_tag = self.host_tag.as_str();
         for formula in cache.all().values() {
             check_supportability(formula, host_tag)?;
@@ -397,22 +410,43 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         let order = resolve_install_order(
             &self.build_install_graph(&cache)?,
-            &[candidate.record.name.as_str()],
+            &[candidate.name.as_str()],
         )?;
-        let state_db = StateDb::open(&self.layout.db_path())?;
+        let cellar = self.layout.cellar();
+        let opt_dir = self.layout.opt_dir();
         let mut to_install = Vec::new();
         for name in order {
-            if name == candidate.record.name || state_db.get(&name)?.is_none() {
+            if name == candidate.name || find_installed_keg(&name, &cellar, &opt_dir)?.is_none() {
                 to_install.push(name);
             }
         }
         Ok((to_install, cache))
     }
 
-    /// Installs a single formula (download → extract → materialize → link → receipt → state).
-    ///
-    /// `StateDb` is opened after the download completes to avoid holding a non-`Send`
-    /// reference across `.await` boundaries.
+    /// Runs the install step of an upgrade: resolves deps for source builds,
+    /// then installs each formula in order.
+    async fn run_upgrade_install(
+        &self,
+        candidate: &UpgradeCandidate,
+        requested: &HashSet<&str>,
+        blob_store: &BlobStore,
+    ) -> Result<(), BrewdockError> {
+        if matches!(candidate.method, InstallMethod::Source(_)) {
+            let (to_install, cache) = self.resolve_upgrade_install_list(candidate).await?;
+            for name in &to_install {
+                self.install_single(name, &cache, requested, blob_store)
+                    .await?;
+            }
+        } else {
+            let mut cache = FormulaCache::new();
+            cache.insert(candidate.formula.clone());
+            self.install_single(&candidate.name, &cache, requested, blob_store)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Installs a single formula (download → extract → materialize → link → receipt).
     async fn install_single(
         &self,
         name: &str,
@@ -443,7 +477,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 );
             })?;
         let post_install_transaction = self
-            .execute_post_install(name, formula, &keg_path)
+            .execute_post_install(formula, &keg_path)
             .await
             .inspect_err(|_| {
                 let _ = cleanup_failed_install(
@@ -466,8 +500,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             build_receipt_deps(formula, cache),
             build_receipt_source(formula),
         );
-        let finalize_install =
-            self.finalize_installed_formula(formula, &keg_path, &receipt, is_requested);
+        let finalize_install = self.finalize_installed_formula(formula, &keg_path, &receipt);
 
         if let Err(error) = finalize_install {
             if let Some(transaction) = post_install_transaction {
@@ -522,25 +555,26 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         }
     }
 
+    /// Checks whether a formula's `post_install` can be parsed and lowered.
+    ///
+    /// Returns `Ok(())` if the formula has no `post_install` or if it can be
+    /// successfully lowered. Returns an error if the source cannot be fetched
+    /// or contains unsupported syntax.
+    async fn check_post_install_viability(&self, formula: &Formula) -> Result<(), BrewdockError> {
+        if let Some(source) = self.fetch_post_install_source(formula).await? {
+            validate_post_install(&source)?;
+        }
+        Ok(())
+    }
+
     async fn execute_post_install(
         &self,
-        name: &str,
         formula: &Formula,
         keg_path: &Path,
     ) -> Result<Option<PostInstallTransaction>, BrewdockError> {
-        if !formula.post_install_defined {
+        let Some(ruby_source) = self.fetch_post_install_source(formula).await? else {
             return Ok(None);
-        }
-
-        let ruby_source_path =
-            formula
-                .ruby_source_path
-                .as_deref()
-                .ok_or_else(|| FormulaError::Unsupported {
-                    name: name.to_owned(),
-                    reason: UnsupportedReason::PostInstallDefined,
-                })?;
-        let ruby_source = self.repo.get_ruby_source(ruby_source_path).await?;
+        };
         let transaction = run_post_install(
             &ruby_source,
             &PostInstallContext::new(self.layout.prefix(), keg_path),
@@ -548,27 +582,39 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(Some(transaction))
     }
 
+    /// Fetches the Ruby source for a formula's `post_install` block.
+    ///
+    /// Returns `None` if the formula has no `post_install`.
+    async fn fetch_post_install_source(
+        &self,
+        formula: &Formula,
+    ) -> Result<Option<String>, BrewdockError> {
+        if !formula.post_install_defined {
+            return Ok(None);
+        }
+        let ruby_source_path =
+            formula
+                .ruby_source_path
+                .as_deref()
+                .ok_or_else(|| FormulaError::Unsupported {
+                    name: formula.name.clone(),
+                    reason: UnsupportedReason::PostInstallDefined,
+                })?;
+        let source = self.repo.get_ruby_source(ruby_source_path).await?;
+        Ok(Some(source))
+    }
+
     fn finalize_installed_formula(
         &self,
         formula: &Formula,
         keg_path: &Path,
         receipt: &InstallReceipt,
-        is_requested: bool,
     ) -> Result<(), BrewdockError> {
         if !formula.keg_only {
             link(keg_path, self.layout.prefix())?;
         }
 
         write_receipt(keg_path, receipt)?;
-
-        let state_db = StateDb::open(&self.layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: formula.name.clone(),
-            version: formula.versions.stable.clone(),
-            revision: formula.revision,
-            installed_on_request: is_requested,
-            installed_at: unix_timestamp_string(),
-        })?;
         Ok(())
     }
 
@@ -1079,11 +1125,6 @@ fn unix_timestamp_f64() -> f64 {
     unix_now().as_secs_f64()
 }
 
-/// Returns the current Unix timestamp as a string of seconds.
-fn unix_timestamp_string() -> String {
-    unix_now().as_secs().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1095,6 +1136,7 @@ mod tests {
     };
 
     use brewdock_bottle::BottleError;
+    use brewdock_cellar::find_installed_keg;
     use brewdock_formula::{
         BottleFile, BottleSpec, BottleStable, CellarType, FormulaUrls, StableUrl, Versions,
     };
@@ -1346,6 +1388,66 @@ mod tests {
         Ok(())
     }
 
+    /// Sets up filesystem install state for a formula (keg directory + receipt + opt symlink).
+    fn setup_installed_keg(
+        layout: &Layout,
+        name: &str,
+        version: &str,
+        on_request: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let keg_path = layout.cellar().join(name).join(version);
+        std::fs::create_dir_all(&keg_path)?;
+
+        let receipt = InstallReceipt::for_bottle(
+            if on_request {
+                InstallReason::OnRequest
+            } else {
+                InstallReason::AsDependency
+            },
+            Some(1_000.0),
+            Vec::new(),
+            ReceiptSource {
+                path: String::new(),
+                tap: "homebrew/core".to_owned(),
+                spec: "stable".to_owned(),
+                versions: ReceiptSourceVersions {
+                    stable: version.to_owned(),
+                    head: None,
+                    version_scheme: 0,
+                },
+            },
+        );
+        write_receipt(&keg_path, &receipt)?;
+
+        // Create opt symlink (absolute path; relative_from_to is pub(crate) in cellar).
+        std::fs::create_dir_all(layout.opt_dir())?;
+        let opt_link = layout.opt_dir().join(name);
+        atomic_symlink_replace(&keg_path, &opt_link)?;
+        Ok(())
+    }
+
+    /// Asserts that a formula is visible as installed via filesystem state.
+    fn assert_installed(layout: &Layout, name: &str) {
+        assert!(
+            find_installed_keg(name, &layout.cellar(), &layout.opt_dir())
+                .ok()
+                .flatten()
+                .is_some(),
+            "expected {name} to be installed"
+        );
+    }
+
+    /// Asserts that a formula is NOT visible as installed via filesystem state.
+    fn assert_not_installed(layout: &Layout, name: &str) {
+        assert!(
+            find_installed_keg(name, &layout.cellar(), &layout.opt_dir())
+                .ok()
+                .flatten()
+                .is_none(),
+            "expected {name} to not be installed"
+        );
+    }
+
     // --- Install tests ---
 
     #[tokio::test]
@@ -1392,14 +1494,15 @@ mod tests {
         assert!(layout.cellar().join("a/1.0/INSTALL_RECEIPT.json").exists());
         assert!(layout.cellar().join("b/2.0/INSTALL_RECEIPT.json").exists());
 
-        // Verify state DB.
-        let state_db = StateDb::open(&layout.db_path())?;
-        let rec_a = state_db.get("a")?.ok_or("expected record for a")?;
-        assert_eq!(rec_a.version, "1.0");
-        assert!(rec_a.installed_on_request);
-        let rec_b = state_db.get("b")?.ok_or("expected record for b")?;
-        assert_eq!(rec_b.version, "2.0");
-        assert!(!rec_b.installed_on_request);
+        // Verify filesystem install state.
+        let keg_a =
+            find_installed_keg("a", &layout.cellar(), &layout.opt_dir())?.ok_or("expected a")?;
+        assert_eq!(keg_a.pkg_version, "1.0");
+        assert!(keg_a.installed_on_request);
+        let keg_b =
+            find_installed_keg("b", &layout.cellar(), &layout.opt_dir())?.ok_or("expected b")?;
+        assert_eq!(keg_b.pkg_version, "2.0");
+        assert!(!keg_b.installed_on_request);
 
         // Both bottles downloaded.
         assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -1419,16 +1522,8 @@ mod tests {
         let tar_a = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh\necho a")])?;
         let tar_b = create_bottle_tar_gz("b", "2.0", &[("bin/b_tool", b"#!/bin/sh\necho b")])?;
 
-        // Pre-populate state DB with "b" already installed.
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "b".to_owned(),
-            version: "2.0".to_owned(),
-            revision: 0,
-            installed_on_request: false,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        // Pre-populate filesystem state with "b" already installed.
+        setup_installed_keg(&layout, "b", "2.0", false)?;
 
         let counter = Arc::new(AtomicUsize::new(0));
         let orchestrator = make_orchestrator(
@@ -1530,15 +1625,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "a".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        setup_installed_keg(&layout, "a", "1.0", true)?;
 
         let mut formula = make_formula("a", "2.0", &[], PLAN_SHA);
         move_host_bottle_to_tag(&mut formula, "arm64_sonoma")?;
@@ -1644,7 +1731,7 @@ end
                 .join("demo/1.0/INSTALL_RECEIPT.json")
                 .exists()
         );
-        assert!(StateDb::open(&layout.db_path())?.get("demo")?.is_some());
+        assert_installed(&layout, "demo");
         Ok(())
     }
 
@@ -1692,7 +1779,7 @@ end
                 .join("demo/1.0/INSTALL_RECEIPT.json")
                 .exists()
         );
-        assert!(StateDb::open(&layout.db_path())?.get("demo")?.is_none());
+        assert_not_installed(&layout, "demo");
         assert!(!layout.prefix().join("bin").exists());
         Ok(())
     }
@@ -1787,11 +1874,7 @@ end
                 .join("ca-certificates/1.0/INSTALL_RECEIPT.json")
                 .exists()
         );
-        assert!(
-            StateDb::open(&layout.db_path())?
-                .get("ca-certificates")?
-                .is_some()
-        );
+        assert_installed(&layout, "ca-certificates");
         Ok(())
     }
 
@@ -2025,7 +2108,7 @@ install:
         )?)?;
         assert_eq!(receipt["built_as_bottle"].as_bool(), Some(false));
         assert_eq!(receipt["poured_from_bottle"].as_bool(), Some(false));
-        assert!(StateDb::open(&layout.db_path())?.get("target")?.is_some());
+        assert_installed(&layout, "target");
         Ok(())
     }
 
@@ -2102,7 +2185,7 @@ install:
                 .join("broken/1.0/INSTALL_RECEIPT.json")
                 .exists()
         );
-        assert!(StateDb::open(&layout.db_path())?.get("broken")?.is_none());
+        assert_not_installed(&layout, "broken");
         Ok(())
     }
 
@@ -2112,15 +2195,7 @@ install:
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "portable".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        setup_installed_keg(&layout, "portable", "1.0", true)?;
 
         let mut formula = make_formula("portable", "2.0", &[], PLAN_SHA);
         formula.versions.bottle = false;
@@ -2150,15 +2225,7 @@ install:
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "target".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        setup_installed_keg(&layout, "target", "1.0", true)?;
 
         let helper_sha = "9090909090909090909090909090909090909090909090909090909090909090";
         let source_sha = "9191919191919191919191919191919191919191919191919191919191919191";
@@ -2210,18 +2277,10 @@ install:
             std::fs::read_to_string(layout.cellar().join("target/2.0/generated.txt"))?,
             "helper-upgrade\n"
         );
-        assert!(
-            StateDb::open(&layout.db_path())?
-                .get("build-helper")?
-                .is_some()
-        );
-        assert_eq!(
-            StateDb::open(&layout.db_path())?
-                .get("target")?
-                .ok_or("expected upgraded target record")?
-                .version,
-            "2.0"
-        );
+        assert_installed(&layout, "build-helper");
+        let target_keg = find_installed_keg("target", &layout.cellar(), &layout.opt_dir())?
+            .ok_or("expected upgraded target record")?;
+        assert_eq!(target_keg.pkg_version, "2.0");
         Ok(())
     }
 
@@ -2244,16 +2303,28 @@ install:
             "old_version"
         );
 
-        // Pre-populate state DB.
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "a".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        // Write receipt for the old version so filesystem state discovery finds it.
+        write_receipt(
+            &old_keg,
+            &InstallReceipt::for_bottle(
+                InstallReason::OnRequest,
+                Some(1_000.0),
+                Vec::new(),
+                ReceiptSource {
+                    path: String::new(),
+                    tap: "homebrew/core".to_owned(),
+                    spec: "stable".to_owned(),
+                    versions: ReceiptSourceVersions {
+                        stable: "1.0".to_owned(),
+                        head: None,
+                        version_scheme: 0,
+                    },
+                },
+            ),
+        )?;
+        // Create opt symlink pointing to old keg.
+        std::fs::create_dir_all(layout.opt_dir())?;
+        atomic_symlink_replace(&old_keg, &layout.opt_dir().join("a"))?;
 
         // Mock repo returns v2.0.
         let sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -2285,11 +2356,11 @@ install:
             "new_version"
         );
 
-        // State DB updated, preserving installed_on_request status.
-        let state_db = StateDb::open(&layout.db_path())?;
-        let record = state_db.get("a")?.ok_or("expected record")?;
-        assert_eq!(record.version, "2.0");
-        assert!(record.installed_on_request);
+        // Filesystem state updated, preserving installed_on_request status.
+        let keg =
+            find_installed_keg("a", &layout.cellar(), &layout.opt_dir())?.ok_or("expected keg")?;
+        assert_eq!(keg.pkg_version, "2.0");
+        assert!(keg.installed_on_request);
         Ok(())
     }
 
@@ -2298,16 +2369,8 @@ install:
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
-        // Pre-populate state DB with v1.0 (same as repo).
-        let state_db = StateDb::open(&layout.db_path())?;
-        state_db.insert(&InstallRecord {
-            name: "a".to_owned(),
-            version: "1.0".to_owned(),
-            revision: 0,
-            installed_on_request: true,
-            installed_at: "1000".to_owned(),
-        })?;
-        drop(state_db);
+        // Pre-populate filesystem state with v1.0 (same as repo).
+        setup_installed_keg(&layout, "a", "1.0", true)?;
 
         let formula = make_formula(
             "a",

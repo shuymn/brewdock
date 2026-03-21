@@ -157,6 +157,20 @@ pub fn extract_post_install_block(source: &str) -> Result<String, CellarError> {
 /// - `system command, args...`
 /// - `if (path).exist? ... end`
 ///
+/// Validates that a `post_install` block can be parsed and lowered without executing it.
+///
+/// Use this to check whether a formula's `post_install` is supported before
+/// performing destructive operations like unlinking the old keg during upgrade.
+///
+/// # Errors
+///
+/// Returns [`CellarError::UnsupportedPostInstallSyntax`] if the source contains
+/// unsupported Ruby constructs that cannot be lowered.
+pub fn validate_post_install(source: &str) -> Result<(), CellarError> {
+    let _program = lower_post_install(source)?;
+    Ok(())
+}
+
 /// # Errors
 ///
 /// Returns [`CellarError::UnsupportedPostInstallSyntax`] for any unsupported

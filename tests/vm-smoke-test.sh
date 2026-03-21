@@ -4,6 +4,13 @@
 #
 # Usage:
 #   ./tests/vm-smoke-test.sh [--keep] [--formula <name> ...]
+#                            [--skip-cross] [--phase <phases>]
+#
+# Phases (comma-separated):
+#   install  — installability sweep + usability + deep verification
+#   upgrade  — bd upgrade tests + dry-run
+#   cross    — Homebrew install + bd↔brew cross-compatibility
+#   Default: all phases. --skip-cross removes cross from whatever phases run.
 #
 # Prerequisites:
 #   - Tart (https://tart.run) installed
@@ -87,9 +94,11 @@ BD_BINARY="$PROJECT_ROOT/target/release/bd"
 SSH_USER="admin"
 SSH_PASS="admin"
 KEEP_VM=false
+SKIP_CROSS=false
 SHARE_DIR=""
 SSH_KEY=""
 FORMULAE=()
+PHASES=()
 INSTALL_RESULTS=()
 FAILED_FORMULAE=()
 USABILITY_RESULTS=()
@@ -101,6 +110,19 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --keep)
       KEEP_VM=true
+      shift
+      ;;
+    --skip-cross)
+      SKIP_CROSS=true
+      shift
+      ;;
+    --phase)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "missing value for --phase" >&2
+        exit 1
+      fi
+      IFS=',' read -ra PHASES <<< "$1"
       shift
       ;;
     --formula)
@@ -128,6 +150,17 @@ fi
 log()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 pass() { printf '\033[1;32m  PASS: %s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m  FAIL: %s\033[0m\n' "$*"; exit 1; }
+
+should_run_phase() {
+  local phase=$1
+  if [ "$phase" = "cross" ] && [ "$SKIP_CROSS" = true ]; then
+    return 1
+  fi
+  if [ "${#PHASES[@]}" -eq 0 ]; then
+    return 0
+  fi
+  printf '%s\n' "${PHASES[@]}" | grep -qx "$phase"
+}
 
 record_install_result() {
   local formula=$1
@@ -311,7 +344,6 @@ ssh_with_password() {
 run_install_check() {
   local formula=$1
   local install_output=""
-  local db_version=""
   local install_status=0
 
   log "Running: bd install $formula"
@@ -332,13 +364,16 @@ run_install_check() {
     return
   fi
 
-  db_version=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='$formula'\"" 2>/dev/null || true)
-  if [ -z "$db_version" ]; then
-    record_install_result "$formula" "FAIL" "state DB record missing"
+  # Verify Homebrew-visible install state: receipt must exist in the keg.
+  if ! vm_ssh "ls /opt/homebrew/Cellar/$formula/*/INSTALL_RECEIPT.json" >/dev/null 2>&1; then
+    record_install_result "$formula" "FAIL" "INSTALL_RECEIPT.json missing"
     return
   fi
 
-  record_install_result "$formula" "PASS" "$db_version"
+  # Extract version from the keg directory name.
+  local keg_version=""
+  keg_version=$(vm_ssh "ls /opt/homebrew/Cellar/$formula/ | head -1" 2>/dev/null || true)
+  record_install_result "$formula" "PASS" "$keg_version"
 }
 
 print_install_summary() {
@@ -457,6 +492,8 @@ pass "bd update"
 
 # --- Test: installability sweep ----------------------------------------------
 
+if should_run_phase "install"; then
+
 for formula in "${FORMULAE[@]}"; do
   run_install_check "$formula"
 done
@@ -520,7 +557,11 @@ log "Verifying: oniguruma dependency installed"
 vm_ssh "test -d /opt/homebrew/Cellar/oniguruma" || fail "dependency oniguruma not installed"
 pass "oniguruma dependency present"
 
+fi # install phase
+
 # --- Test: bd upgrade (already up-to-date) -----------------------------------
+
+if should_run_phase "upgrade"; then
 
 log "Running: bd upgrade (should be up-to-date)"
 UPGRADE_OUTPUT=$(vm_ssh "/tmp/bd upgrade" 2>&1 || true)
@@ -533,13 +574,15 @@ fi
 
 # --- Test: bd upgrade (actual version bump) ----------------------------------
 
-log "Faking old jq version in state DB..."
-vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"UPDATE installs SET version='0.0.0-fake' WHERE name='jq'\""
-FAKED=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='jq'\"")
+log "Faking old jq version by renaming keg directory..."
+REAL_JQ_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/jq/ | head -1")
+vm_ssh "mv /opt/homebrew/Cellar/jq/$REAL_JQ_VERSION /opt/homebrew/Cellar/jq/0.0.0-fake"
+vm_ssh "ln -sfn ../Cellar/jq/0.0.0-fake /opt/homebrew/opt/jq"
+FAKED=$(vm_ssh "ls /opt/homebrew/Cellar/jq/ | head -1")
 if [ "$FAKED" != "0.0.0-fake" ]; then
-  fail "failed to fake version in state DB (got: $FAKED)"
+  fail "failed to fake version in Cellar (got: $FAKED)"
 fi
-pass "State DB faked to 0.0.0-fake"
+pass "Cellar faked to 0.0.0-fake"
 
 log "Running: bd upgrade jq (should download and install)"
 UPGRADE_OUTPUT=$(vm_ssh "/tmp/bd upgrade jq" 2>&1 || true)
@@ -557,12 +600,12 @@ if [ -z "$JQ_POST_UPGRADE" ]; then
 fi
 pass "jq after upgrade: $JQ_POST_UPGRADE"
 
-log "Verifying: state DB updated"
-DB_VERSION=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='jq'\"")
-if [ "$DB_VERSION" = "0.0.0-fake" ]; then
-  fail "state DB still has fake version after upgrade"
+log "Verifying: keg version updated"
+KEG_VERSION=$(vm_ssh "ls /opt/homebrew/Cellar/jq/ | grep -v fake | head -1" || true)
+if [ -z "$KEG_VERSION" ]; then
+  fail "no real version keg found after upgrade"
 fi
-pass "state DB version: $DB_VERSION"
+pass "keg version: $KEG_VERSION"
 
 # --- Test: bd install --dry-run ----------------------------------------------
 
@@ -579,7 +622,11 @@ if [ "$DRY_RUN_FORMULA" = "ripgrep" ]; then
   pass "dry-run output checked against $DRY_RUN_FORMULA"
 fi
 
+fi # upgrade phase
+
 # --- Cross-test: Install Homebrew --------------------------------------------
+
+if should_run_phase "cross"; then
 
 log "Installing Homebrew for cross-compatibility tests..."
 vm_ssh "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"" \
@@ -650,7 +697,8 @@ for formula in "${CROSS_TEST_BREW_TO_BD[@]}"; do
     pass "$formula works after brew install"
   fi
 
-  # bd install (takeover): formula is in Cellar but not in bd's state DB
+  # bd install (takeover): formula is already in Cellar with receipt from brew.
+  # bd should detect it as already installed via Homebrew-visible filesystem state.
   log "  bd install $formula (takeover)"
   bd_install_output=$(vm_ssh "/tmp/bd install $formula" 2>&1 || true)
   echo "$bd_install_output"
@@ -663,15 +711,15 @@ for formula in "${CROSS_TEST_BREW_TO_BD[@]}"; do
     pass "$formula works after bd install"
   fi
 
-  # Verify bd state DB has the record now
-  db_version=$(vm_ssh "sqlite3 /opt/homebrew/var/brewdock/brewdock.db \"SELECT version FROM installs WHERE name='$formula'\"" 2>/dev/null || true)
-  if [ -z "$db_version" ]; then
-    record_cross_result "brew→bd:$formula" "FAIL" "state DB record missing after bd install"
+  # Verify filesystem state: receipt must exist in the keg.
+  if ! vm_ssh "ls /opt/homebrew/Cellar/$formula/*/INSTALL_RECEIPT.json" >/dev/null 2>&1; then
+    record_cross_result "brew→bd:$formula" "FAIL" "INSTALL_RECEIPT.json missing after bd install"
     continue
   fi
-  pass "$formula in state DB ($db_version)"
+  keg_ver=$(vm_ssh "ls /opt/homebrew/Cellar/$formula/ | head -1" 2>/dev/null || true)
+  pass "$formula in Cellar ($keg_ver)"
 
-  # bd upgrade (should work now that formula is in state DB)
+  # bd upgrade (should work now that formula is visible via filesystem state)
   log "  bd upgrade $formula"
   bd_upgrade_output=$(vm_ssh "/tmp/bd upgrade $formula" 2>&1 || true)
   echo "$bd_upgrade_output"
@@ -688,6 +736,8 @@ for formula in "${CROSS_TEST_BREW_TO_BD[@]}"; do
 done
 
 print_cross_summary
+
+fi # cross phase
 
 # --- Summary -----------------------------------------------------------------
 
