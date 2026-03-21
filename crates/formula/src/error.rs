@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::{CellarType, FormulaName};
+
 /// Errors that can occur in formula operations.
 #[derive(Debug, thiserror::Error)]
 pub enum FormulaError {
@@ -7,14 +9,14 @@ pub enum FormulaError {
     #[error("formula not found: {name}")]
     NotFound {
         /// Name of the missing formula.
-        name: String,
+        name: FormulaName,
     },
 
     /// The formula is not supported for installation via brewdock.
     #[error("formula {name} is not supported: {reason}")]
     Unsupported {
         /// Name of the unsupported formula.
-        name: String,
+        name: FormulaName,
         /// Reason the formula is unsupported.
         reason: UnsupportedReason,
     },
@@ -68,7 +70,7 @@ pub enum UnsupportedReason {
 
     /// The bottle requires a cellar path incompatible with the current layout.
     #[error("incompatible cellar {0}")]
-    IncompatibleCellar(String),
+    IncompatibleCellar(CellarType),
 }
 
 /// A dependency cycle represented as a list of formula names.
@@ -135,7 +137,8 @@ mod tests {
     #[test]
     fn test_incompatible_cellar_display() {
         assert_eq!(
-            UnsupportedReason::IncompatibleCellar("/usr/local/Cellar".to_owned()).to_string(),
+            UnsupportedReason::IncompatibleCellar(CellarType::Path("/usr/local/Cellar".to_owned()))
+                .to_string(),
             "incompatible cellar /usr/local/Cellar"
         );
     }

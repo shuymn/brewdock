@@ -1,6 +1,7 @@
 pub use brewdock_bottle::BottleError;
 pub use brewdock_cellar::CellarError;
 pub use brewdock_formula::FormulaError;
+use brewdock_formula::FormulaName;
 
 use crate::platform::PlatformError;
 
@@ -45,7 +46,7 @@ pub enum SourceBuildError {
 
     /// Source fallback requires a checksum for verified downloads.
     #[error("missing source checksum for {0}")]
-    MissingSourceChecksum(String),
+    MissingSourceChecksum(FormulaName),
 
     /// The extracted source tree does not expose a supported build entrypoint.
     #[error("unsupported source build system in {0}")]

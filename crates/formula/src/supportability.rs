@@ -1,4 +1,5 @@
 use crate::{
+    FormulaName,
     error::{FormulaError, UnsupportedReason},
     select_bottle,
     types::Formula,
@@ -45,7 +46,7 @@ pub fn check_supportability(formula: &Formula, host_tag: &str) -> Result<(), For
 
 fn unsupported(name: &str, reason: UnsupportedReason) -> FormulaError {
     FormulaError::Unsupported {
-        name: name.to_owned(),
+        name: FormulaName::from(name),
         reason,
     }
 }
@@ -144,13 +145,13 @@ mod tests {
             .stable
             .as_mut()
             .ok_or_else(|| FormulaError::NotFound {
-                name: "compat".to_owned(),
+                name: FormulaName::from("compat"),
             })?;
         let bottle = stable
             .files
             .remove(TAG)
             .ok_or_else(|| FormulaError::NotFound {
-                name: TAG.to_owned(),
+                name: FormulaName::from(TAG),
             })?;
         stable.files.insert("arm64_sonoma".to_owned(), bottle);
 

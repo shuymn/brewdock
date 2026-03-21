@@ -6,6 +6,7 @@ mod api;
 mod bottle_selection;
 pub mod cellar_type;
 pub mod error;
+mod formula_name;
 mod resolve;
 mod supportability;
 mod types;
@@ -14,6 +15,7 @@ pub use api::{FormulaCache, FormulaRepository, HttpFormulaRepository};
 pub use bottle_selection::{SelectedBottle, select_bottle};
 pub use cellar_type::CellarType;
 pub use error::{FormulaError, UnsupportedReason};
+pub use formula_name::FormulaName;
 pub use resolve::resolve_install_order;
 pub use supportability::check_supportability;
 pub use types::{

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
+    FormulaName,
     error::{DependencyCycle, FormulaError},
     types::Formula,
 };
@@ -56,7 +57,7 @@ fn visit<'a, S: ::std::hash::BuildHasher>(
     }
 
     let formula = formulae.get(name).ok_or_else(|| FormulaError::NotFound {
-        name: name.to_owned(),
+        name: FormulaName::from(name),
     })?;
 
     state.insert(name, VisitState::InProgress);

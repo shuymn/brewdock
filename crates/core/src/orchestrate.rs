@@ -14,7 +14,7 @@ use brewdock_cellar::{
     relocate_keg, run_post_install, unlink, validate_post_install, write_receipt,
 };
 use brewdock_formula::{
-    CellarType, Formula, FormulaCache, FormulaError, FormulaRepository, Requirement,
+    CellarType, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository, Requirement,
     SelectedBottle, UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
 };
 use futures::future::try_join_all;
@@ -228,9 +228,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 to_install
                     .iter()
                     .map(|name| {
-                        let f = cache
-                            .get(name)
-                            .ok_or_else(|| FormulaError::NotFound { name: name.clone() })?;
+                        let f = cache.get(name).ok_or_else(|| FormulaError::NotFound {
+                            name: FormulaName::from(name.clone()),
+                        })?;
                         Ok(PlanEntry {
                             name: name.clone(),
                             version: pkg_version(&f.versions.stable, f.revision),
@@ -285,9 +285,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             let resolved_methods: Vec<_> = to_install
                 .iter()
                 .map(|name| {
-                    let formula = cache
-                        .get(name)
-                        .ok_or_else(|| FormulaError::NotFound { name: name.clone() })?;
+                    let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
+                        name: FormulaName::from(name.clone()),
+                    })?;
                     let method =
                         Self::instrument_phase("install", "resolve-install-method", name, || {
                             self.resolve_install_method(formula)
@@ -389,7 +389,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 "update",
                 "fetch-formula-index",
                 "formula-index",
-                self.repo.get_all_formulae(),
+                self.repo.all_formulae(),
             )
             .await?;
             let count = formulae.len();
@@ -586,7 +586,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             if cache.get(&name).is_some() {
                 continue;
             }
-            let formula = self.repo.get_formula(&name).await?;
+            let formula = self.repo.formula(&name).await?;
             for dep in self.plan_dependencies(&formula)? {
                 if cache.get(&dep).is_none() {
                     queue.push_back(dep);
@@ -616,7 +616,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 "upgrade-discovery",
                 "fetch-formula-metadata",
                 &keg.name,
-                self.repo.get_formula(&keg.name),
+                self.repo.formula(&keg.name),
             )
             .await?;
             check_supportability(&formula, host_tag)?;
@@ -698,7 +698,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
         for name in to_install.iter().map(String::as_str) {
             let formula = cache.get(name).ok_or_else(|| FormulaError::NotFound {
-                name: name.to_owned(),
+                name: FormulaName::from(name),
             })?;
             let method = Self::instrument_phase(
                 install_context.operation,
@@ -798,7 +798,9 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             }
             InstallMethod::Source(plan) => {
                 let checksum = plan.source_checksum.as_deref().ok_or_else(|| {
-                    SourceBuildError::MissingSourceChecksum(plan.formula_name.clone())
+                    SourceBuildError::MissingSourceChecksum(FormulaName::from(
+                        plan.formula_name.clone(),
+                    ))
                 })?;
                 let data = Self::instrument_async_phase(
                     operation,
@@ -810,24 +812,39 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 .await?;
 
                 let parent = self.layout.cache_dir().join("sources");
-                std::fs::create_dir_all(&parent)?;
-                let tempdir = tempfile::tempdir_in(parent)?;
-                let archive_path = tempdir
-                    .path()
-                    .join(source_archive_filename(&plan.source_url).unwrap_or("source.tar.gz"));
-                Self::instrument_phase(
+                let formula_name = plan.formula_name.clone();
+                let source_url = plan.source_url.clone();
+                let span_persist = tracing::info_span!(
+                    "bd.phase",
                     operation,
-                    "persist-source-archive",
-                    &plan.formula_name,
-                    || std::fs::write(&archive_path, &data),
-                )?;
+                    phase = "persist-source-archive",
+                    target = formula_name.as_str(),
+                );
+                let span_extract = tracing::info_span!(
+                    "bd.phase",
+                    operation,
+                    phase = "extract-source-archive",
+                    target = formula_name.as_str(),
+                );
 
-                let source_root = Self::instrument_phase(
-                    operation,
-                    "extract-source-archive",
-                    &plan.formula_name,
-                    || extract_source_archive(&archive_path, tempdir.path()),
-                )?;
+                let (source_root, tempdir) = tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(&parent)?;
+                    let tempdir = tempfile::tempdir_in(parent)?;
+                    let archive_path = tempdir
+                        .path()
+                        .join(source_archive_filename(&source_url).unwrap_or("source.tar.gz"));
+                    {
+                        let _entered = span_persist.enter();
+                        std::fs::write(&archive_path, &data)?;
+                    }
+                    let source_root = {
+                        let _entered = span_extract.enter();
+                        extract_source_archive(&archive_path, tempdir.path())?
+                    };
+                    Ok::<_, BrewdockError>((source_root, tempdir))
+                })
+                .await
+                .map_err(|err| BrewdockError::from(std::io::Error::other(err)))??;
 
                 Ok(PrefetchedPayload::Source {
                     source_root,
@@ -1116,10 +1133,10 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 .ruby_source_path
                 .as_deref()
                 .ok_or_else(|| FormulaError::Unsupported {
-                    name: formula.name.clone(),
+                    name: FormulaName::from(formula.name.clone()),
                     reason: UnsupportedReason::PostInstallDefined,
                 })?;
-        let source = self.repo.get_ruby_source(ruby_source_path).await?;
+        let source = self.repo.ruby_source(ruby_source_path).await?;
         Ok(Some(source))
     }
 
@@ -1152,14 +1169,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
 
             if formula.urls.stable.is_none() {
                 return Err(FormulaError::Unsupported {
-                    name: formula.name.clone(),
-                    reason: UnsupportedReason::IncompatibleCellar(bottle.cellar.to_string()),
+                    name: FormulaName::from(formula.name.clone()),
+                    reason: UnsupportedReason::IncompatibleCellar(bottle.cellar),
                 }
                 .into());
             }
         } else if formula.urls.stable.is_none() {
             return Err(FormulaError::Unsupported {
-                name: formula.name.clone(),
+                name: FormulaName::from(formula.name.clone()),
                 reason: UnsupportedReason::NoBottleForTag(self.host_tag.to_string()),
             }
             .into());
@@ -1213,10 +1230,9 @@ fn build_source_plan(
         .stable
         .as_ref()
         .ok_or_else(|| SourceBuildError::UnsupportedSourceArchive(formula.name.clone()))?;
-    let source_checksum = stable
-        .checksum
-        .clone()
-        .ok_or_else(|| SourceBuildError::MissingSourceChecksum(formula.name.clone()))?;
+    let source_checksum = stable.checksum.clone().ok_or_else(|| {
+        SourceBuildError::MissingSourceChecksum(FormulaName::from(formula.name.clone()))
+    })?;
     if source_archive_kind(&stable.url).is_none() {
         return Err(SourceBuildError::UnsupportedSourceArchive(
             stable.url.clone(),
@@ -1788,25 +1804,25 @@ mod tests {
     }
 
     impl FormulaRepository for MockRepo {
-        async fn get_formula(&self, name: &str) -> Result<Formula, FormulaError> {
+        async fn formula(&self, name: &str) -> Result<Formula, FormulaError> {
             self.formulae
                 .get(name)
                 .cloned()
                 .ok_or_else(|| FormulaError::NotFound {
-                    name: name.to_owned(),
+                    name: FormulaName::from(name),
                 })
         }
 
-        async fn get_all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
+        async fn all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
             Ok(self.formulae.values().cloned().collect())
         }
 
-        async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
+        async fn ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
             self.ruby_sources
                 .get(ruby_source_path)
                 .cloned()
                 .ok_or_else(|| FormulaError::NotFound {
-                    name: ruby_source_path.to_owned(),
+                    name: FormulaName::from(ruby_source_path),
                 })
         }
     }

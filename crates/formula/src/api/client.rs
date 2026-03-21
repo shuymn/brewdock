@@ -1,4 +1,4 @@
-use crate::{error::FormulaError, types::Formula};
+use crate::{FormulaName, error::FormulaError, types::Formula};
 
 const DEFAULT_API_BASE_URL: &str = "https://formulae.brew.sh/api";
 const DEFAULT_CORE_RAW_BASE_URL: &str =
@@ -15,7 +15,7 @@ pub trait FormulaRepository: Send + Sync {
     ///
     /// Returns [`FormulaError::NotFound`] if the formula does not exist.
     /// Returns [`FormulaError::Network`] on HTTP failure.
-    fn get_formula(
+    fn formula(
         &self,
         name: &str,
     ) -> impl std::future::Future<Output = Result<Formula, FormulaError>> + Send;
@@ -25,7 +25,7 @@ pub trait FormulaRepository: Send + Sync {
     /// # Errors
     ///
     /// Returns [`FormulaError::Network`] on HTTP failure.
-    fn get_all_formulae(
+    fn all_formulae(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<Formula>, FormulaError>> + Send;
 
@@ -34,7 +34,7 @@ pub trait FormulaRepository: Send + Sync {
     /// # Errors
     ///
     /// Returns [`FormulaError::Network`] on HTTP failure.
-    fn get_ruby_source(
+    fn ruby_source(
         &self,
         ruby_source_path: &str,
     ) -> impl std::future::Future<Output = Result<String, FormulaError>> + Send;
@@ -82,13 +82,13 @@ impl Default for HttpFormulaRepository {
 }
 
 impl FormulaRepository for HttpFormulaRepository {
-    async fn get_formula(&self, name: &str) -> Result<Formula, FormulaError> {
+    async fn formula(&self, name: &str) -> Result<Formula, FormulaError> {
         let url = format!("{}/formula/{name}.json", self.base_url);
         let response = self.client.get(&url).send().await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(FormulaError::NotFound {
-                name: name.to_owned(),
+                name: FormulaName::from(name),
             });
         }
 
@@ -97,7 +97,7 @@ impl FormulaRepository for HttpFormulaRepository {
         Ok(formula)
     }
 
-    async fn get_all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
+    async fn all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
         let url = format!("{}/formula.json", self.base_url);
         let response = self.client.get(&url).send().await?;
         let response = response.error_for_status()?;
@@ -105,7 +105,7 @@ impl FormulaRepository for HttpFormulaRepository {
         Ok(formulae)
     }
 
-    async fn get_ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
+    async fn ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
         let path = validate_ruby_source_path(ruby_source_path)?;
         let url = format!("{}/{}", self.core_raw_base_url, path);
         let response = self.client.get(&url).send().await?;
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_formula_success() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_formula_success() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start();
         let formula = server.mock(|when, then| {
             when.method(GET).path("/formula/jq.json");
@@ -230,7 +230,7 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_formula("jq").await?;
+        let result = repo.formula("jq").await?;
 
         formula.assert();
         assert_eq!(result.name, "jq");
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_formula_not_found() {
+    async fn test_formula_not_found() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/formula/missing.json");
@@ -247,13 +247,13 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_formula("missing").await;
+        let result = repo.formula("missing").await;
 
         assert!(matches!(result, Err(FormulaError::NotFound { .. })));
     }
 
     #[tokio::test]
-    async fn test_get_formula_non_404_http_error() {
+    async fn test_formula_non_404_http_error() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/formula/jq.json");
@@ -261,13 +261,13 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_formula("jq").await;
+        let result = repo.formula("jq").await;
 
         assert!(matches!(result, Err(FormulaError::Network(_))));
     }
 
     #[tokio::test]
-    async fn test_get_formula_invalid_json() {
+    async fn test_formula_invalid_json() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/formula/jq.json");
@@ -277,13 +277,13 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_formula("jq").await;
+        let result = repo.formula("jq").await;
 
         assert!(matches!(result, Err(FormulaError::Network(_))));
     }
 
     #[tokio::test]
-    async fn test_get_formula_parses_live_uses_from_macos_shape()
+    async fn test_formula_parses_live_uses_from_macos_shape()
     -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start();
         let formula = server.mock(|when, then| {
@@ -294,7 +294,7 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_formula("zsh-completions").await?;
+        let result = repo.formula("zsh-completions").await?;
 
         formula.assert();
         assert_eq!(result.name, "zsh-completions");
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_all_formulae_success() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_all_formulae_success() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start();
         let formulae = server.mock(|when, then| {
             when.method(GET).path("/formula.json");
@@ -313,7 +313,7 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_all_formulae().await?;
+        let result = repo.all_formulae().await?;
 
         formulae.assert();
         assert_eq!(result.len(), 1);
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_all_formulae_parses_mixed_uses_from_macos_shape()
+    async fn test_all_formulae_parses_mixed_uses_from_macos_shape()
     -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start();
         let formulae = server.mock(|when, then| {
@@ -333,7 +333,7 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_all_formulae().await?;
+        let result = repo.all_formulae().await?;
 
         formulae.assert();
         assert_eq!(result.len(), 2);
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_all_formulae_http_error() {
+    async fn test_all_formulae_http_error() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/formula.json");
@@ -351,13 +351,13 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_all_formulae().await;
+        let result = repo.all_formulae().await;
 
         assert!(matches!(result, Err(FormulaError::Network(_))));
     }
 
     #[tokio::test]
-    async fn test_get_ruby_source_success() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_ruby_source_success() -> Result<(), Box<dyn std::error::Error>> {
         let server = MockServer::start();
         let source = server.mock(|when, then| {
             when.method(GET).path("/Formula/t/test.rb");
@@ -367,7 +367,7 @@ mod tests {
         });
 
         let repo = make_repo(&server);
-        let result = repo.get_ruby_source("Formula/t/test.rb").await?;
+        let result = repo.ruby_source("Formula/t/test.rb").await?;
 
         source.assert();
         assert!(result.contains("class Test < Formula"));
@@ -375,11 +375,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_ruby_source_rejects_encoded_traversal() {
+    async fn test_ruby_source_rejects_encoded_traversal() {
         let server = MockServer::start();
         let repo = make_repo(&server);
 
-        let result = repo.get_ruby_source("Formula/%2e%2e/secret.rb").await;
+        let result = repo.ruby_source("Formula/%2e%2e/secret.rb").await;
 
         assert!(matches!(
             result,
@@ -388,12 +388,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_ruby_source_does_not_escape_raw_source_prefix()
+    async fn test_ruby_source_does_not_escape_raw_source_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
         let (base_url, captured_path) = spawn_capture_server()?;
         let repo = HttpFormulaRepository::with_urls(base_url.clone(), format!("{base_url}/root"));
 
-        let result = repo.get_ruby_source("../secret.rb").await;
+        let result = repo.ruby_source("../secret.rb").await;
         let request_path = captured_path
             .lock()
             .map_err(|error| std::io::Error::other(error.to_string()))?
