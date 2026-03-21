@@ -20,7 +20,7 @@ Rust CLI (`bd`) that acts as a performance-oriented, Homebrew-coexisting client 
 - All CI jobs run on macOS (`macos-latest`)
 - `formulae.brew.sh` JSON API (no tap clone)
 - Homebrew-compatible file layout, receipt, linking (`/opt/homebrew` paths always flow through `Layout`; Ruby API compatibility is non-goal)
-- Command surface may expand beyond `install` / `update` / `upgrade`, but new commands should reuse shared metadata/install-state layers instead of introducing parallel architectures
+- Command surface (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`) reuses shared metadata/install-state layers; new commands should follow the same pattern instead of introducing parallel architectures
 - Third-party taps remain out of scope for now, but metadata/cache boundaries and formula identity should not assume `homebrew/core` so rigidly that a future limited `tap/name` read/install path becomes an architectural rewrite
 - If Ruby execution is ever introduced as a compatibility escape hatch, it must remain an explicit last-resort, opt-in fallback with visible diagnostics/state markers rather than the default path
 - `unsafe_code` forbidden; `unwrap`/`expect`/`todo`/`dbg!` denied
@@ -33,15 +33,43 @@ Rust CLI (`bd`) that acts as a performance-oriented, Homebrew-coexisting client 
 cli → core → {formula, bottle, cellar}
 ```
 
-- `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve. No core dependency.
+- `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve, metadata cache and index. No core dependency.
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
-- `brewdock-cellar`: materialize, receipt, relocation, linking, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only).
-- `brewdock-core`: Layout, platform, lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, and user-facing progress event emission. Depends on formula, bottle, cellar.
-- `brewdock-cli`: clap commands, tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only.
+- `brewdock-cellar`: materialize, receipt, relocation, linking, keg discovery, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only).
+- `brewdock-core`: Layout, platform (`HostTag` auto-detection), lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, diagnostics, and user-facing progress event emission. Depends on formula, bottle, cellar.
+- `brewdock-cli`: clap commands (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`), tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only.
 
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
 Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
-Install orchestration is stage-driven via an explicit execution plan. Bottle and source installs both flow through `network acquire -> local prepare -> finalize`, where network acquire and local prepare use explicit bounded concurrency, source builds are admitted via `defer-to-finalize` entries instead of a separate control path, blob/store publication happens only after checksum-complete success, and finalize remains the only Homebrew-visible mutation boundary.
+Install orchestration is stage-driven via an explicit execution plan:
+
+```mermaid
+flowchart TD
+    R[Resolve deps + select install method] --> PA
+
+    subgraph PA ["Prefetch — concurrent (max 4)"]
+        direction LR
+        PA1[Formula A: download + SHA256] ~~~ PA2[Formula B: download + SHA256] ~~~ PA3[...]
+    end
+
+    PA -->|barrier: all complete| LP
+
+    subgraph LP ["Local Prepare — concurrent (max 4)"]
+        direction LR
+        LP1["Bottle: extract → CAS store → relocation manifest"] ~~~ LP2["Source: deferred (no-op)"]
+    end
+
+    LP -->|barrier: all complete| FN
+
+    subgraph FN ["Finalize — sequential (topological order)"]
+        direction TB
+        FN1["Bottle: materialize → relocate → receipt → link → post_install"]
+        FN2["Source: build → receipt → link → post_install"]
+        FN1 --> FN2
+    end
+```
+
+Each stage is a batch barrier: all formulae complete stage N before any enters stage N+1. Network acquire and local prepare use `buffer_unordered`/`buffered` with max concurrency of 4. Source builds skip local prepare via `defer-to-finalize` entries and run the actual build during finalize. Blob/store publication happens only after checksum-complete success. Finalize remains the only Homebrew-visible mutation boundary and runs sequentially in topological order to preserve dependency ordering.
 Bottle finalize derives a relocation manifest from extracted store payloads before materialization and reuses it after copy so finalize avoids a second full-tree relocation scan; `clonefile`-first copy remains deferred until it demonstrates enough additional gain to justify its macOS/filesystem-specific fallback surface.
 User-facing terminal output is not derived from the `tracing` subscriber. `brewdock-core` emits explicit progress events for CLI consumption, while `tracing` remains reserved for diagnostics and benchmark capture.
 
@@ -73,19 +101,28 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 
 ## Open Questions
 
-None blocking. Decision record: [ADR 0001](adr/0001-nanobrew-install-method.md).
+None blocking. Decision records: [ADR 0001](adr/0001-nanobrew-install-method.md), [ADR 0002](adr/0002-user-facing-progress-output.md), [ADR 0003](adr/0003-copy-strategy-next-step.md).
 
 ## Revisit Trigger
 
 - Need to support Linux runtime or Intel Mac
 - Need to support cask or external taps
 - Formula count exceeds JSON API scalability
-- Read-heavy commands such as `search`, `info`, `list`, or `outdated` become first-class enough that metadata cache design dominates user-facing latency
+- Read-heavy commands (`search`, `info`, `list`, `outdated`) hit metadata cache scalability limits that dominate user-facing latency
 - Terminal UX needs richer interaction than non-interactive progress plus static summaries
 - Need Homebrew Formula DSL compatibility beyond restricted AST lowering and schema normalization
 - Generic source build fallback cannot cover target formulae without Ruby formula execution
 
 ## post_install runtime semantics
+
+```mermaid
+flowchart LR
+    A[Formula Ruby source] -->|ruby-prism| B[AST]
+    B -->|allowlisted shapes only| C[Internal Operations]
+    C -->|pattern match| D{Schema recognized?}
+    D -->|yes| E[Normalized schema execution]
+    D -->|no| F[Execute ops directly]
+```
 
 - Parse `post_install` from full formula source and allow helper methods to participate only as static lowering material.
 - The parser accepts representational variance such as receiverless space-call / paren-call, zero-arg helper calls, receiver-based path helper calls, `if OS.mac?`, `if path.exist?`, `rm(..., force: true)`, `rm(...) if ...exist?`, `install_symlink`, and `Formula["..."].pkgetc`.
