@@ -416,4 +416,37 @@ mod tests {
             PathBuf::from("b")
         );
     }
+
+    #[test]
+    fn test_link_and_unlink_refuse_hostile_prefix_symlink() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let (prefix, keg_path) = setup_keg(dir.path(), &[("bin/tool", "#!/bin/sh")])?;
+
+        let hostile_target = dir.path().join("outside/tool");
+        std::fs::create_dir_all(
+            hostile_target
+                .parent()
+                .ok_or_else(|| std::io::Error::other("missing parent"))?,
+        )?;
+        std::fs::create_dir_all(prefix.join("bin"))?;
+        std::os::unix::fs::symlink(&hostile_target, prefix.join("bin/tool"))?;
+
+        let result = link(&keg_path, &prefix);
+        assert!(
+            matches!(result, Err(CellarError::LinkCollision { .. })),
+            "hostile symlinks in the prefix should be rejected"
+        );
+
+        let symlink_target = std::fs::read_link(prefix.join("bin/tool"))?;
+        assert_eq!(symlink_target, hostile_target);
+
+        unlink(&keg_path, &prefix)?;
+        assert!(
+            prefix.join("bin/tool").is_symlink(),
+            "unlink should not delete a symlink that resolves outside the keg"
+        );
+        assert_eq!(std::fs::read_link(prefix.join("bin/tool"))?, hostile_target);
+        Ok(())
+    }
 }
