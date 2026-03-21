@@ -294,7 +294,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: executor 並列化だけ先に入れても finalize 境界と rollback 契約が固定されなければ `/opt/homebrew` 共存 contract を閉じられない
   - Escalate if: prefix-mutating stepsを分離しても Homebrew-visible state の整合を保てない場合
 
-- [ ] Theme: Warm-path cache hit and per-keg parallel materialize/relocate
+- [x] Theme: Warm-path cache hit and per-keg parallel materialize/relocate
   - Outcome: warm install が blob/extract store hit で download/extract をスキップし、独立 keg の materialize/relocate が並列に進む
   - Goal: prefetch の warm-path skip（blob store hit → download skip, extract dir hit → extract skip）と、per-keg 独立の materialize/relocate 並列化を実装する
   - Must Not Break: Homebrew-visible receipt/Cellar/opt/link contract を維持する; rollback は failure 時に壊れた prefix を残さない; cold path の correctness を壊さない; `task check` green
