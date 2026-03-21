@@ -10,6 +10,7 @@ mod formula_name;
 mod resolve;
 mod supportability;
 mod types;
+mod version;
 
 pub use api::{
     FetchOutcome, FormulaCache, FormulaRepository, HttpFormulaRepository, IndexMetadata,
@@ -25,6 +26,7 @@ pub use types::{
     BottleFile, BottleSpec, BottleStable, Formula, FormulaUrls, MacOsDependency,
     MacOsDependencyDetail, NamedEntry, Requirement, StableUrl, Versions,
 };
+pub use version::PkgVersion;
 
 #[cfg(test)]
 mod test_support {
