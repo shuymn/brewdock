@@ -2,7 +2,8 @@ use std::path::Path;
 
 use brewdock_cellar::{
     InstallReason, InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
-    RelocationScope, atomic_symlink_replace, materialize, relocate_keg, unlink,
+    RelocationManifest, RelocationScope, atomic_symlink_replace, materialize,
+    relocate_keg_with_manifest, unlink,
 };
 use brewdock_formula::{Formula, FormulaCache};
 
@@ -41,7 +42,7 @@ pub fn build_receipt(
 /// Shared by both the parallel install path and the serial upgrade path.
 #[expect(
     clippy::too_many_arguments,
-    reason = "thin delegation to materialize + relocate_keg"
+    reason = "thin delegation to materialize + relocate_keg_with_manifest"
 )]
 pub fn materialize_and_relocate_bottle(
     source_dir: &Path,
@@ -51,8 +52,9 @@ pub fn materialize_and_relocate_bottle(
     formula_name: &str,
     relocation_scope: RelocationScope,
 ) -> Result<(), BrewdockError> {
+    let relocation_manifest = RelocationManifest::derive(source_dir)?;
     materialize(source_dir, keg_path, opt_dir, formula_name)?;
-    relocate_keg(keg_path, prefix, relocation_scope)?;
+    relocate_keg_with_manifest(keg_path, prefix, relocation_scope, &relocation_manifest)?;
     Ok(())
 }
 

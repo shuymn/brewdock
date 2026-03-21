@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{error::CellarError, fs};
 
@@ -25,6 +25,41 @@ pub enum RelocationScope {
     Full,
 }
 
+/// Relative file paths in an extracted bottle that require relocation work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelocationManifest(Vec<PathBuf>);
+
+impl RelocationManifest {
+    /// Derives a relocation manifest from an extracted bottle root.
+    ///
+    /// The manifest contains only regular files whose contents include
+    /// Homebrew placeholder bytes, which keeps finalize-time relocation from
+    /// rescanning the full keg tree after materialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CellarError::Io`] on filesystem failure.
+    pub fn derive(root: &Path) -> Result<Self, CellarError> {
+        let entries = fs::walk_files(root)?
+            .into_iter()
+            .filter_map(|path| {
+                let relative = path.strip_prefix(root).ok()?.to_path_buf();
+                match std::fs::read(&path) {
+                    Ok(data) if has_placeholder(&data) => Some(Ok(relative)),
+                    Ok(_) => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => None,
+                    Err(error) => Some(Err(CellarError::from(error))),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self(entries))
+    }
+
+    fn paths(&self) -> &[PathBuf] {
+        &self.0
+    }
+}
+
 /// Rewrites `@@HOMEBREW_*@@` placeholders in all files under `keg_path`.
 ///
 /// - When `scope` is [`RelocationScope::Full`], Mach-O binaries are patched
@@ -40,36 +75,22 @@ pub fn relocate_keg(
     prefix: &Path,
     scope: RelocationScope,
 ) -> Result<(), CellarError> {
-    let manifest = fs::walk_files(keg_path)?
-        .into_iter()
-        .filter_map(|path| path.strip_prefix(keg_path).ok().map(Path::to_path_buf))
-        .collect::<Vec<_>>();
+    let manifest = RelocationManifest::derive(keg_path)?;
     relocate_keg_with_manifest(keg_path, prefix, scope, &manifest)
 }
 
-#[cfg(test)]
-pub(crate) fn build_relocation_manifest(
-    root: &Path,
-) -> Result<Vec<std::path::PathBuf>, CellarError> {
-    fs::walk_files(root)?
-        .into_iter()
-        .filter_map(|path| {
-            let relative = path.strip_prefix(root).ok()?.to_path_buf();
-            match std::fs::read(&path) {
-                Ok(data) if has_placeholder(&data) => Some(Ok(relative)),
-                Ok(_) => None,
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => None,
-                Err(error) => Some(Err(CellarError::from(error))),
-            }
-        })
-        .collect()
-}
-
-pub(crate) fn relocate_keg_with_manifest(
+/// Rewrites placeholders using a manifest derived from extracted bottle content.
+///
+/// `manifest` must contain paths relative to `keg_path`.
+///
+/// # Errors
+///
+/// Returns [`CellarError::Io`] on filesystem or subprocess failure.
+pub fn relocate_keg_with_manifest(
     keg_path: &Path,
     prefix: &Path,
     scope: RelocationScope,
-    manifest: &[std::path::PathBuf],
+    manifest: &RelocationManifest,
 ) -> Result<(), CellarError> {
     let cellar = prefix.join("Cellar");
     let prefix_str = path_str(prefix)?.to_owned();
@@ -81,7 +102,7 @@ pub(crate) fn relocate_keg_with_manifest(
         (REPOSITORY_PLACEHOLDER, prefix_str.as_str()),
     ];
 
-    for relative_path in manifest {
+    for relative_path in manifest.paths() {
         let file = keg_path.join(relative_path);
         let data = match std::fs::read(&file) {
             Ok(d) => d,
@@ -328,6 +349,8 @@ fn path_str(path: &Path) -> Result<&str, CellarError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -587,6 +610,53 @@ Load command 16
             "Mach-O file must not be modified in TextOnly mode"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_relocation_manifest_only_contains_placeholder_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("bin"))?;
+        std::fs::create_dir_all(root.join("share"))?;
+        std::fs::write(root.join("bin/tool"), "#!@@HOMEBREW_PREFIX@@/bin/sh\n")?;
+        std::fs::write(root.join("share/readme.txt"), "plain text\n")?;
+        std::os::unix::fs::symlink("tool", root.join("bin/tool-link"))?;
+
+        let manifest = RelocationManifest::derive(&root)?;
+
+        assert_eq!(manifest.paths(), &[PathBuf::from("bin/tool")]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_relocate_keg_with_manifest_only_touches_listed_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/formula/1.0");
+        std::fs::create_dir_all(keg_path.join("bin"))?;
+        std::fs::write(
+            keg_path.join("bin/in-manifest"),
+            "#!@@HOMEBREW_PREFIX@@/bin/python3\n",
+        )?;
+        std::fs::write(
+            keg_path.join("bin/not-in-manifest"),
+            "#!@@HOMEBREW_PREFIX@@/bin/python3\n",
+        )?;
+
+        let manifest = RelocationManifest(vec![PathBuf::from("bin/in-manifest")]);
+        relocate_keg_with_manifest(&keg_path, &prefix, RelocationScope::TextOnly, &manifest)?;
+
+        assert_eq!(
+            std::fs::read_to_string(keg_path.join("bin/in-manifest"))?,
+            format!("#!{}/bin/python3\n", prefix.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(keg_path.join("bin/not-in-manifest"))?,
+            "#!@@HOMEBREW_PREFIX@@/bin/python3\n"
+        );
         Ok(())
     }
 }

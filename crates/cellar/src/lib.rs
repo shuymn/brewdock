@@ -12,9 +12,6 @@ pub mod receipt;
 pub mod relocate;
 pub mod state;
 
-#[cfg(test)]
-mod copy_strategy_spike;
-
 pub use discover::{InstalledKeg, discover_installed_kegs, find_installed_keg};
 pub use error::CellarError;
 pub use link::{link, unlink};
@@ -27,4 +24,4 @@ pub use receipt::{
     InstallReason, InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
     write_receipt,
 };
-pub use relocate::{RelocationScope, relocate_keg};
+pub use relocate::{RelocationManifest, RelocationScope, relocate_keg, relocate_keg_with_manifest};
