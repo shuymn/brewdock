@@ -294,6 +294,22 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: executor 並列化だけ先に入れても finalize 境界と rollback 契約が固定されなければ `/opt/homebrew` 共存 contract を閉じられない
   - Escalate if: prefix-mutating stepsを分離しても Homebrew-visible state の整合を保てない場合
 
+- [ ] Theme: Warm-path cache hit and per-keg parallel materialize/relocate
+  - Outcome: warm install が blob/extract store hit で download/extract をスキップし、独立 keg の materialize/relocate が並列に進む
+  - Goal: prefetch の warm-path skip（blob store hit → download skip, extract dir hit → extract skip）と、per-keg 独立の materialize/relocate 並列化を実装する
+  - Must Not Break: Homebrew-visible receipt/Cellar/opt/link contract を維持する; rollback は failure 時に壊れた prefix を残さない; cold path の correctness を壊さない; `task check` green
+  - Non-goals: store-first runtime; dedicated prefix; keg dedup/hardlink/reflink; `multi_thread` runtime への移行; uninstall 実装
+  - Acceptance (EARS):
+    - When a blob for the requested bottle SHA256 already exists in the store, the system shall skip download and blob store write
+    - When extracted content for the requested bottle already exists in the store dir, the system shall skip extraction
+    - When independent formulae reach the materialize/relocate phase, the system shall allow per-keg work to proceed without waiting for unrelated formulae
+    - When warm benchmark is replayed after the change, the system shall show measurable wall-time improvement over the pre-change warm baseline
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-benchmark.sh --formula-set jq,wget --manager brewdock --manager zerobrew; oracle=integration tests cover warm-path skip and parallel materialize, and VM benchmark shows warm improvement without state regression; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget; notes=architecture.md Storage path rationale already anticipates warm-path optimization; pre-change baseline is brewdock warm 5.32s vs zerobrew warm 0.64s for jq,wget (8 formulae); materialize-payload 2285ms + relocate-keg 1818ms = 77% of wall time`
+  - Gates: `static`, `integration`, `benchmark`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- install`; `./tests/vm-smoke-test.sh --formula jq --formula wget`; `./tests/vm-benchmark.sh --formula-set jq,wget --manager brewdock --manager zerobrew`
+  - Why not split vertically further?: warm-path skip だけ入れても materialize/relocate が wall time の 77% を占めるため user-visible improvement が小さく、並列 materialize だけ入れても warm-path で毎回 download/extract を繰り返すので warm benchmark が閉じない; 両方セットで初めて warm benchmark の改善が user-visible になる
+  - Escalate if: per-keg materialize/relocate の並列化で opt symlink や keg parent directory の操作に予期しない競合が発生し、per-keg 独立性の前提が崩れる場合
+
 - [ ] Theme: Metadata cache redesign for update and future formula/cask scale
   - Outcome: `update` と将来の search/info/install planning が full snapshot 一本足ではなくなり、formula/cask 件数が増えても metadata path が支配的ボトルネックになりにくい
   - Goal: Homebrew 互換 install state を維持したまま、metadata 取得と local cache の責務を再設計して `update` を将来の scale に備えさせる
