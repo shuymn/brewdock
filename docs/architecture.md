@@ -41,6 +41,7 @@ cli → core → {formula, bottle, cellar}
 
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
 Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
+Install orchestration is stage-driven via an explicit execution plan. Bottle installs flow through `network acquire -> local prepare -> finalize`, where local prepare is bounded concurrency pre-finalize work and finalize remains the only Homebrew-visible mutation boundary. Source installs may share planning/prefetch machinery, but source build execution remains on the finalize side until a later theme closes the shared staged executor contract.
 
 Each crate owns a `thiserror` error enum. Core aggregates with `#[from]`.
 
