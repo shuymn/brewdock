@@ -8,7 +8,7 @@ use std::{
 
 use ruby_prism::{ConstantId, Node, ParseResult, parse as parse_ruby};
 
-use crate::{error::CellarError, link::relative_from_to};
+use crate::{error::CellarError, link::relative_from_to, util::normalize_absolute_path};
 
 static ROLLBACK_NONCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -156,6 +156,22 @@ impl PostInstallContext {
         }
         path
     }
+
+    fn resolve_allowed_path(&self, expr: &PathExpr) -> Result<PathBuf, CellarError> {
+        let raw = self.resolve_path(expr);
+        let resolved = normalize_absolute_path(&raw).ok_or_else(|| {
+            CellarError::UnsupportedPostInstallSyntax {
+                message: format!("path escapes allowed roots: {}", raw.display()),
+            }
+        })?;
+        if path_is_allowed(&resolved, self) {
+            return Ok(resolved);
+        }
+
+        Err(CellarError::UnsupportedPostInstallSyntax {
+            message: format!("path escapes allowed roots: {}", resolved.display()),
+        })
+    }
 }
 
 fn formula_name_from_keg(keg_path: &Path) -> String {
@@ -271,20 +287,24 @@ fn collect_statement_roots(
             | Statement::GlobRemove { dir: to, .. }
             | Statement::GlobSymlink { link_dir: to, .. }
             | Statement::ForceSymlink { link: to, .. } => {
-                if let Some(root) = rollback_root(&context.resolve_path(to), context) {
+                if let Ok(path) = context.resolve_allowed_path(to)
+                    && let Some(root) = rollback_root(&path, context)
+                {
                     roots.insert(root);
                 }
             }
             Statement::Mkpath(path) | Statement::RemoveIfExists(path) => {
-                if let Some(root) = rollback_root(&context.resolve_path(path), context) {
+                if let Ok(path) = context.resolve_allowed_path(path)
+                    && let Some(root) = rollback_root(&path, context)
+                {
                     roots.insert(root);
                 }
             }
             Statement::InstallSymlink { link_dir, target } => {
-                if let Ok(link_path) = install_symlink_path(
-                    &context.resolve_path(link_dir),
-                    &context.resolve_path(target),
-                ) && let Some(root) = rollback_root(&link_path, context)
+                if let Ok(link_dir) = context.resolve_allowed_path(link_dir)
+                    && let Ok(target) = context.resolve_allowed_path(target)
+                    && let Ok(link_path) = install_symlink_path(&link_dir, &target)
+                    && let Some(root) = rollback_root(&link_path, context)
                 {
                     roots.insert(root);
                 }
@@ -292,7 +312,8 @@ fn collect_statement_roots(
             Statement::System(arguments) => {
                 for argument in arguments.iter().skip(1) {
                     if let Argument::Path(path) = argument
-                        && let Some(root) = rollback_root(&context.resolve_path(path), context)
+                        && let Ok(path) = context.resolve_allowed_path(path)
+                        && let Some(root) = rollback_root(&path, context)
                     {
                         roots.insert(root);
                     }
@@ -1094,7 +1115,8 @@ fn parse_path_expr_ast<'pr>(
         let Some(segment) = parse_string(&arguments[0])? else {
             return unsupported("path join segment must be string literal");
         };
-        path.segments.push(segment);
+        path.segments
+            .push(validate_path_segment(&segment)?.to_owned());
         return Ok(path);
     }
 
@@ -1221,10 +1243,19 @@ fn parse_path_segments(raw: &str) -> Result<Vec<String>, CellarError> {
             .ok_or_else(|| CellarError::UnsupportedPostInstallSyntax {
                 message: format!("unterminated string literal in path: {remainder}"),
             })?;
-        segments.push(stripped[..end].to_owned());
+        segments.push(validate_path_segment(&stripped[..end])?.to_owned());
         remainder = stripped[end + 1..].trim();
     }
     Ok(segments)
+}
+
+fn validate_path_segment(segment: &str) -> Result<&str, CellarError> {
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return Err(CellarError::UnsupportedPostInstallSyntax {
+            message: format!("unsupported path segment: {segment}"),
+        });
+    }
+    Ok(segment)
 }
 
 fn parse_formula_ref(node: &Node<'_>) -> Result<Option<String>, CellarError> {
@@ -1391,6 +1422,15 @@ fn append_segment(path: &PathExpr, segment: &str) -> PathExpr {
     next
 }
 
+const ALLOWED_PREFIX_DIRS: &[&str] = &["etc", "var", "share", "bin", "sbin", "lib", "include"];
+
+fn path_is_allowed(path: &Path, context: &PostInstallContext) -> bool {
+    path.starts_with(&context.keg_path)
+        || ALLOWED_PREFIX_DIRS
+            .iter()
+            .any(|&dir| path.starts_with(context.prefix.join(dir)))
+}
+
 fn execute_statements(
     statements: &[Statement],
     context: &PostInstallContext,
@@ -1398,23 +1438,23 @@ fn execute_statements(
     for statement in statements {
         match statement {
             Statement::Mkpath(path) => {
-                std::fs::create_dir_all(context.resolve_path(path))?;
+                std::fs::create_dir_all(context.resolve_allowed_path(path)?)?;
             }
             Statement::Copy { from, to } => {
-                let from = context.resolve_path(from);
-                let to = context.resolve_path(to);
+                let from = context.resolve_allowed_path(from)?;
+                let to = context.resolve_allowed_path(to)?;
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::copy(from, to)?;
             }
             Statement::RemoveIfExists(path) => {
-                remove_path_if_exists(&context.resolve_path(path))?;
+                remove_path_if_exists(&context.resolve_allowed_path(path)?)?;
             }
             Statement::InstallSymlink { link_dir, target } => {
-                let link_dir = context.resolve_path(link_dir);
+                let link_dir = context.resolve_allowed_path(link_dir)?;
                 std::fs::create_dir_all(&link_dir)?;
-                let target = context.resolve_path(target);
+                let target = context.resolve_allowed_path(target)?;
                 let link_path = install_symlink_path(&link_dir, &target)?;
                 remove_path_if_exists(&link_path)?;
                 let link_target = relative_from_to(&link_dir, &target);
@@ -1425,13 +1465,13 @@ fn execute_statements(
                 condition,
                 then_branch,
             } => {
-                if context.resolve_path(condition).exists() {
+                if context.resolve_allowed_path(condition)?.exists() {
                     execute_statements(then_branch, context)?;
                 }
             }
             Statement::RecursiveCopy { from, to } => {
-                let from_path = context.resolve_path(from);
-                let to_path = context.resolve_path(to);
+                let from_path = context.resolve_allowed_path(from)?;
+                let to_path = context.resolve_allowed_path(to)?;
                 let file_name =
                     from_path
                         .file_name()
@@ -1442,8 +1482,8 @@ fn execute_statements(
                 copy_path(&from_path, &dest)?;
             }
             Statement::ForceSymlink { target, link } => {
-                let target_path = context.resolve_path(target);
-                let link_path = context.resolve_path(link);
+                let target_path = context.resolve_allowed_path(target)?;
+                let link_path = context.resolve_allowed_path(link)?;
                 let link_parent =
                     link_path
                         .parent()
@@ -1456,7 +1496,7 @@ fn execute_statements(
                 std::os::unix::fs::symlink(rel_target, &link_path)?;
             }
             Statement::WriteFile { path, content } => {
-                let file_path = context.resolve_path(path);
+                let file_path = context.resolve_allowed_path(path)?;
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -1464,7 +1504,7 @@ fn execute_statements(
                 std::fs::write(file_path, resolved)?;
             }
             Statement::GlobRemove { dir, pattern } => {
-                let dir_path = context.resolve_path(dir);
+                let dir_path = context.resolve_allowed_path(dir)?;
                 if dir_path.is_dir() {
                     for entry in std::fs::read_dir(&dir_path)? {
                         let entry = entry?;
@@ -1483,8 +1523,8 @@ fn execute_statements(
                 pattern,
                 link_dir,
             } => {
-                let source_path = context.resolve_path(source_dir);
-                let link_path = context.resolve_path(link_dir);
+                let source_path = context.resolve_allowed_path(source_dir)?;
+                let link_path = context.resolve_allowed_path(link_dir)?;
                 std::fs::create_dir_all(&link_path)?;
                 if source_path.is_dir() {
                     for entry in std::fs::read_dir(&source_path)? {
@@ -1519,7 +1559,7 @@ fn run_system(arguments: &[Argument], context: &PostInstallContext) -> Result<()
     let command_line = arguments
         .iter()
         .map(|arg| match arg {
-            Argument::Path(path) => Ok(context.resolve_path(path).into_os_string()),
+            Argument::Path(path) => Ok(context.resolve_allowed_path(path)?.into_os_string()),
             Argument::String(value) => Ok(OsString::from(value)),
         })
         .collect::<Result<Vec<_>, CellarError>>()?;
@@ -1644,6 +1684,21 @@ end
             std::fs::read_to_string(prefix.join("var/demo/result.txt"))?,
             "done"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_rejects_empty_source() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+
+        let result = run_post_install("", &PostInstallContext::new(&prefix, &keg, "1.0"));
+        assert!(matches!(
+            result,
+            Err(CellarError::UnsupportedPostInstallSyntax { .. })
+        ));
         Ok(())
     }
 
@@ -1840,6 +1895,94 @@ end
             Err(CellarError::PostInstallCommandFailed { .. })
         ));
         assert!(!prefix.join("var/demo").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_rejects_path_traversal_and_leaves_no_escape_artifacts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+
+        let escape = prefix.join("escape");
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (var/"demo"/".."/".."/"escape").mkpath
+    system "/bin/sh", "-c", "exit 1"
+  end
+end
+"#;
+
+        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        assert!(
+            result.is_err(),
+            "path traversal in post_install should fail closed before mutating outside the prefix"
+        );
+        assert!(
+            !escape.exists(),
+            "path traversal should not leave artifacts outside the prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_rejects_parent_directory_escape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+
+        let source = r#"
+class Demo
+  def post_install
+    (HOMEBREW_PREFIX/".."/".."/"tmp"/"brewdock-owned").mkpath
+  end
+end
+"#;
+
+        let escaped = std::env::temp_dir().join("brewdock-owned");
+        let _ = std::fs::remove_dir_all(&escaped);
+
+        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+
+        assert!(
+            result.is_err(),
+            "post_install path traversal must fail closed before mutating outside prefix"
+        );
+        assert!(
+            !escaped.exists(),
+            "post_install must not create directories outside the prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_rejects_atomic_write_path_traversal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+
+        let escape = prefix.join("escape.txt");
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (etc/"demo"/".."/".."/"escape.txt").atomic_write("owned")
+  end
+end
+"#;
+
+        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        assert!(result.is_err(), "atomic_write traversal should fail closed");
+        assert!(
+            !escape.exists(),
+            "atomic_write traversal should not create files outside allowed roots"
+        );
         Ok(())
     }
 
