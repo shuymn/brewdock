@@ -42,6 +42,7 @@ cli → core → {formula, bottle, cellar}
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
 Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
 Install orchestration is stage-driven via an explicit execution plan. Bottle and source installs both flow through `network acquire -> local prepare -> finalize`, where network acquire and local prepare use explicit bounded concurrency, source builds are admitted via `defer-to-finalize` entries instead of a separate control path, blob/store publication happens only after checksum-complete success, and finalize remains the only Homebrew-visible mutation boundary.
+The next bottle-path optimization after the copy-strategy spike is manifest-targeted relocation derived from extracted store payloads; `clonefile`-first copy remains deferred until it demonstrates enough additional gain to justify its macOS/filesystem-specific fallback surface.
 User-facing terminal output is not derived from the `tracing` subscriber. `brewdock-core` emits explicit progress events for CLI consumption, while `tracing` remains reserved for diagnostics and benchmark capture.
 
 Each crate owns a `thiserror` error enum. Core aggregates with `#[from]`.
