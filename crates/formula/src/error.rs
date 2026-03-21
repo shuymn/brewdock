@@ -36,6 +36,10 @@ pub enum FormulaError {
         path: String,
     },
 
+    /// A filesystem I/O error occurred.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     /// A dependency cycle was detected.
     #[error("cyclic dependency: {0}")]
     CyclicDependency(DependencyCycle),

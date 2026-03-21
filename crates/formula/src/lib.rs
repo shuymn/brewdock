@@ -11,7 +11,10 @@ mod resolve;
 mod supportability;
 mod types;
 
-pub use api::{FormulaCache, FormulaRepository, HttpFormulaRepository};
+pub use api::{
+    FetchOutcome, FormulaCache, FormulaRepository, HttpFormulaRepository, IndexMetadata,
+    MetadataStore,
+};
 pub use bottle_selection::{SelectedBottle, select_bottle};
 pub use cellar_type::CellarType;
 pub use error::{FormulaError, UnsupportedReason};

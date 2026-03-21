@@ -14,8 +14,9 @@ use brewdock_cellar::{
     relocate_keg, run_post_install, unlink, validate_post_install, write_receipt,
 };
 use brewdock_formula::{
-    CellarType, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository, Requirement,
-    SelectedBottle, UnsupportedReason, check_supportability, resolve_install_order, select_bottle,
+    CellarType, FetchOutcome, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository,
+    IndexMetadata, MetadataStore, Requirement, SelectedBottle, UnsupportedReason,
+    check_supportability, resolve_install_order, select_bottle,
 };
 use futures::future::try_join_all;
 use tracing::Instrument;
@@ -132,6 +133,7 @@ pub struct Orchestrator<R, D> {
     downloader: D,
     layout: Layout,
     host_tag: HostTag,
+    metadata_store: MetadataStore,
 }
 
 #[derive(Debug, Clone)]
@@ -196,12 +198,14 @@ struct PendingSourcePayload {
 impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Creates a new orchestrator.
     #[must_use]
-    pub const fn new(repo: R, downloader: D, layout: Layout, host_tag: HostTag) -> Self {
+    pub fn new(repo: R, downloader: D, layout: Layout, host_tag: HostTag) -> Self {
+        let metadata_store = MetadataStore::new(layout.cache_dir());
         Self {
             repo,
             downloader,
             layout,
             host_tag,
+            metadata_store,
         }
     }
 
@@ -385,28 +389,37 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Returns [`BrewdockError`] if the fetch or file write fails.
     pub async fn update(&self) -> Result<usize, BrewdockError> {
         Self::instrument_operation("update", &[], async {
-            let formulae = Self::instrument_async_phase(
+            // Only use ETag for conditional fetch when both metadata and
+            // formulae files are present. If the formulae file is missing
+            // (e.g., manually deleted), force a full re-fetch to restore
+            // integrity rather than accepting a 304 with no local data.
+            let existing_meta = self.metadata_store.load_metadata().ok().flatten();
+            let existing_etag = existing_meta
+                .as_ref()
+                .and_then(|m| m.etag.as_deref())
+                .filter(|_| self.metadata_store.has_formulae());
+
+            let outcome = Self::instrument_async_phase(
                 "update",
                 "fetch-formula-index",
                 "formula-index",
-                self.repo.all_formulae(),
+                self.repo.all_formulae_conditional(existing_etag),
             )
             .await?;
-            let count = formulae.len();
-            Self::instrument_phase(
-                "update",
-                "persist-formula-index",
-                "formula-index",
-                || -> Result<(), BrewdockError> {
-                    let json = serde_json::to_vec(&formulae).map_err(FormulaError::from)?;
-                    let cache_dir = self.layout.cache_dir();
-                    std::fs::create_dir_all(&cache_dir)?;
-                    std::fs::write(cache_dir.join("formula.json"), &json)?;
-                    Ok(())
-                },
-            )?;
-            tracing::info!(count, "formula index cached");
-            Ok(count)
+
+            match outcome {
+                FetchOutcome::Modified { formulae, etag } => {
+                    self.persist_formula_index(&formulae, etag)?;
+                    let count = formulae.len();
+                    tracing::info!(count, "formula index cached");
+                    Ok(count)
+                }
+                FetchOutcome::NotModified => {
+                    let count = existing_meta.map_or(0, |m| m.formula_count);
+                    tracing::info!(count, "formula index unchanged (not modified)");
+                    Ok(count)
+                }
+            }
         })
         .await
     }
@@ -572,13 +585,47 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok((to_install, cache))
     }
 
+    /// Persists the formula index and freshness metadata to disk.
+    fn persist_formula_index(
+        &self,
+        formulae: &[Formula],
+        etag: Option<String>,
+    ) -> Result<(), BrewdockError> {
+        Self::instrument_phase(
+            "update",
+            "persist-formula-index",
+            "formula-index",
+            || -> Result<(), BrewdockError> {
+                self.metadata_store
+                    .save_formulae(formulae)
+                    .map_err(BrewdockError::from)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                self.metadata_store
+                    .save_metadata(&IndexMetadata {
+                        etag,
+                        fetched_at: now,
+                        formula_count: formulae.len(),
+                    })
+                    .map_err(BrewdockError::from)?;
+                Ok(())
+            },
+        )
+    }
+
     /// Acquires the brewdock file lock.
     fn acquire_lock(&self) -> Result<FileLock, std::io::Error> {
         FileLock::acquire(&self.layout.lock_dir().join("brewdock.lock"))
     }
 
     /// Fetches formulae and all transitive dependencies.
+    ///
+    /// Checks the on-disk metadata cache first and falls back to the
+    /// network for any formula not found locally.
     async fn fetch_with_deps(&self, names: &[&str]) -> Result<FormulaCache, BrewdockError> {
+        let disk_cache = self.metadata_store.load_formula_map().ok().flatten();
+
         let mut cache = FormulaCache::new();
         let mut queue: VecDeque<String> = names.iter().map(|name| (*name).to_owned()).collect();
 
@@ -586,7 +633,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             if cache.get(&name).is_some() {
                 continue;
             }
-            let formula = self.repo.formula(&name).await?;
+            let formula = if let Some(f) = disk_cache.as_ref().and_then(|m| m.get(&name)) {
+                f.clone()
+            } else {
+                self.repo.formula(&name).await?
+            };
             for dep in self.plan_dependencies(&formula)? {
                 if cache.get(&dep).is_none() {
                     queue.push_back(dep);
@@ -608,21 +659,31 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             &request_label(names),
             || self.fetch_installed_kegs(names),
         )?;
+        let disk_cache = self.metadata_store.load_formula_map().ok().flatten();
         let host_tag = self.host_tag.as_str();
         let mut candidates = Vec::new();
 
         for keg in installed {
-            let formula = Self::instrument_async_phase(
-                "upgrade-discovery",
-                "fetch-formula-metadata",
-                &keg.name,
-                self.repo.formula(&keg.name),
-            )
-            .await?;
-            check_supportability(&formula, host_tag)?;
-            let method = self.resolve_install_method(&formula)?;
+            // Borrow from cache for early checks; only clone if this keg
+            // survives the version comparison and becomes a candidate.
+            let cached_ref = disk_cache.as_ref().and_then(|m| m.get(&keg.name));
+            let fetched;
+            let formula_ref = if let Some(f) = cached_ref {
+                f
+            } else {
+                fetched = Self::instrument_async_phase(
+                    "upgrade-discovery",
+                    "fetch-formula-metadata",
+                    &keg.name,
+                    self.repo.formula(&keg.name),
+                )
+                .await?;
+                &fetched
+            };
+            check_supportability(formula_ref, host_tag)?;
+            let method = self.resolve_install_method(formula_ref)?;
 
-            let latest_version = pkg_version(&formula.versions.stable, formula.revision);
+            let latest_version = pkg_version(&formula_ref.versions.stable, formula_ref.revision);
             if keg.pkg_version == latest_version {
                 continue;
             }
@@ -631,7 +692,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                 "upgrade-discovery",
                 "check-post-install-viability",
                 &keg.name,
-                self.check_post_install_viability(&formula),
+                self.check_post_install_viability(formula_ref),
             )
             .await
             {
@@ -646,7 +707,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             candidates.push(UpgradeCandidate {
                 name: keg.name,
                 installed_on_request: keg.installed_on_request,
-                formula,
+                formula: formula_ref.clone(),
                 current_version: keg.pkg_version,
                 latest_version,
                 method,
@@ -3626,6 +3687,176 @@ install:
         assert_not_installed(&layout, "alpha");
         assert_not_installed(&layout, "bravo");
         assert_not_installed(&layout, "charlie");
+        Ok(())
+    }
+
+    // --- Metadata cache tests ---
+
+    /// Mock that tracks per-formula fetch calls to verify cache usage.
+    struct CountingMockRepo {
+        formulae: HashMap<String, Formula>,
+        formula_call_count: Arc<AtomicUsize>,
+    }
+
+    impl CountingMockRepo {
+        fn new(list: Vec<Formula>, counter: Arc<AtomicUsize>) -> Self {
+            let formulae = list.into_iter().map(|f| (f.name.clone(), f)).collect();
+            Self {
+                formulae,
+                formula_call_count: counter,
+            }
+        }
+    }
+
+    impl FormulaRepository for CountingMockRepo {
+        async fn formula(&self, name: &str) -> Result<Formula, FormulaError> {
+            self.formula_call_count.fetch_add(1, Ordering::SeqCst);
+            self.formulae
+                .get(name)
+                .cloned()
+                .ok_or_else(|| FormulaError::NotFound {
+                    name: FormulaName::from(name),
+                })
+        }
+
+        async fn all_formulae(&self) -> Result<Vec<Formula>, FormulaError> {
+            Ok(self.formulae.values().cloned().collect())
+        }
+
+        async fn ruby_source(&self, _ruby_source_path: &str) -> Result<String, FormulaError> {
+            Err(FormulaError::NotFound {
+                name: FormulaName::from("unsupported"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_writes_metadata_and_formulae_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator(
+            vec![make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA)],
+            vec![],
+            counter,
+            layout.clone(),
+        )?;
+
+        let count = orchestrator.update().await?;
+
+        assert_eq!(count, 1);
+        assert!(layout.cache_dir().join("formula.json").exists());
+        assert!(layout.cache_dir().join("formula-meta.json").exists());
+
+        let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
+        let meta = store.load_metadata()?.ok_or("metadata should exist")?;
+        assert!(meta.fetched_at > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_plan_uses_cached_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // Pre-populate the disk cache using MetadataStore
+        let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
+        store.save_formulae(&[
+            make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA),
+            make_formula("oniguruma", "6.9.9", &[], PLAN_SHA),
+        ])?;
+
+        // Create orchestrator with a counting mock
+        let formula_calls = Arc::new(AtomicUsize::new(0));
+        let host_tag: HostTag = HOST_TAG.parse()?;
+        let repo = CountingMockRepo::new(
+            vec![
+                make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA),
+                make_formula("oniguruma", "6.9.9", &[], PLAN_SHA),
+            ],
+            Arc::clone(&formula_calls),
+        );
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let downloader = MockDownloader::new(vec![], download_count);
+        let orchestrator = Orchestrator::new(repo, downloader, layout, host_tag);
+
+        let plan = orchestrator.plan_install(&["jq"]).await?;
+
+        // Cache had both jq and oniguruma, so no individual formula() calls
+        assert_eq!(
+            formula_calls.load(Ordering::SeqCst),
+            0,
+            "should use disk cache, not network"
+        );
+        assert_eq!(plan.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_plan_falls_back_to_network_on_cache_miss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // Pre-populate cache with only jq (missing oniguruma)
+        let store = brewdock_formula::MetadataStore::new(layout.cache_dir());
+        store.save_formulae(&[make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA)])?;
+
+        // Create orchestrator with counting mock that has both
+        let formula_calls = Arc::new(AtomicUsize::new(0));
+        let host_tag: HostTag = HOST_TAG.parse()?;
+        let repo = CountingMockRepo::new(
+            vec![
+                make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA),
+                make_formula("oniguruma", "6.9.9", &[], PLAN_SHA),
+            ],
+            Arc::clone(&formula_calls),
+        );
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let downloader = MockDownloader::new(vec![], download_count);
+        let orchestrator = Orchestrator::new(repo, downloader, layout, host_tag);
+
+        let plan = orchestrator.plan_install(&["jq"]).await?;
+
+        // jq from cache, oniguruma from network (1 call)
+        assert_eq!(
+            formula_calls.load(Ordering::SeqCst),
+            1,
+            "should fetch only the missing dependency from network"
+        );
+        assert_eq!(plan.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_install_plan_works_without_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        // No disk cache populated
+        let formula_calls = Arc::new(AtomicUsize::new(0));
+        let host_tag: HostTag = HOST_TAG.parse()?;
+        let repo = CountingMockRepo::new(
+            vec![
+                make_formula("jq", "1.8.1", &["oniguruma"], PLAN_SHA),
+                make_formula("oniguruma", "6.9.9", &[], PLAN_SHA),
+            ],
+            Arc::clone(&formula_calls),
+        );
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let downloader = MockDownloader::new(vec![], download_count);
+        let orchestrator = Orchestrator::new(repo, downloader, layout, host_tag);
+
+        let plan = orchestrator.plan_install(&["jq"]).await?;
+
+        // No cache, all formulae fetched from network
+        assert_eq!(
+            formula_calls.load(Ordering::SeqCst),
+            2,
+            "should fetch all from network when no cache"
+        );
+        assert_eq!(plan.len(), 2);
         Ok(())
     }
 }

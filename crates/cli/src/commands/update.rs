@@ -56,6 +56,13 @@ mod tests {
         let data = std::fs::read_to_string(&cache_path)?;
         let cached: Vec<brewdock_formula::Formula> = serde_json::from_str(&data)?;
         assert_eq!(cached.len(), 2);
+
+        let meta_path = layout.cache_dir().join("formula-meta.json");
+        assert!(meta_path.exists(), "metadata file should be written");
+        let meta_data = std::fs::read_to_string(&meta_path)?;
+        let meta: brewdock_formula::IndexMetadata = serde_json::from_str(&meta_data)?;
+        assert!(meta.fetched_at > 0, "fetched_at should be set");
+        assert_eq!(meta.formula_count, 2, "formula_count should match");
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use super::metadata_store::FetchOutcome;
 use crate::{FormulaName, error::FormulaError, types::Formula};
 
 const DEFAULT_API_BASE_URL: &str = "https://formulae.brew.sh/api";
@@ -28,6 +29,29 @@ pub trait FormulaRepository: Send + Sync {
     fn all_formulae(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<Formula>, FormulaError>> + Send;
+
+    /// Conditionally fetches the full formula index using an `ETag`.
+    ///
+    /// The default implementation ignores the `ETag` and always returns
+    /// [`FetchOutcome::Modified`] by delegating to [`Self::all_formulae`].
+    /// [`HttpFormulaRepository`] overrides this with real HTTP conditional
+    /// request support.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormulaError::Network`] on HTTP failure.
+    fn all_formulae_conditional(
+        &self,
+        _etag: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<FetchOutcome, FormulaError>> + Send {
+        async {
+            let formulae = self.all_formulae().await?;
+            Ok(FetchOutcome::Modified {
+                formulae,
+                etag: None,
+            })
+        }
+    }
 
     /// Fetches the raw Ruby formula source from `homebrew/core`.
     ///
@@ -103,6 +127,34 @@ impl FormulaRepository for HttpFormulaRepository {
         let response = response.error_for_status()?;
         let formulae: Vec<Formula> = response.json().await?;
         Ok(formulae)
+    }
+
+    async fn all_formulae_conditional(
+        &self,
+        etag: Option<&str>,
+    ) -> Result<FetchOutcome, FormulaError> {
+        let url = format!("{}/formula.json", self.base_url);
+        let mut request = self.client.get(&url);
+        if let Some(etag) = etag {
+            request = request.header("If-None-Match", etag);
+        }
+        let response = request.send().await?;
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(FetchOutcome::NotModified);
+        }
+
+        let response = response.error_for_status()?;
+        let new_etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let formulae: Vec<Formula> = response.json().await?;
+        Ok(FetchOutcome::Modified {
+            formulae,
+            etag: new_etag,
+        })
     }
 
     async fn ruby_source(&self, ruby_source_path: &str) -> Result<String, FormulaError> {
@@ -404,5 +456,89 @@ mod tests {
             assert_eq!(body, "safe");
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conditional_fetch_returns_modified_without_etag()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/formula.json");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("etag", "\"v1\"")
+                .body(format!("[{JQ_FIXTURE}]"));
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.all_formulae_conditional(None).await?;
+
+        let FetchOutcome::Modified { formulae, etag } = result else {
+            return Err("expected Modified".into());
+        };
+        assert_eq!(formulae.len(), 1);
+        assert_eq!(formulae[0].name, "jq");
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conditional_fetch_returns_not_modified() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/formula.json")
+                .header("If-None-Match", "\"v1\"");
+            then.status(304);
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.all_formulae_conditional(Some("\"v1\"")).await?;
+
+        assert!(
+            matches!(result, FetchOutcome::NotModified),
+            "expected NotModified"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conditional_fetch_returns_modified_with_new_etag()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/formula.json")
+                .header("If-None-Match", "\"v1\"");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("etag", "\"v2\"")
+                .body(format!("[{JQ_FIXTURE}]"));
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.all_formulae_conditional(Some("\"v1\"")).await?;
+
+        let FetchOutcome::Modified { formulae, etag } = result else {
+            return Err("expected Modified with new etag".into());
+        };
+        assert_eq!(formulae.len(), 1);
+        assert_eq!(etag.as_deref(), Some("\"v2\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conditional_fetch_http_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/formula.json");
+            then.status(500);
+        });
+
+        let repo = make_repo(&server);
+        let result = repo.all_formulae_conditional(None).await;
+
+        assert!(matches!(result, Err(FormulaError::Network(_))));
     }
 }

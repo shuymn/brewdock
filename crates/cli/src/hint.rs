@@ -20,6 +20,7 @@ const fn hint_for_formula(err: &FormulaError) -> Option<&'static str> {
         FormulaError::Unsupported { .. } => Some("this formula cannot be installed as a bottle"),
         FormulaError::Network(_) => Some("check your internet connection"),
         FormulaError::Parse(_)
+        | FormulaError::Io(_)
         | FormulaError::CyclicDependency(_)
         | FormulaError::InvalidRubySourcePath { .. } => None,
     }
