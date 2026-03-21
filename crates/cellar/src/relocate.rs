@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
 use crate::{error::CellarError, fs};
 
 /// Placeholder strings embedded in Homebrew bottles.
@@ -102,16 +104,16 @@ pub fn relocate_keg_with_manifest(
         (REPOSITORY_PLACEHOLDER, prefix_str.as_str()),
     ];
 
-    for relative_path in manifest.paths() {
+    manifest.paths().par_iter().try_for_each(|relative_path| {
         let file = keg_path.join(relative_path);
         let data = match std::fs::read(&file) {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => return Ok(()),
+            Err(e) => return Err(CellarError::from(e)),
         };
 
         if !has_placeholder(&data) {
-            continue;
+            return Ok(());
         }
 
         if is_macho(&data) {
@@ -121,7 +123,8 @@ pub fn relocate_keg_with_manifest(
         } else {
             relocate_text_file(&file, &data, &replacements)?;
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
