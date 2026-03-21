@@ -373,6 +373,22 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: executor split だけ先に入れても `ExecutionPlan` と rollback closure が揃わなければ、source path 編入の入口条件も user-visible latency 改善も固定できない
   - Escalate if: pre-finalize で分離した local prepare が opt / Cellar mutation と実質的に競合し、finalize boundary の再定義が必要になる場合
 
+- [ ] Theme: Bounded network acquire for bottle prefetch
+  - Outcome: multi-formula bottle install で `prefetch-payload` / `download-bottle` が bounded concurrency と fail-closed persistence contract の下で短縮され、`install-jq-wget` の wall bottleneck が network-heavy でも replay 可能に改善する
+  - Goal: `ExecutionPlan` の pre-finalize acquire 側に明示的な download concurrency と persistence ownership を入れ、Homebrew-visible state を触らずに bottle fetch wall を減らす
+  - Must Not Break: finalize boundary を壊さない; blob/store は incomplete payload を publish しない; checksum verification と fail-closed policy を弱めない; warm-path hit と rollback 成功系を壊さない; `task check` green
+  - Non-goals: source build path の最適化; finalize/materialize/relocate の再設計; dedicated prefix; cache format の大幅変更; transport protocol の変更
+  - Acceptance (EARS):
+    - When multiple independent bottle installs are requested, the system shall bound concurrent `download -> verify -> persist` work explicitly instead of relying on unbounded prefetch fan-out
+    - When a bottle payload is persisted, the system shall publish it to blob/store only after checksum-complete success so other formulae cannot observe partial payload state
+    - When `install-jq-wget` baseline is replayed across multiple runs, the system shall show lower median `prefetch-payload` or `download-bottle` wall time than the current baseline without regressing Homebrew-visible correctness
+    - If a bounded acquire design cannot reduce network-heavy wall time without weakening fail-closed blob/store semantics, the system shall fail the Theme and escalate
+  - Evidence: `run=task test && cargo build --release -p brewdock-cli && ./tests/vm-pipeline-baseline.sh --runs 3 --output docs/pipeline-baseline.md; oracle=integration tests prove bounded acquire ordering, no partial payload publication, and warm-path preservation, and aggregated pipeline baseline shows lower median prefetch/download wall time for install-jq-wget without state regression; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula jq --formula wget; notes=current 3-run baseline is install-jq-wget wall 4.23s median with prefetch-payload 2454.1ms and download-bottle 2160.3ms median, so improvement must beat that replayed baseline rather than a single noisy run`
+  - Gates: `static`, `integration`, `benchmark`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- install`; `./tests/vm-pipeline-baseline.sh --runs 3 --output docs/pipeline-baseline.md`; `./tests/vm-smoke-test.sh --formula jq --formula wget`
+  - Why not split vertically further?: concurrency bounding だけ先に入れても partial publish contract が曖昧なら fail-closed 境界が閉じず、逆に persistence contract だけ先に変えても benchmark replay で wall 改善を判定できない
+  - Escalate if: bounded acquire を導入するために blob/store API か benchmark harness に広い破壊的変更が必要になる場合
+
 - [ ] Theme: Source-build admission into staged executor
   - Outcome: bottle staged executor Theme の直後に、source fallback も同じ `ExecutionPlan` と phase contract に編入され、install path が bottle/source で二重化しない
   - Goal: staged bottle executor Theme 完了直後の follow-up として、source build を同じ plan artifact に載せて ad-hoc な finalize-only path を閉じる
