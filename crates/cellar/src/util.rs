@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Ensures the file at `path` is writable by the owner.
 ///
@@ -37,6 +37,33 @@ pub fn walk_entries(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut entries = Vec::new();
     walk_inner(dir, &mut entries, true)?;
     Ok(entries)
+}
+
+/// Normalizes an absolute path by resolving `.` and `..` components without
+/// touching the filesystem.
+///
+/// Returns `None` if a `..` would escape beyond the root.
+pub fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(segment) => normalized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return None;
+    }
+
+    Some(normalized)
 }
 
 fn walk_inner(
