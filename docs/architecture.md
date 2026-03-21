@@ -4,24 +4,26 @@
 
 ## Goal
 
-Rust CLI (`bd`) that installs Homebrew `homebrew/core` formulae to `/opt/homebrew` on Apple Silicon macOS, preferring compatible stable bottles and falling back to a minimal source build path when needed.
+Rust CLI (`bd`) that acts as a performance-oriented, Homebrew-coexisting client for the Homebrew ecosystem on Apple Silicon macOS.
 
-The command surface may expand beyond `install` / `update` / `upgrade`, but the core concept remains coexistence with Homebrew-visible on-disk state rather than replacing Homebrew with a separate prefix or runtime model.
+- Install `homebrew/core` formulae into `/opt/homebrew`, preferring compatible stable bottles and falling back to a minimal source build path when needed.
+- Reuse Homebrew ecosystem assets (`homebrew-core`, bottles, metadata, Homebrew-visible on-disk install state) rather than replacing them with a separate prefix or runtime model.
+- Keep the primary execution path native and fail-closed; compatibility escape hatches must not redefine the trust or performance model of the default path.
 
 ## Constraints
 
 - Apple Silicon macOS + `/opt/homebrew`
+- Homebrew coexistence is a core contract: final on-disk state must stay Homebrew-visible and compatible with mixed `bd` / `brew` operation
 - Prefer stable bottle install; if no compatible bottle exists, allow a minimal generic source build fallback
 - `post_install` support is restricted to a fail-closed pipeline of `homebrew/core` Ruby source parse, AST lowering, and schema normalization; no arbitrary Ruby execution
 - No cask, external tap, Linux/Intel runtime
 - All CI jobs run on macOS (`macos-latest`)
 - `formulae.brew.sh` JSON API (no tap clone)
 - Homebrew-compatible file layout, receipt, linking (`/opt/homebrew` paths always flow through `Layout`; Ruby API compatibility is non-goal)
+- Command surface may expand beyond `install` / `update` / `upgrade`, but new commands should reuse shared metadata/install-state layers instead of introducing parallel architectures
+- Third-party taps remain out of scope for now, but metadata/cache boundaries and formula identity should not assume `homebrew/core` so rigidly that a future limited `tap/name` read/install path becomes an architectural rewrite
+- If Ruby execution is ever introduced as a compatibility escape hatch, it must remain an explicit last-resort, opt-in fallback with visible diagnostics/state markers rather than the default path
 - `unsafe_code` forbidden; `unwrap`/`expect`/`todo`/`dbg!` denied
-
-Design note: third-party taps are still out of scope, but metadata/cache boundaries and formula identity should not be painted into a `homebrew/core`-only corner if that would make a future limited `tap/name` read/install path impossible to add without redoing the architecture.
-
-Design note: if Ruby execution is ever introduced as a compatibility escape hatch, it should remain an explicit last-resort fallback rather than the default path. The primary contract stays a native, fail-closed pipeline; any Ruby-backed fallback should be opt-in, clearly visible in logs/state, and isolated so it does not redefine the performance or trust model of the main path.
 
 ## Core Boundaries
 
@@ -47,11 +49,13 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 
 | Concern | Choice | Rationale |
 |---------|--------|-----------|
+| Product stance | Performance-oriented Homebrew coexisting client, not a Homebrew replacement | Keeps optimization work focused on pipeline/storage/cache design while preserving Homebrew interoperability |
 | CLI | clap (derive) | Standard, derive macro reduces boilerplate |
 | HTTP | reqwest (rustls-tls, stream) | JSON API, bottle download, source archive fetch, Ruby source fetch without OpenSSL system dep |
 | Async | tokio | Network orchestration; blocking I/O and local builds stay isolated |
 | SHA256 | sha2 | Pure Rust, streaming chunk update |
 | Archive | flate2 + tar | Standard; Homebrew bottles are .tar.gz |
+| Storage path | Content-addressable blobs/store under brewdock-owned dirs, materialized into Homebrew-visible paths | Preserves coexistence while leaving room for warm-path optimization and deduplication |
 | State | rusqlite (bundled) | No system SQLite dep, works on CI |
 | Lock | fs2 | Portable advisory file lock (macOS + Linux) |
 | Error (lib) | thiserror | Per-crate typed errors |
@@ -61,6 +65,7 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 | Bottle selection | Compatible tag fallback (`arm64_sequoia -> arm64_sonoma -> arm64_ventura -> all`) | Matches target Homebrew usage without requiring exact host tag parity |
 | `post_install` execution | Parse full `homebrew/core` Ruby source with `ruby-prism`, lower only allowlisted AST shapes into internal operations, then normalize reachable filesystem effects into fixed schemas before execution | Removes Ruby runtime dependency while replacing formula-specific builtins with fail-closed generic lowering and normalization |
 | Source fallback | Generic build driver (`cmake`/`configure`/`meson`/`make`) | Enables a small first source path without full Formula DSL compatibility |
+| Ruby compatibility escape hatch | Not on the default path; if introduced later, keep it opt-in and clearly marked | Avoids collapsing the native fail-closed model into an implicit Ruby execution client |
 
 ## Open Questions
 
@@ -82,6 +87,7 @@ None blocking. Decision record: [ADR 0001](adr/0001-nanobrew-install-method.md).
 - The evaluator never executes AST directly. It executes only lowered internal operations.
 - The initial internal operation set is fixed to `Mkpath`, `CopyFile`, `RunSystemArgv`, `RemoveIfExists`, `InstallSymlink`, `IfPathExists`, `MacOsBranch`, `CallHelper`, `ResolveFormulaPkgetc`, `RecursiveCopy`, `ForceSymlink`, `WriteFile`, `GlobRemove`, and `GlobSymlink`.
 - macOS runtime semantics are fixed: `if OS.mac?` executes only the `then` branch; the `else` branch is parsed but is not a runtime path.
+- Path traversal segments and filesystem effects outside the allowed keg / Homebrew-prefix roots are unsupported and fail closed before mutation.
 - Unsupported nodes that remain in a reachable macOS runtime branch fail closed.
 - Unsupported nodes that exist only in a non-runtime branch do not fail by themselves.
 - Helper methods are zero-arg only. Path helpers must lower to a single path expression; action helpers must lower fully into allowlisted operations; recursive helpers, arity-bearing helpers, and block-taking helpers fail closed.
