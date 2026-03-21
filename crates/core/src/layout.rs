@@ -90,86 +90,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_layout_production_prefix() {
-        let layout = Layout::production();
-        assert_eq!(layout.prefix(), Path::new("/opt/homebrew"));
-    }
-
-    #[test]
-    fn test_layout_with_root_prefix() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(layout.prefix(), Path::new("/tmp/test/opt/homebrew"));
-    }
-
-    #[test]
-    fn test_layout_cellar() {
-        let layout = Layout::with_root("/tmp/test");
+    fn test_layout_prefixes() {
+        assert_eq!(Layout::production().prefix(), Path::new("/opt/homebrew"));
         assert_eq!(
+            Layout::with_root("/tmp/test").prefix(),
+            Path::new("/tmp/test/opt/homebrew")
+        );
+    }
+
+    #[test]
+    fn test_layout_derived_paths() {
+        let layout = Layout::with_root("/tmp/test");
+        let expected_paths = [
             layout.cellar(),
-            PathBuf::from("/tmp/test/opt/homebrew/Cellar")
-        );
-    }
-
-    #[test]
-    fn test_layout_opt_dir() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.opt_dir(),
-            PathBuf::from("/tmp/test/opt/homebrew/opt")
-        );
-    }
-
-    #[test]
-    fn test_layout_bin_dir() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.bin_dir(),
-            PathBuf::from("/tmp/test/opt/homebrew/bin")
-        );
-    }
-
-    #[test]
-    fn test_layout_var_brewdock() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.var_brewdock(),
-            PathBuf::from("/tmp/test/opt/homebrew/var/brewdock")
-        );
-    }
-
-    #[test]
-    fn test_layout_cache_dir() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.cache_dir(),
-            PathBuf::from("/tmp/test/opt/homebrew/var/brewdock/cache")
-        );
-    }
-
-    #[test]
-    fn test_layout_blob_dir() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.blob_dir(),
-            PathBuf::from("/tmp/test/opt/homebrew/var/brewdock/blobs")
-        );
-    }
-
-    #[test]
-    fn test_layout_store_dir() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.store_dir(),
-            PathBuf::from("/tmp/test/opt/homebrew/var/brewdock/store")
-        );
-    }
-
-    #[test]
-    fn test_layout_lock_dir() {
-        let layout = Layout::with_root("/tmp/test");
-        assert_eq!(
             layout.lock_dir(),
-            PathBuf::from("/tmp/test/opt/homebrew/var/brewdock/locks")
-        );
+        ];
+        let expected_suffixes = [
+            "Cellar",
+            "opt",
+            "bin",
+            "var/brewdock",
+            "var/brewdock/cache",
+            "var/brewdock/blobs",
+            "var/brewdock/store",
+            "var/brewdock/locks",
+        ];
+
+        for (actual, suffix) in expected_paths.iter().zip(expected_suffixes) {
+            assert_eq!(
+                actual,
+                &PathBuf::from("/tmp/test/opt/homebrew").join(suffix),
+                "path mismatch for suffix {suffix}"
+            );
+        }
     }
 }

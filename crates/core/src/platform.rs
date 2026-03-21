@@ -222,25 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn test_host_tag_display() -> Result<(), PlatformError> {
-        let tag: HostTag = "arm64_sequoia".parse()?;
-        assert_eq!(tag.to_string(), "arm64_sequoia");
-        Ok(())
-    }
-
-    #[test]
-    fn test_host_tag_round_trip() -> Result<(), PlatformError> {
-        let original = "arm64_sonoma";
-        let tag: HostTag = original.parse()?;
-        assert_eq!(tag.to_string(), original);
-        Ok(())
-    }
-
-    #[test]
-    fn test_host_tag_round_trip_tahoe() -> Result<(), PlatformError> {
-        let original = "arm64_tahoe";
-        let tag: HostTag = original.parse()?;
-        assert_eq!(tag.to_string(), original);
+    fn test_host_tag_round_trip_cases() -> Result<(), PlatformError> {
+        for original in ["arm64_sequoia", "arm64_sonoma", "arm64_tahoe"] {
+            let tag: HostTag = original.parse()?;
+            assert_eq!(tag.as_str(), original, "as_str mismatch for {original}");
+            assert_eq!(
+                tag.to_string(),
+                original,
+                "to_string mismatch for {original}"
+            );
+        }
         Ok(())
     }
 
@@ -286,33 +277,12 @@ mod tests {
     }
 
     #[test]
-    fn test_os_version_parse_single_part() {
-        let result: Result<OsVersion, _> = "15".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_os_version_parse_four_parts() {
-        let result: Result<OsVersion, _> = "15.0.1.2".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_os_version_parse_non_numeric() {
-        let result: Result<OsVersion, _> = "abc.0.1".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_os_version_parse_empty() {
-        let result: Result<OsVersion, _> = "".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_os_version_parse_trailing_dot() {
-        // "15.0." splits into ["15", "0", ""] — empty string fails parse
-        let result: Result<OsVersion, _> = "15.0.".parse();
-        assert!(result.is_err());
+    fn test_os_version_parse_invalid_inputs() {
+        for input in ["15", "15.0.1.2", "abc.0.1", "", "15.0."] {
+            assert!(
+                input.parse::<OsVersion>().is_err(),
+                "expected invalid os version: {input:?}"
+            );
+        }
     }
 }
