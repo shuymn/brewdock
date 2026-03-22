@@ -26,31 +26,10 @@ impl FormulaCache {
         self.entries.insert(formula.name.clone(), formula);
     }
 
-    /// Inserts all formulae from an iterator.
-    pub fn insert_all(&mut self, formulae: impl IntoIterator<Item = Formula>) {
-        let iter = formulae.into_iter();
-        self.entries.reserve(iter.size_hint().0);
-        for formula in iter {
-            self.insert(formula);
-        }
-    }
-
     /// Returns all cached formulae as a map.
     #[must_use]
     pub const fn all(&self) -> &HashMap<String, Formula> {
         &self.entries
-    }
-
-    /// Returns the number of cached formulae.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Returns true if the cache is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -62,8 +41,8 @@ mod tests {
     #[test]
     fn test_cache_empty_by_default() {
         let cache = FormulaCache::new();
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
+        assert!(cache.all().is_empty());
+        assert_eq!(cache.all().len(), 0);
     }
 
     #[test]
@@ -71,8 +50,8 @@ mod tests {
         let mut cache = FormulaCache::new();
         cache.insert(test_formula("jq", &["oniguruma"]));
 
-        assert_eq!(cache.len(), 1);
-        assert!(!cache.is_empty());
+        assert_eq!(cache.all().len(), 1);
+        assert!(!cache.all().is_empty());
 
         let formula = cache.get("jq");
         assert!(formula.is_some());
@@ -86,15 +65,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_insert_all() {
+    fn test_cache_insert_multiple() {
         let mut cache = FormulaCache::new();
-        cache.insert_all(vec![
+        for formula in [
             test_formula("a", &[]),
             test_formula("b", &["a"]),
             test_formula("c", &[]),
-        ]);
+        ] {
+            cache.insert(formula);
+        }
 
-        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.all().len(), 3);
         assert!(cache.get("a").is_some());
         assert!(cache.get("b").is_some());
         assert!(cache.get("c").is_some());
@@ -106,7 +87,7 @@ mod tests {
         cache.insert(test_formula("jq", &["old_dep"]));
         cache.insert(test_formula("jq", &["new_dep"]));
 
-        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.all().len(), 1);
         let formula = cache.get("jq");
         assert_eq!(
             formula.map(|f| f.dependencies.as_slice()),

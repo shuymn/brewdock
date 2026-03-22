@@ -164,27 +164,6 @@ impl MetadataStore {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
-    /// Searches for formula names matching a SQL LIKE pattern.
-    ///
-    /// The `pattern` is matched against formula names using SQL `LIKE`
-    /// (case-insensitive). Use `%` for wildcard matching.
-    ///
-    /// Returns an empty list if the database does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database exists but cannot be read.
-    pub fn search_formulae(&self, pattern: &str) -> Result<Vec<String>, FormulaError> {
-        let Some(conn) = self.open_if_exists()? else {
-            return Ok(Vec::new());
-        };
-        let mut stmt =
-            conn.prepare("SELECT name FROM formulae WHERE name LIKE ?1 ORDER BY name")?;
-        let rows = stmt.query_map(rusqlite::params![pattern], |row| row.get(0))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(FormulaError::Database)
-    }
-
     /// Searches for formula names matching a SQL LIKE pattern with backslash
     /// escaping.
     ///
@@ -415,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_formulae() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_search_formulae_escaped() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, store) = temp_store()?;
         store.save_index(
             &[
@@ -430,21 +409,22 @@ mod tests {
             },
         )?;
 
-        let results = store.search_formulae("jq%")?;
+        let results = store.search_formulae_escaped("jq%")?;
         assert_eq!(results, vec!["jq", "jql"]);
 
-        let results = store.search_formulae("%get")?;
+        let results = store.search_formulae_escaped("%get")?;
         assert_eq!(results, vec!["wget"]);
 
-        let results = store.search_formulae("nonexistent%")?;
+        let results = store.search_formulae_escaped("nonexistent%")?;
         assert!(results.is_empty());
         Ok(())
     }
 
     #[test]
-    fn test_search_formulae_returns_empty_when_no_db() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_search_formulae_escaped_returns_empty_when_no_db()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, store) = temp_store()?;
-        let results = store.search_formulae("jq%")?;
+        let results = store.search_formulae_escaped("jq%")?;
         assert!(results.is_empty());
         Ok(())
     }
