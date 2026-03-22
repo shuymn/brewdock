@@ -7,8 +7,8 @@ use std::{
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
     InstallReason, InstallReceipt, InstalledKeg, PostInstallContext, PostInstallTransaction,
-    RelocationScope, discover_installed_kegs, find_installed_keg, link, run_post_install, unlink,
-    validate_post_install, write_receipt,
+    RelocationScope, discover_installed_kegs, find_installed_keg, link, lower_post_install_tier2,
+    run_post_install, unlink, validate_post_install, write_receipt,
 };
 use brewdock_formula::{
     CellarType, FetchOutcome, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository,
@@ -1119,11 +1119,14 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// Checks whether a formula's `post_install` can be parsed and lowered.
     ///
     /// Returns `Ok(())` if the formula has no `post_install` or if it can be
-    /// successfully lowered. Returns an error if the source cannot be fetched
-    /// or contains unsupported syntax.
+    /// successfully lowered. Tries Tier 1 (static analysis) first, then falls
+    /// back to Tier 2 (attribute injection) before giving up.
     async fn check_post_install_viability(&self, formula: &Formula) -> Result<(), BrewdockError> {
         if let Some(source) = self.fetch_post_install_source(formula).await? {
             validate_post_install(&source, &formula.versions.stable)
+                .or_else(|_| {
+                    lower_post_install_tier2(&source, &formula.versions.stable).map(|_| ())
+                })
                 .map_err(brewdock_cellar::CellarError::from)?;
         }
         Ok(())
@@ -4273,6 +4276,98 @@ install:
         let result = orchestrator.cleanup(true)?;
         assert!(result.blobs_removed > 0);
         assert!(orphan_path.exists(), "dry run should not delete files");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tier2_fallback_installs_formula_using_name_attribute()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+        let mut formula = make_formula("myapp", "2.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar =
+            create_bottle_tar_gz("myapp", "2.0", &[("bin/myapp", b"#!/bin/sh\necho myapp\n")])?;
+
+        // post_install uses `name` as a path segment — fails Tier 1, succeeds Tier 2.
+        let source = r"
+class Myapp < Formula
+  def post_install
+    (etc/name).mkpath
+  end
+end
+";
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/myapp.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["myapp"]).await?;
+
+        assert_eq!(installed, vec!["myapp"]);
+        // The `name` attribute should be resolved to "myapp" by the cellar.
+        assert!(layout.prefix().join("etc/myapp").is_dir());
+        assert!(
+            layout
+                .cellar()
+                .join("myapp/2.0/INSTALL_RECEIPT.json")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tier2_fallback_installs_formula_using_version_major_minor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2";
+        let mut formula = make_formula("cafeobj", "1.6.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz(
+            "cafeobj",
+            "1.6.0",
+            &[("bin/cafeobj", b"#!/bin/sh\necho cafeobj\n")],
+        )?;
+
+        // post_install uses `version.major_minor` — fails Tier 1, succeeds Tier 2.
+        let source = r#"
+class Cafeobj < Formula
+  def post_install
+    mkdir_p lib/"cafeobj-#{version.major_minor}/sbcl"
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/cafeobj.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["cafeobj"]).await?;
+
+        assert_eq!(installed, vec!["cafeobj"]);
+        // version.major_minor should resolve to "1.6" from version "1.6.0".
+        assert!(
+            layout
+                .cellar()
+                .join("cafeobj/1.6.0/lib/cafeobj-1.6/sbcl")
+                .is_dir()
+        );
         Ok(())
     }
 }

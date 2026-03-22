@@ -8,8 +8,9 @@ use std::{
 };
 
 pub use brewdock_analysis::{
-    Argument, ContentPart, PathBase, PathCondition, PathExpr, Program, Statement,
-    extract_post_install_block, lower_post_install, validate_post_install,
+    Argument, ContentPart, PathBase, PathCondition, PathExpr, PathSegment, Program, SegmentPart,
+    Statement, extract_post_install_block, lower_post_install, lower_post_install_tier2,
+    validate_post_install,
 };
 
 use crate::{error::CellarError, fs::normalize_absolute_path, link::relative_from_to};
@@ -63,9 +64,28 @@ impl PostInstallContext {
             PathBase::Var => self.prefix.join("var"),
         };
         for segment in &expr.segments {
-            path.push(segment);
+            path.push(self.resolve_segment(segment));
         }
         path
+    }
+
+    fn resolve_segment(&self, segment: &PathSegment) -> String {
+        match segment {
+            PathSegment::Literal(s) => s.clone(),
+            PathSegment::Interpolated(parts) => {
+                let mut result = String::new();
+                for part in parts {
+                    match part {
+                        SegmentPart::Literal(s) => result.push_str(s),
+                        SegmentPart::FormulaName => result.push_str(&self.formula_name),
+                        SegmentPart::VersionMajorMinor => {
+                            result.push_str(&major_minor_version(&self.formula_version));
+                        }
+                    }
+                }
+                result
+            }
+        }
     }
 
     fn resolve_allowed_path(&self, expr: &PathExpr) -> Result<PathBuf, CellarError> {
@@ -82,6 +102,15 @@ impl PostInstallContext {
         Err(CellarError::UnsupportedPostInstallSyntax {
             message: format!("path escapes allowed roots: {}", resolved.display()),
         })
+    }
+}
+
+/// Extracts `"major.minor"` from a version string like `"3.12.2"`.
+fn major_minor_version(version: &str) -> String {
+    let mut parts = version.splitn(3, '.');
+    match (parts.next(), parts.next()) {
+        (Some(major), Some(minor)) => format!("{major}.{minor}"),
+        _ => version.to_owned(),
     }
 }
 
@@ -102,7 +131,9 @@ pub fn run_post_install(
     source: &str,
     context: &PostInstallContext,
 ) -> Result<PostInstallTransaction, CellarError> {
-    let program = lower_post_install(source, &context.formula_version)?;
+    // Tier 1 → Tier 2 fallback: try static analysis first, then attribute injection.
+    let program = lower_post_install(source, &context.formula_version)
+        .or_else(|_| lower_post_install_tier2(source, &context.formula_version))?;
     let rollback_roots = collect_rollback_roots(&program, context);
     run_with_rollback(&rollback_roots, || {
         execute_statements(&program.statements, context)

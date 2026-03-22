@@ -4,6 +4,25 @@ use ruby_prism::{ConstantId, Node, ParseResult, parse as parse_ruby};
 
 use crate::error::AnalysisError;
 
+/// Controls which tier of DSL constructs the lowering accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoweringTier {
+    /// Tier 1: static analysis only. Unknown formula attributes are rejected.
+    Static,
+    /// Tier 2: allow symbolic formula attributes (`name`, `version.major_minor`)
+    /// that will be resolved at install time.
+    WithAttributes,
+}
+
+/// Shared lowering context threaded through internal functions.
+#[derive(Clone, Copy)]
+struct LowerCtx<'a, 'pr> {
+    parsed: &'a ParseResult<'pr>,
+    methods: &'a BTreeMap<String, MethodDef<'pr>>,
+    formula_version: &'a str,
+    tier: LoweringTier,
+}
+
 /// Parsed `post_install` program — a sequence of lowered statements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
@@ -138,18 +157,45 @@ pub struct PathExpr {
     /// The base path (e.g. `prefix`, `bin`, `HOMEBREW_PREFIX`).
     pub base: PathBase,
     /// Path segments joined after the base.
-    pub segments: Vec<String>,
+    pub segments: Vec<PathSegment>,
 }
 
 impl PathExpr {
-    /// Creates a new path expression from a base and segment slices.
+    /// Creates a new path expression from a base and literal segment slices.
     #[must_use]
     pub fn new(base: PathBase, segments: &[&str]) -> Self {
         Self {
             base,
-            segments: segments.iter().map(|&s| s.to_owned()).collect(),
+            segments: segments
+                .iter()
+                .map(|&s| PathSegment::Literal(s.to_owned()))
+                .collect(),
         }
     }
+}
+
+/// A single segment in a [`PathExpr`].
+///
+/// Most segments are [`Literal`](PathSegment::Literal) strings known at
+/// analysis time. [`Interpolated`](PathSegment::Interpolated) segments
+/// contain parts that require runtime context (Tier 2) to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    /// A segment whose value is fully known at analysis time.
+    Literal(String),
+    /// A segment composed of literal and runtime-resolved parts.
+    Interpolated(Vec<SegmentPart>),
+}
+
+/// A fragment of an [`Interpolated`](PathSegment::Interpolated) path segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentPart {
+    /// Literal text.
+    Literal(String),
+    /// The formula's `name` attribute, resolved at install time.
+    FormulaName,
+    /// The formula's `version.major_minor` value (e.g. `"3.12"` from `"3.12.2"`).
+    VersionMajorMinor,
 }
 
 /// Base component of a [`PathExpr`].
@@ -231,21 +277,49 @@ pub fn validate_post_install(source: &str, formula_version: &str) -> Result<(), 
 
 /// Parses and lowers a `post_install` block into an executable [`Program`].
 ///
+/// This is Tier 1 (static analysis): unknown formula attributes like `name` or
+/// `version.major_minor` are rejected.
+///
 /// # Errors
 ///
 /// Returns [`AnalysisError::UnsupportedPostInstallSyntax`] if the source contains
 /// unsupported Ruby constructs.
 pub fn lower_post_install(source: &str, formula_version: &str) -> Result<Program, AnalysisError> {
+    lower_post_install_inner(source, formula_version, LoweringTier::Static)
+}
+
+/// Parses and lowers a `post_install` block with Tier 2 attribute support.
+///
+/// Unlike [`lower_post_install`], this allows symbolic formula attributes
+/// (`name`, `version.major_minor`) that will be resolved at install time by
+/// the cellar's runtime context.
+///
+/// # Errors
+///
+/// Returns [`AnalysisError::UnsupportedPostInstallSyntax`] if the source contains
+/// unsupported Ruby constructs beyond Tier 2 capabilities.
+pub fn lower_post_install_tier2(
+    source: &str,
+    formula_version: &str,
+) -> Result<Program, AnalysisError> {
+    lower_post_install_inner(source, formula_version, LoweringTier::WithAttributes)
+}
+
+fn lower_post_install_inner(
+    source: &str,
+    formula_version: &str,
+    tier: LoweringTier,
+) -> Result<Program, AnalysisError> {
     let parsed = parse_source(source)?;
     let methods = build_method_table(&parsed)?;
-    let mut helper_stack = BTreeSet::new();
-    let statements = lower_method(
-        "post_install",
-        &parsed,
-        &methods,
-        &mut helper_stack,
+    let ctx = LowerCtx {
+        parsed: &parsed,
+        methods: &methods,
         formula_version,
-    )?;
+        tier,
+    };
+    let mut helper_stack = BTreeSet::new();
+    let statements = lower_method("post_install", &ctx, &mut helper_stack)?;
     Ok(Program { statements })
 }
 
@@ -306,18 +380,17 @@ fn collect_methods_from_node<'pr>(
     Ok(())
 }
 
-fn lower_method<'pr>(
+fn lower_method(
     name: &str,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, '_>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
-    let method = methods
-        .get(name)
-        .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
-            message: format!("unknown helper method: {name}"),
-        })?;
+    let method =
+        ctx.methods
+            .get(name)
+            .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+                message: format!("unknown helper method: {name}"),
+            })?;
 
     if method.has_receiver || method.has_parameters {
         return unsupported(&format!("unsupported helper method signature: {name}"));
@@ -331,12 +404,10 @@ fn lower_method<'pr>(
         let Some(body) = method.body.as_ref() else {
             return Ok(Vec::new());
         };
-        if let Some(statements) =
-            normalize_method_schema(body, parsed, methods, helper_stack, formula_version)?
-        {
+        if let Some(statements) = normalize_method_schema(body, ctx, helper_stack)? {
             return Ok(statements);
         }
-        lower_body_node(body, parsed, methods, helper_stack, formula_version)
+        lower_body_node(body, ctx, helper_stack)
     })();
 
     helper_stack.remove(name);
@@ -345,24 +416,22 @@ fn lower_method<'pr>(
 
 fn normalize_method_schema<'pr>(
     body: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Option<Vec<Statement>>, AnalysisError> {
-    if matches_ruby_bundler_cleanup_schema(body, methods, formula_version)? {
-        return Ok(Some(normalize_ruby_bundler_cleanup(formula_version)));
+    if matches_ruby_bundler_cleanup_schema(body, ctx.methods, ctx.formula_version)? {
+        return Ok(Some(normalize_ruby_bundler_cleanup(ctx.formula_version)));
     }
 
-    if matches_node_npm_propagation_schema(body, parsed)? {
+    if matches_node_npm_propagation_schema(body, ctx.parsed)? {
         return Ok(Some(normalize_node_npm_propagation()));
     }
 
-    if matches_shared_mime_info_schema(body, parsed)? {
+    if matches_shared_mime_info_schema(body, ctx.parsed)? {
         return Ok(Some(normalize_shared_mime_info()));
     }
 
-    if matches_bundle_bootstrap_schema(body, parsed, methods, helper_stack)? {
+    if matches_bundle_bootstrap_schema(body, ctx, helper_stack)? {
         return Ok(Some(vec![
             Statement::Mkpath(PathExpr {
                 base: PathBase::Pkgetc,
@@ -371,19 +440,17 @@ fn normalize_method_schema<'pr>(
             Statement::Copy {
                 from: PathExpr {
                     base: PathBase::Pkgshare,
-                    segments: vec!["cacert.pem".to_owned()],
+                    segments: vec![PathSegment::Literal("cacert.pem".to_owned())],
                 },
                 to: PathExpr {
                     base: PathBase::Pkgetc,
-                    segments: vec!["cert.pem".to_owned()],
+                    segments: vec![PathSegment::Literal("cert.pem".to_owned())],
                 },
             },
         ]));
     }
 
-    if let Some((link_dir, target)) =
-        detect_cert_symlink_schema(body, parsed, methods, helper_stack)?
-    {
+    if let Some((link_dir, target)) = detect_cert_symlink_schema(body, ctx, helper_stack)? {
         return Ok(Some(vec![
             Statement::RemoveIfExists(append_segment(&link_dir, "cert.pem")),
             Statement::InstallSymlink { link_dir, target },
@@ -395,25 +462,30 @@ fn normalize_method_schema<'pr>(
 
 fn matches_bundle_bootstrap_schema<'pr>(
     body: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<bool, AnalysisError> {
+    let static_ctx = LowerCtx {
+        tier: LoweringTier::Static,
+        ..*ctx
+    };
     let mut saw_mkpath = false;
     let mut saw_atomic_write = false;
     visit_calls(body, &mut |call| {
         let name = call_name(call)?;
         if name == "mkpath" {
             if let Some(receiver) = call.receiver()
-                && parse_path_expr(&receiver, parsed, methods, helper_stack)
+                && parse_path_expr(&receiver, &static_ctx, helper_stack)
                     .is_ok_and(|path| path.base == PathBase::Pkgetc && path.segments.is_empty())
             {
                 saw_mkpath = true;
             }
         } else if name == "atomic_write"
             && let Some(receiver) = call.receiver()
-            && parse_path_expr(&receiver, parsed, methods, helper_stack)
-                .is_ok_and(|path| path.base == PathBase::Pkgetc && path.segments == ["cert.pem"])
+            && parse_path_expr(&receiver, &static_ctx, helper_stack).is_ok_and(|path| {
+                path.base == PathBase::Pkgetc
+                    && path.segments == [PathSegment::Literal("cert.pem".to_owned())]
+            })
         {
             saw_atomic_write = true;
         }
@@ -425,10 +497,13 @@ fn matches_bundle_bootstrap_schema<'pr>(
 
 fn detect_cert_symlink_schema<'pr>(
     body: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<Option<(PathExpr, PathExpr)>, AnalysisError> {
+    let static_ctx = LowerCtx {
+        tier: LoweringTier::Static,
+        ..*ctx
+    };
     let mut link_dir = None;
     let mut target = None;
 
@@ -438,16 +513,11 @@ fn detect_cert_symlink_schema<'pr>(
             if name == "install_symlink"
                 && let Some(receiver) = call.receiver()
             {
-                let receiver = parse_path_expr(&receiver, parsed, methods, helper_stack)?;
+                let receiver = parse_path_expr(&receiver, &static_ctx, helper_stack)?;
                 let arguments = call_args(&call);
                 if arguments.len() == 1 {
                     link_dir = Some(receiver);
-                    target = Some(parse_path_expr(
-                        &arguments[0],
-                        parsed,
-                        methods,
-                        helper_stack,
-                    )?);
+                    target = Some(parse_path_expr(&arguments[0], &static_ctx, helper_stack)?);
                 }
             }
         }
@@ -483,13 +553,12 @@ fn matches_ruby_bundler_cleanup_schema(
 fn normalize_ruby_bundler_cleanup(formula_version: &str) -> Vec<Statement> {
     let v = compute_ruby_api_version(formula_version);
     let gems = |sub: &[&str]| {
-        let mut segs = vec![
-            "lib".to_owned(),
-            "ruby".to_owned(),
-            "gems".to_owned(),
-            v.clone(),
-        ];
-        segs.extend(sub.iter().map(|&s| s.to_owned()));
+        let mut segs: Vec<PathSegment> = ["lib", "ruby", "gems"]
+            .iter()
+            .map(|&s| PathSegment::Literal(s.to_owned()))
+            .collect();
+        segs.push(PathSegment::Literal(v.clone()));
+        segs.extend(sub.iter().map(|&s| PathSegment::Literal(s.to_owned())));
         PathExpr {
             base: PathBase::HomebrewPrefix,
             segments: segs,
@@ -664,20 +733,12 @@ fn normalize_shared_mime_info() -> Vec<Statement> {
 
 fn lower_body_node<'pr>(
     body: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     let mut statements = Vec::new();
     for child in body_statements(body)? {
-        statements.extend(lower_statement(
-            &child,
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        )?);
+        statements.extend(lower_statement(&child, ctx, helper_stack)?);
     }
     Ok(statements)
 }
@@ -705,72 +766,42 @@ fn body_statements<'pr>(body: &Node<'pr>) -> Result<Vec<Node<'pr>>, AnalysisErro
 
 fn lower_statement<'pr>(
     node: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     if let Some(if_node) = node.as_if_node() {
-        return lower_if_statement(&if_node, parsed, methods, helper_stack, formula_version);
+        return lower_if_statement(&if_node, ctx, helper_stack);
     }
 
     if let Some(call) = node.as_call_node() {
-        return lower_call_statement(&call, parsed, methods, helper_stack, formula_version);
+        return lower_call_statement(&call, ctx, helper_stack);
     }
 
     if let Some(unless_node) = node.as_unless_node() {
-        return lower_unless_statement(
-            &unless_node,
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        );
+        return lower_unless_statement(&unless_node, ctx, helper_stack);
     }
 
     unsupported(&format!(
         "unsupported post_install statement: {}",
-        node_source(parsed, node)?
+        node_source(ctx.parsed, node)?
     ))
 }
 
 fn lower_if_statement<'pr>(
     if_node: &ruby_prism::IfNode<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     if predicate_is_os_runtime(&if_node.predicate(), "mac?")? {
-        return lower_statements_node_opt(
-            if_node.statements(),
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        );
+        return lower_statements_node_opt(if_node.statements(), ctx, helper_stack);
     }
 
     if predicate_is_os_runtime(&if_node.predicate(), "linux?")? {
-        return lower_else_branch(
-            if_node.subsequent(),
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        );
+        return lower_else_branch(if_node.subsequent(), ctx, helper_stack);
     }
 
-    if let Some(condition) =
-        parse_exist_condition(&if_node.predicate(), parsed, methods, helper_stack)?
-    {
-        let then_branch = lower_statements_node_opt(
-            if_node.statements(),
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        )?;
+    if let Some(condition) = parse_exist_condition(&if_node.predicate(), ctx, helper_stack)? {
+        let then_branch = lower_statements_node_opt(if_node.statements(), ctx, helper_stack)?;
         if if_node.subsequent().is_none()
             && then_branch.len() == 1
             && matches!(then_branch.first(), Some(Statement::RemoveIfExists(path)) if *path == condition)
@@ -789,16 +820,14 @@ fn lower_if_statement<'pr>(
 
     unsupported(&format!(
         "unsupported post_install conditional: {}",
-        node_source(parsed, &if_node.predicate())?
+        node_source(ctx.parsed, &if_node.predicate())?
     ))
 }
 
 fn lower_unless_statement<'pr>(
     unless_node: &ruby_prism::UnlessNode<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     // `unless OS.mac?` — on macOS OS.mac? is TRUE → unless body never executes → skip
     if predicate_is_os_runtime(&unless_node.predicate(), "mac?")? {
@@ -806,78 +835,54 @@ fn lower_unless_statement<'pr>(
     }
     // `unless OS.linux?` — on macOS OS.linux? is FALSE → unless body always executes
     if predicate_is_os_runtime(&unless_node.predicate(), "linux?")? {
-        return lower_statements_node_opt(
-            unless_node.statements(),
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        );
+        return lower_statements_node_opt(unless_node.statements(), ctx, helper_stack);
     }
     unsupported(&format!(
         "unsupported unless condition: {}",
-        node_source(parsed, &unless_node.predicate())?
+        node_source(ctx.parsed, &unless_node.predicate())?
     ))
 }
 
 fn lower_else_branch<'pr>(
     subsequent: Option<Node<'pr>>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     let Some(subsequent) = subsequent else {
         return Ok(Vec::new());
     };
     if let Some(else_node) = subsequent.as_else_node() {
-        return lower_statements_node_opt(
-            else_node.statements(),
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        );
+        return lower_statements_node_opt(else_node.statements(), ctx, helper_stack);
     }
     if let Some(if_node) = subsequent.as_if_node() {
-        return lower_if_statement(&if_node, parsed, methods, helper_stack, formula_version);
+        return lower_if_statement(&if_node, ctx, helper_stack);
     }
     unsupported("unsupported runtime else branch")
 }
 
 fn lower_statements_node_opt<'pr>(
     statements: Option<ruby_prism::StatementsNode<'pr>>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     let Some(statements) = statements else {
         return Ok(Vec::new());
     };
     let mut lowered = Vec::new();
     for child in &statements.body() {
-        lowered.extend(lower_statement(
-            &child,
-            parsed,
-            methods,
-            helper_stack,
-            formula_version,
-        )?);
+        lowered.extend(lower_statement(&child, ctx, helper_stack)?);
     }
     Ok(lowered)
 }
 
 fn lower_call_statement<'pr>(
     call: &ruby_prism::CallNode<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
-    formula_version: &str,
 ) -> Result<Vec<Statement>, AnalysisError> {
     let name = call_name(call)?;
     if let Some(receiver) = call.receiver() {
-        let receiver = parse_path_expr(&receiver, parsed, methods, helper_stack)?;
+        let receiver = parse_path_expr(&receiver, ctx, helper_stack)?;
         return match name.as_str() {
             "mkpath" => Ok(vec![Statement::Mkpath(receiver)]),
             "install_symlink" => {
@@ -890,7 +895,7 @@ fn lower_call_statement<'pr>(
                     .map(|arg| {
                         Ok(Statement::InstallSymlink {
                             link_dir: receiver.clone(),
-                            target: parse_path_expr(arg, parsed, methods, helper_stack)?,
+                            target: parse_path_expr(arg, ctx, helper_stack)?,
                         })
                     })
                     .collect()
@@ -913,7 +918,7 @@ fn lower_call_statement<'pr>(
                 }
                 Ok(vec![Statement::Install {
                     into_dir: receiver,
-                    from: parse_path_expr(&arguments[0], parsed, methods, helper_stack)?,
+                    from: parse_path_expr(&arguments[0], ctx, helper_stack)?,
                 }])
             }
             "chmod" => {
@@ -938,8 +943,8 @@ fn lower_call_statement<'pr>(
                 return unsupported("cp expects exactly two arguments");
             }
             Ok(vec![Statement::Copy {
-                from: parse_path_expr(&arguments[0], parsed, methods, helper_stack)?,
-                to: parse_path_expr(&arguments[1], parsed, methods, helper_stack)?,
+                from: parse_path_expr(&arguments[0], ctx, helper_stack)?,
+                to: parse_path_expr(&arguments[1], ctx, helper_stack)?,
             }])
         }
         "system" | "quiet_system" => {
@@ -949,7 +954,7 @@ fn lower_call_statement<'pr>(
             }
             let arguments = arguments
                 .iter()
-                .map(|argument| parse_argument(argument, parsed, methods, helper_stack))
+                .map(|argument| parse_argument(argument, ctx, helper_stack))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(vec![Statement::System(arguments)])
         }
@@ -958,13 +963,12 @@ fn lower_call_statement<'pr>(
             if arguments.is_empty() || arguments.len() > 2 {
                 return unsupported("rm expects one path argument");
             }
-            if arguments.len() == 2 && !is_force_true_keyword(&arguments[1], parsed)? {
+            if arguments.len() == 2 && !is_force_true_keyword(&arguments[1], ctx.parsed)? {
                 return unsupported("rm only supports force: true keyword");
             }
             Ok(vec![Statement::RemoveIfExists(parse_path_expr(
                 &arguments[0],
-                parsed,
-                methods,
+                ctx,
                 helper_stack,
             )?)])
         }
@@ -975,53 +979,42 @@ fn lower_call_statement<'pr>(
             }
             Ok(vec![Statement::Mkpath(parse_path_expr(
                 &arguments[0],
-                parsed,
-                methods,
+                ctx,
                 helper_stack,
             )?)])
         }
         // Homebrew logging helpers — purely informational, safe to ignore.
         "ohai" | "opoo" | "odebug" => Ok(vec![]),
-        helper if methods.contains_key(helper) => {
-            lower_method(helper, parsed, methods, helper_stack, formula_version)
-        }
+        helper if ctx.methods.contains_key(helper) => lower_method(helper, ctx, helper_stack),
         _ => unsupported(&format!("unsupported post_install statement: {name}")),
     }
 }
 
 fn parse_argument<'pr>(
     node: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<Argument, AnalysisError> {
     if let Some(value) = parse_string(node)? {
         return Ok(Argument::String(value));
     }
-    Ok(Argument::Path(parse_path_expr(
-        node,
-        parsed,
-        methods,
-        helper_stack,
-    )?))
+    Ok(Argument::Path(parse_path_expr(node, ctx, helper_stack)?))
 }
 
 fn parse_path_expr<'pr>(
     node: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<PathExpr, AnalysisError> {
-    if let Ok(path) = parse_path_expr_ast(node, parsed, methods, helper_stack) {
+    if let Ok(path) = parse_path_expr_ast(node, ctx, helper_stack) {
         return Ok(path);
     }
-    parse_path_expr_text(node_source(parsed, node)?)
+    parse_path_expr_text(node_source(ctx.parsed, node)?)
 }
 
 fn parse_path_expr_ast<'pr>(
     node: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<PathExpr, AnalysisError> {
     if let Some(parentheses) = node.as_parentheses_node()
@@ -1032,10 +1025,10 @@ fn parse_path_expr_ast<'pr>(
         if let Some(statements) = body.as_statements_node() {
             let children: Vec<_> = statements.body().iter().collect();
             if children.len() == 1 {
-                return parse_path_expr_ast(&children[0], parsed, methods, helper_stack);
+                return parse_path_expr_ast(&children[0], ctx, helper_stack);
             }
         }
-        return parse_path_expr_ast(&body, parsed, methods, helper_stack);
+        return parse_path_expr_ast(&body, ctx, helper_stack);
     }
 
     if let Some(constant) = node.as_constant_read_node() {
@@ -1051,13 +1044,13 @@ fn parse_path_expr_ast<'pr>(
     }
 
     if let Some(interp) = node.as_interpolated_string_node() {
-        return parse_interpolated_path_expr_ast(&interp, parsed, methods, helper_stack);
+        return parse_interpolated_path_expr_ast(&interp, ctx, helper_stack);
     }
 
     let Some(call) = node.as_call_node() else {
         return unsupported(&format!(
             "unsupported path expression: {}",
-            node_source(parsed, node)?
+            node_source(ctx.parsed, node)?
         ));
     };
     let name = call_name(&call)?;
@@ -1065,17 +1058,27 @@ fn parse_path_expr_ast<'pr>(
         let Some(receiver) = call.receiver() else {
             return unsupported("path join requires receiver");
         };
-        let mut path = parse_path_expr_ast(&receiver, parsed, methods, helper_stack)?;
+        let mut path = parse_path_expr_ast(&receiver, ctx, helper_stack)?;
         let arguments = call_args(&call);
         if arguments.len() != 1 {
             return unsupported("path join expects exactly one segment");
         }
-        let Some(segment) = parse_string(&arguments[0])? else {
-            return unsupported("path join segment must be string literal");
-        };
-        path.segments
-            .push(validate_path_segment(&segment)?.to_owned());
-        return Ok(path);
+        // Try string literal first.
+        if let Some(segment) = parse_string(&arguments[0])? {
+            path.segments.push(PathSegment::Literal(
+                validate_path_segment(&segment)?.to_owned(),
+            ));
+            return Ok(path);
+        }
+        // Tier 2: allow formula attributes as path join segments.
+        if ctx.tier == LoweringTier::WithAttributes {
+            let tier2_segments = parse_tier2_segments(&arguments[0])?;
+            if !tier2_segments.is_empty() {
+                path.segments.extend(tier2_segments);
+                return Ok(path);
+            }
+        }
+        return unsupported("path join segment must be string literal");
     }
 
     if name == "pkgetc"
@@ -1105,19 +1108,18 @@ fn parse_path_expr_ast<'pr>(
                 segments: Vec::new(),
             });
         }
-        return parse_helper_path_expr(&name, parsed, methods, helper_stack);
+        return parse_helper_path_expr(&name, ctx, helper_stack);
     }
 
     unsupported(&format!(
         "unsupported path expression: {}",
-        node_source(parsed, node)?
+        node_source(ctx.parsed, node)?
     ))
 }
 
 fn parse_interpolated_path_expr_ast<'pr>(
     interp: &ruby_prism::InterpolatedStringNode<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<PathExpr, AnalysisError> {
     let parts: Vec<_> = interp.parts().iter().collect();
@@ -1127,7 +1129,7 @@ fn parse_interpolated_path_expr_ast<'pr>(
     let Some(embedded) = first.as_embedded_statements_node() else {
         return unsupported(&format!(
             "interpolated path must start with embedded expression: {}",
-            node_source(parsed, first)?
+            node_source(ctx.parsed, first)?
         ));
     };
     let stmts =
@@ -1140,12 +1142,12 @@ fn parse_interpolated_path_expr_ast<'pr>(
     if body.len() != 1 {
         return unsupported("embedded path expression must be a single expression");
     }
-    let mut path = parse_path_expr_ast(&body[0], parsed, methods, helper_stack)?;
+    let mut path = parse_path_expr_ast(&body[0], ctx, helper_stack)?;
     for part in &parts[1..] {
         let Some(string) = part.as_string_node() else {
             return unsupported(&format!(
                 "interpolated path segment must be string literal: {}",
-                node_source(parsed, part)?
+                node_source(ctx.parsed, part)?
             ));
         };
         let segment_str = String::from_utf8(string.unescaped().to_vec()).map_err(|error| {
@@ -1154,24 +1156,25 @@ fn parse_interpolated_path_expr_ast<'pr>(
             }
         })?;
         for segment in segment_str.split('/').filter(|s| !s.is_empty()) {
-            path.segments
-                .push(validate_path_segment(segment)?.to_owned());
+            path.segments.push(PathSegment::Literal(
+                validate_path_segment(segment)?.to_owned(),
+            ));
         }
     }
     Ok(path)
 }
 
-fn parse_helper_path_expr<'pr>(
+fn parse_helper_path_expr(
     name: &str,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, '_>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<PathExpr, AnalysisError> {
-    let method = methods
-        .get(name)
-        .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
-            message: format!("unsupported path base: {name}"),
-        })?;
+    let method =
+        ctx.methods
+            .get(name)
+            .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+                message: format!("unsupported path base: {name}"),
+            })?;
     if method.has_receiver || method.has_parameters {
         return unsupported(&format!("unsupported path helper signature: {name}"));
     }
@@ -1186,10 +1189,172 @@ fn parse_helper_path_expr<'pr>(
         if statements.len() != 1 {
             return unsupported(&format!("path helper must lower to one expression: {name}"));
         }
-        parse_path_expr(&statements[0], parsed, methods, helper_stack)
+        parse_path_expr(&statements[0], ctx, helper_stack)
     })();
     helper_stack.remove(&format!("path:{name}"));
     result
+}
+
+/// Recognizes a call node as a known formula attribute and returns the
+/// corresponding [`SegmentPart`], or `None` if unrecognized.
+///
+/// Recognized patterns:
+/// - Receiverless, no-arg `name` → [`SegmentPart::FormulaName`]
+/// - `version.major_minor` → [`SegmentPart::VersionMajorMinor`]
+fn recognize_formula_attribute(
+    call: &ruby_prism::CallNode<'_>,
+) -> Result<Option<SegmentPart>, AnalysisError> {
+    let name = call_name(call)?;
+    if name == "name" && call.receiver().is_none() && call.arguments().is_none() {
+        return Ok(Some(SegmentPart::FormulaName));
+    }
+    if name == "major_minor"
+        && call.arguments().is_none()
+        && let Some(receiver) = call.receiver()
+        && let Some(version_call) = receiver.as_call_node()
+        && call_name(&version_call)? == "version"
+        && version_call.receiver().is_none()
+        && version_call.arguments().is_none()
+    {
+        return Ok(Some(SegmentPart::VersionMajorMinor));
+    }
+    Ok(None)
+}
+
+/// Attempts to parse a Tier 2 formula attribute as path segments.
+///
+/// Recognizes:
+/// - `name` → `[Interpolated([FormulaName])]`
+/// - `version.major_minor` → `[Interpolated([VersionMajorMinor])]`
+/// - Interpolated strings containing these attributes (may produce multiple
+///   segments when the string contains `/`)
+fn parse_tier2_segments(node: &Node<'_>) -> Result<Vec<PathSegment>, AnalysisError> {
+    if let Some(call) = node.as_call_node()
+        && let Some(part) = recognize_formula_attribute(&call)?
+    {
+        return Ok(vec![PathSegment::Interpolated(vec![part])]);
+    }
+
+    if let Some(interp) = node.as_interpolated_string_node() {
+        return parse_tier2_interpolated_segments(&interp);
+    }
+
+    Ok(Vec::new())
+}
+
+/// Parses an interpolated string as Tier 2 path segments.
+///
+/// The string may contain literal text and embedded formula attributes
+/// (`name`, `version.major_minor`). `/` in literal parts splits the result
+/// into multiple path segments.
+fn parse_tier2_interpolated_segments(
+    interp: &ruby_prism::InterpolatedStringNode<'_>,
+) -> Result<Vec<PathSegment>, AnalysisError> {
+    let parts: Vec<_> = interp.parts().iter().collect();
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Collect all parts as SegmentParts first, then split on `/` boundaries.
+    let mut flat_parts: Vec<SegmentPart> = Vec::new();
+
+    for part in &parts {
+        if let Some(string) = part.as_string_node() {
+            let text = String::from_utf8(string.unescaped().to_vec()).map_err(|error| {
+                AnalysisError::UnsupportedPostInstallSyntax {
+                    message: format!("invalid utf-8 in interpolated segment: {error}"),
+                }
+            })?;
+            if !text.is_empty() {
+                flat_parts.push(SegmentPart::Literal(text));
+            }
+        } else if let Some(embedded) = part.as_embedded_statements_node() {
+            let stmts = embedded.statements().ok_or_else(|| {
+                AnalysisError::UnsupportedPostInstallSyntax {
+                    message: "empty embedded expression in Tier 2 segment".to_owned(),
+                }
+            })?;
+            let body: Vec<_> = stmts.body().iter().collect();
+            if body.len() != 1 {
+                return Ok(Vec::new());
+            }
+            let Some(call) = body[0].as_call_node() else {
+                return Ok(Vec::new());
+            };
+            let Some(part) = recognize_formula_attribute(&call)? else {
+                return Ok(Vec::new());
+            };
+            flat_parts.push(part);
+        } else {
+            return Ok(Vec::new());
+        }
+    }
+
+    if flat_parts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Split on `/` in literal parts to produce multiple path segments.
+    split_segment_parts_on_slash(flat_parts)
+}
+
+/// Splits a flat list of [`SegmentPart`]s into multiple [`PathSegment`]s
+/// wherever a `/` appears in a [`SegmentPart::Literal`].
+fn split_segment_parts_on_slash(
+    parts: Vec<SegmentPart>,
+) -> Result<Vec<PathSegment>, AnalysisError> {
+    let mut segments: Vec<PathSegment> = Vec::new();
+    let mut current: Vec<SegmentPart> = Vec::new();
+
+    for part in parts {
+        match part {
+            SegmentPart::Literal(ref text) if text.contains('/') => {
+                let pieces: Vec<&str> = text.split('/').collect();
+                for (i, piece) in pieces.iter().enumerate() {
+                    if i > 0 {
+                        // Flush current accumulator as a segment.
+                        if !current.is_empty() {
+                            segments.push(make_path_segment(std::mem::take(&mut current)));
+                        }
+                    }
+                    if !piece.is_empty() {
+                        current.push(SegmentPart::Literal((*piece).to_owned()));
+                    }
+                }
+            }
+            other => current.push(other),
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push(make_path_segment(current));
+    }
+
+    // Validate: each segment must produce a non-empty result.
+    for segment in &segments {
+        match segment {
+            PathSegment::Literal(s) => {
+                validate_path_segment(s)?;
+            }
+            PathSegment::Interpolated(parts) => {
+                if parts.is_empty() {
+                    return unsupported("empty interpolated path segment");
+                }
+            }
+        }
+    }
+
+    Ok(segments)
+}
+
+/// Converts a list of [`SegmentPart`]s into a single [`PathSegment`].
+fn make_path_segment(parts: Vec<SegmentPart>) -> PathSegment {
+    if parts.len() == 1
+        && let SegmentPart::Literal(s) = &parts[0]
+    {
+        return PathSegment::Literal(s.clone());
+    }
+    PathSegment::Interpolated(parts)
 }
 
 fn parse_path_base(name: &str) -> Option<PathBase> {
@@ -1243,7 +1408,7 @@ fn parse_interpolated_homebrew_prefix_path(raw: &str) -> Result<Option<PathExpr>
     let segments = rest
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .map(|segment| validate_path_segment(segment).map(ToOwned::to_owned))
+        .map(|segment| validate_path_segment(segment).map(|s| PathSegment::Literal(s.to_owned())))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(PathExpr {
         base: PathBase::HomebrewPrefix,
@@ -1263,7 +1428,7 @@ fn find_path_split(raw: &str) -> Option<usize> {
     None
 }
 
-fn parse_path_segments(raw: &str) -> Result<Vec<String>, AnalysisError> {
+fn parse_path_segments(raw: &str) -> Result<Vec<PathSegment>, AnalysisError> {
     let mut segments = Vec::new();
     let mut remainder = raw.trim();
     while !remainder.is_empty() {
@@ -1281,14 +1446,16 @@ fn parse_path_segments(raw: &str) -> Result<Vec<String>, AnalysisError> {
                 .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
                     message: format!("unterminated string literal in path: {remainder}"),
                 })?;
-        segments.push(validate_path_segment(&stripped[..end])?.to_owned());
+        segments.push(PathSegment::Literal(
+            validate_path_segment(&stripped[..end])?.to_owned(),
+        ));
         remainder = stripped[end + 1..].trim();
     }
     Ok(segments)
 }
 
 fn validate_path_segment(segment: &str) -> Result<&str, AnalysisError> {
-    if segment.is_empty() || segment == "." || segment == ".." {
+    if segment.is_empty() || segment == "." || segment == ".." || segment.contains("#{") {
         return Err(AnalysisError::UnsupportedPostInstallSyntax {
             message: format!("unsupported path segment: {segment}"),
         });
@@ -1322,8 +1489,7 @@ fn parse_formula_ref(node: &Node<'_>) -> Result<Option<String>, AnalysisError> {
 
 fn parse_exist_condition<'pr>(
     node: &Node<'pr>,
-    parsed: &ParseResult<'pr>,
-    methods: &BTreeMap<String, MethodDef<'pr>>,
+    ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<Option<PathExpr>, AnalysisError> {
     let Some(call) = node.as_call_node() else {
@@ -1335,12 +1501,7 @@ fn parse_exist_condition<'pr>(
     let Some(receiver) = call.receiver() else {
         return Ok(None);
     };
-    Ok(Some(parse_path_expr(
-        &receiver,
-        parsed,
-        methods,
-        helper_stack,
-    )?))
+    Ok(Some(parse_path_expr(&receiver, ctx, helper_stack)?))
 }
 
 fn predicate_is_os_runtime(node: &Node<'_>, method: &str) -> Result<bool, AnalysisError> {
@@ -1523,7 +1684,7 @@ where
 
 fn append_segment(path: &PathExpr, segment: &str) -> PathExpr {
     let mut next = path.clone();
-    next.segments.push(segment.to_owned());
+    next.segments.push(PathSegment::Literal(segment.to_owned()));
     next
 }
 
@@ -1888,6 +2049,140 @@ end
                 ],
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_name_attribute_in_path_join() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r"
+class Demo < Formula
+  def post_install
+    (etc/name).mkpath
+  end
+end
+";
+        // Tier 1 should reject `name` as a path segment.
+        assert!(lower_post_install(source, "1.0").is_err());
+
+        // Tier 2 should accept `name` and emit symbolic FormulaName.
+        let program = lower_post_install_tier2(source, "1.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr {
+                base: PathBase::Etc,
+                segments: vec![PathSegment::Interpolated(vec![SegmentPart::FormulaName])],
+            })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_version_major_minor_in_interpolated_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `version.major_minor` as a standalone path segment via `/`.
+        let source = r"
+class Demo < Formula
+  def post_install
+    mkdir_p lib/version.major_minor
+  end
+end
+";
+        // Tier 1 should reject `version.major_minor` as a path segment.
+        assert!(lower_post_install(source, "1.6.0").is_err());
+
+        // Tier 2 should accept and emit symbolic VersionMajorMinor.
+        let program = lower_post_install_tier2(source, "1.6.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr {
+                base: PathBase::Lib,
+                segments: vec![PathSegment::Interpolated(vec![
+                    SegmentPart::VersionMajorMinor,
+                ])],
+            })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_version_major_minor_in_interpolated_string()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `version.major_minor` inside an interpolated string argument to `/`.
+        let source = r#"
+class Cafeobj < Formula
+  def post_install
+    mkdir_p lib/"cafeobj-#{version.major_minor}/sbcl"
+  end
+end
+"#;
+        // Tier 2 should produce symbolic segments.
+        let program = lower_post_install_tier2(source, "1.6.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr {
+                base: PathBase::Lib,
+                segments: vec![
+                    PathSegment::Interpolated(vec![
+                        SegmentPart::Literal("cafeobj-".to_owned()),
+                        SegmentPart::VersionMajorMinor,
+                    ]),
+                    PathSegment::Literal("sbcl".to_owned()),
+                ],
+            })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_name_in_chained_path_join() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (HOMEBREW_PREFIX/"share"/name).mkpath
+  end
+end
+"#;
+        assert!(lower_post_install(source, "1.0").is_err());
+
+        let program = lower_post_install_tier2(source, "1.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr {
+                base: PathBase::HomebrewPrefix,
+                segments: vec![
+                    PathSegment::Literal("share".to_owned()),
+                    PathSegment::Interpolated(vec![SegmentPart::FormulaName]),
+                ],
+            })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier1_still_rejects_name() {
+        let source = r"
+class Demo < Formula
+  def post_install
+    (etc/name).mkpath
+  end
+end
+";
+        assert!(lower_post_install(source, "1.0").is_err());
+    }
+
+    #[test]
+    fn test_tier2_preserves_tier1_formulas() -> Result<(), Box<dyn std::error::Error>> {
+        // Formulas that pass Tier 1 should also pass Tier 2 unchanged.
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (var/"demo").mkpath
+  end
+end
+"#;
+        let tier1 = lower_post_install(source, "1.0")?;
+        let tier2 = lower_post_install_tier2(source, "1.0")?;
+        assert_eq!(tier1.statements, tier2.statements);
         Ok(())
     }
 }
