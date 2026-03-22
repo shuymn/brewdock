@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     ffi::OsString,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
@@ -150,7 +151,9 @@ fn collect_statement_roots(
             | Statement::WriteFile { path: to, .. }
             | Statement::GlobRemove { dir: to, .. }
             | Statement::GlobSymlink { link_dir: to, .. }
-            | Statement::ForceSymlink { link: to, .. } => {
+            | Statement::ForceSymlink { link: to, .. }
+            | Statement::Install { into_dir: to, .. }
+            | Statement::Chmod { path: to, .. } => {
                 if let Ok(path) = context.resolve_allowed_path(to)
                     && let Some(root) = rollback_root(&path, context)
                 {
@@ -480,6 +483,28 @@ fn execute_statements(
                         }
                     }
                 }
+            }
+            Statement::Install { into_dir, from } => {
+                let from_path = context.resolve_allowed_path(from)?;
+                let into_path = context.resolve_allowed_path(into_dir)?;
+                std::fs::create_dir_all(&into_path)?;
+                let file_name =
+                    from_path
+                        .file_name()
+                        .ok_or_else(|| CellarError::InvalidPathComponent {
+                            path: from_path.clone(),
+                        })?;
+                let dest = into_path.join(file_name);
+                // Homebrew's install uses FileUtils.mv (move semantics).
+                std::fs::rename(&from_path, &dest).or_else(|_rename_err| {
+                    std::fs::copy(&from_path, &dest)?;
+                    std::fs::remove_file(&from_path)
+                })?;
+            }
+            Statement::Chmod { path, mode } => {
+                let file_path = context.resolve_allowed_path(path)?;
+                let permissions = std::fs::Permissions::from_mode(*mode);
+                std::fs::set_permissions(file_path, permissions)?;
             }
         }
     }
@@ -1281,6 +1306,41 @@ end
 
         run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
         assert!(prefix.join("share/mime/mime.cache").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_install_and_chmod() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/buildapp/1.5.6");
+        std::fs::create_dir_all(keg.join("bin"))?;
+        // Pre-create the source file at prefix/buildapp (as if gunzip already ran)
+        std::fs::write(keg.join("buildapp"), "#!/bin/sh\necho hello\n")?;
+
+        let source = r#"
+class Buildapp < Formula
+  def post_install
+    bin.install prefix/"buildapp"
+    (bin/"buildapp").chmod 0755
+  end
+end
+"#;
+
+        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.5.6"))?.commit()?;
+
+        // bin.install moves file into bin/
+        let installed = keg.join("bin/buildapp");
+        assert!(installed.exists(), "bin/buildapp should exist");
+        assert!(!keg.join("buildapp").exists(), "source should be removed");
+        assert_eq!(
+            std::fs::read_to_string(&installed)?,
+            "#!/bin/sh\necho hello\n"
+        );
+
+        // chmod 0755 sets executable permissions
+        let perms = std::fs::metadata(&installed)?.permissions();
+        assert_eq!(perms.mode() & 0o777, 0o755);
         Ok(())
     }
 }

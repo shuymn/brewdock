@@ -87,6 +87,20 @@ pub enum Statement {
         /// Directory that will contain the symlinks.
         link_dir: PathExpr,
     },
+    /// Install a file into a directory (moves `from` into `into_dir`).
+    Install {
+        /// Destination directory.
+        into_dir: PathExpr,
+        /// Source file path.
+        from: PathExpr,
+    },
+    /// Change file permissions.
+    Chmod {
+        /// File path.
+        path: PathExpr,
+        /// Unix permission mode (e.g. `0o755`).
+        mode: u32,
+    },
 }
 
 /// Path condition for [`Statement::IfPath`].
@@ -892,6 +906,27 @@ fn lower_call_statement<'pr>(
                     content,
                 }])
             }
+            "install" => {
+                let arguments = call_args(call);
+                if arguments.len() != 1 {
+                    return unsupported("install expects exactly one argument");
+                }
+                Ok(vec![Statement::Install {
+                    into_dir: receiver,
+                    from: parse_path_expr(&arguments[0], parsed, methods, helper_stack)?,
+                }])
+            }
+            "chmod" => {
+                let arguments = call_args(call);
+                if arguments.len() != 1 {
+                    return unsupported("chmod expects exactly one argument");
+                }
+                let mode = parse_integer_mode(&arguments[0])?;
+                Ok(vec![Statement::Chmod {
+                    path: receiver,
+                    mode,
+                }])
+            }
             _ => unsupported(&format!("unsupported post_install call: {name}")),
         };
     }
@@ -1355,6 +1390,24 @@ fn parse_string(node: &Node<'_>) -> Result<Option<String>, AnalysisError> {
     Ok(None)
 }
 
+fn parse_integer_mode(node: &Node<'_>) -> Result<u32, AnalysisError> {
+    let integer =
+        node.as_integer_node()
+            .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+                message: "chmod expects an integer argument".to_owned(),
+            })?;
+    let value: i32 =
+        integer
+            .value()
+            .try_into()
+            .map_err(|()| AnalysisError::UnsupportedPostInstallSyntax {
+                message: "chmod mode too large for i32".to_owned(),
+            })?;
+    u32::try_from(value).map_err(|_err| AnalysisError::UnsupportedPostInstallSyntax {
+        message: "chmod mode must be non-negative".to_owned(),
+    })
+}
+
 /// Parses the argument to `atomic_write` into a [`Vec<ContentPart>`].
 ///
 /// Accepts plain string literals and interpolated strings where the only
@@ -1796,6 +1849,44 @@ end
                     &["share", "glib-2.0", "schemas"]
                 )),
             ])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_statement_lowered_from_bin_install() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Buildapp < Formula
+  def post_install
+    if (prefix/"buildapp.gz").exist?
+      system "gunzip", prefix/"buildapp.gz"
+      bin.install prefix/"buildapp"
+      (bin/"buildapp").chmod 0755
+    end
+  end
+end
+"#;
+        let program = lower_post_install(source, "1.5.6")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::IfPath {
+                condition: PathExpr::new(PathBase::Prefix, &["buildapp.gz"]),
+                kind: PathCondition::Exists,
+                then_branch: vec![
+                    Statement::System(vec![
+                        Argument::String("gunzip".to_owned()),
+                        Argument::Path(PathExpr::new(PathBase::Prefix, &["buildapp.gz"])),
+                    ]),
+                    Statement::Install {
+                        into_dir: PathExpr::new(PathBase::Bin, &[]),
+                        from: PathExpr::new(PathBase::Prefix, &["buildapp"]),
+                    },
+                    Statement::Chmod {
+                        path: PathExpr::new(PathBase::Bin, &["buildapp"]),
+                        mode: 0o755,
+                    },
+                ],
+            }]
         );
         Ok(())
     }
