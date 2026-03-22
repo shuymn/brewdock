@@ -424,7 +424,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: copy strategy と relocation targeting を別 spike にすると store mutation risk と wall-clock benefit の比較軸がずれる
   - Escalate if: `clonefile` 系の候補が macOS VM 上で一貫して使えず、copy cost 改善に別の長距離 architectural bet が必要になる場合
 
-- [ ] Theme: Static post_install support for gunzip-install formula pattern
+- [x] Theme: Static post_install support for gunzip-install formula pattern
   - Outcome: buildapp, fedify, pgloader の `post_install` が静的解析で ok になり、`bd install` で `post_install` が実行される
   - Goal: `bin.install` (ファイルコピー) と `chmod` (パーミッション変更) を `Statement` variant + cellar 実行に追加
   - Must Not Break: 既存の `post_install` 解析・実行パスを壊さない; `task check` green
