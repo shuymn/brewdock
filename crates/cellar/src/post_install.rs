@@ -122,6 +122,12 @@ impl PostInstallContext {
             SegmentPart::CapturedOutput(name) => {
                 self.captured_outputs.get(name).cloned().unwrap_or_default()
             }
+            SegmentPart::CapturedOutputBasename(name) => self
+                .captured_outputs
+                .get(name)
+                .and_then(|value| Path::new(value).file_name())
+                .and_then(|name| name.to_str())
+                .map_or_else(String::new, ToOwned::to_owned),
         }
     }
 
@@ -223,9 +229,12 @@ fn collect_statement_roots(
             | Statement::CopyChildren { to_dir: to, .. }
             | Statement::WriteFile { path: to, .. }
             | Statement::GlobRemove { dir: to, .. }
+            | Statement::GlobChmod { dir: to, .. }
             | Statement::GlobSymlink { link_dir: to, .. }
             | Statement::ForceSymlink { link: to, .. }
             | Statement::Install { into_dir: to, .. }
+            | Statement::Move { to, .. }
+            | Statement::MoveChildren { to_dir: to, .. }
             | Statement::Chmod { path: to, .. } => {
                 if let Ok(path) = context.resolve_allowed_path(to)
                     && let Some(root) = rollback_root(&path, context)
@@ -551,31 +560,27 @@ fn execute_statements(
                     }
                 }
             }
-            Statement::GlobSymlink {
-                source_dir,
-                pattern,
-                link_dir,
-            } => {
-                let source_path = context.resolve_allowed_path(source_dir)?;
-                let link_path = context.resolve_allowed_path(link_dir)?;
-                std::fs::create_dir_all(&link_path)?;
-                if source_path.is_dir() {
-                    for entry in std::fs::read_dir(&source_path)? {
+            Statement::GlobChmod { dir, pattern, mode } => {
+                let dir_path = context.resolve_allowed_path(dir)?;
+                let permissions = std::fs::Permissions::from_mode(*mode);
+                if dir_path.is_dir() {
+                    for entry in std::fs::read_dir(&dir_path)? {
                         let entry = entry?;
                         if entry
                             .file_name()
                             .to_str()
                             .is_some_and(|name| glob_matches(name, pattern))
                         {
-                            let name = entry.file_name();
-                            let link = link_path.join(&name);
-                            remove_path_if_exists(&link)?;
-                            let rel = relative_from_to(&link_path, &entry.path());
-                            std::os::unix::fs::symlink(rel, &link)?;
+                            std::fs::set_permissions(entry.path(), permissions.clone())?;
                         }
                     }
                 }
             }
+            Statement::GlobSymlink {
+                source_dir,
+                pattern,
+                link_dir,
+            } => execute_glob_symlink(source_dir, pattern, link_dir, context)?,
             Statement::Install { into_dir, from } => {
                 let from_path = context.resolve_allowed_path(from)?;
                 let into_path = context.resolve_allowed_path(into_dir)?;
@@ -592,6 +597,20 @@ fn execute_statements(
                     std::fs::copy(&from_path, &dest)?;
                     std::fs::remove_file(&from_path)
                 })?;
+            }
+            Statement::Move { from, to } => {
+                let from_path = context.resolve_allowed_path(from)?;
+                let to_path = context.resolve_allowed_path(to)?;
+                if let Some(parent) = to_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&from_path, &to_path).or_else(|_rename_err| {
+                    copy_path(&from_path, &to_path)?;
+                    remove_path_if_exists(&from_path)
+                })?;
+            }
+            Statement::MoveChildren { from_dir, to_dir } => {
+                execute_move_children(from_dir, to_dir, context)?;
             }
             Statement::Chmod { path, mode } => {
                 let file_path = context.resolve_allowed_path(path)?;
@@ -613,26 +632,7 @@ fn execute_statements(
                 source_dir,
                 link_dir,
                 suffix,
-            } => {
-                let source_path = context.resolve_allowed_path(source_dir)?;
-                let link_path = context.resolve_allowed_path(link_dir)?;
-                std::fs::create_dir_all(&link_path)?;
-                if source_path.is_dir() {
-                    for entry in std::fs::read_dir(&source_path)? {
-                        let entry = entry?;
-                        let basename = entry.file_name();
-                        let basename_str = basename.to_string_lossy();
-                        let mut link_name = basename_str.to_string();
-                        for part in suffix {
-                            link_name.push_str(&context.resolve_segment_part(part));
-                        }
-                        let link = link_path.join(&link_name);
-                        remove_path_if_exists(&link)?;
-                        let rel = relative_from_to(&link_path, &entry.path());
-                        std::os::unix::fs::symlink(rel, &link)?;
-                    }
-                }
-            }
+            } => execute_children_symlink(source_dir, link_dir, suffix, context)?,
             Statement::IfEnv {
                 variable,
                 negate,
@@ -652,6 +652,82 @@ fn execute_statements(
                 let output = run_process_capture(command, context)?;
                 context.captured_outputs.insert(variable.clone(), output);
             }
+        }
+    }
+    Ok(())
+}
+
+fn execute_glob_symlink(
+    source_dir: &PathExpr,
+    pattern: &str,
+    link_dir: &PathExpr,
+    context: &PostInstallContext,
+) -> Result<(), CellarError> {
+    let source_path = context.resolve_allowed_path(source_dir)?;
+    let link_path = context.resolve_allowed_path(link_dir)?;
+    std::fs::create_dir_all(&link_path)?;
+    if source_path.is_dir() {
+        for entry in std::fs::read_dir(&source_path)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| glob_matches(name, pattern))
+            {
+                let name = entry.file_name();
+                let link = link_path.join(&name);
+                remove_path_if_exists(&link)?;
+                let rel = relative_from_to(&link_path, &entry.path());
+                std::os::unix::fs::symlink(rel, &link)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_move_children(
+    from_dir: &PathExpr,
+    to_dir: &PathExpr,
+    context: &PostInstallContext,
+) -> Result<(), CellarError> {
+    let from_path = context.resolve_allowed_path(from_dir)?;
+    let to_path = context.resolve_allowed_path(to_dir)?;
+    std::fs::create_dir_all(&to_path)?;
+    if from_path.is_dir() {
+        for entry in std::fs::read_dir(&from_path)? {
+            let entry = entry?;
+            let dest = to_path.join(entry.file_name());
+            std::fs::rename(entry.path(), &dest).or_else(|_rename_err| {
+                copy_path(&entry.path(), &dest)?;
+                remove_path_if_exists(&entry.path())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn execute_children_symlink(
+    source_dir: &PathExpr,
+    link_dir: &PathExpr,
+    suffix: &[SegmentPart],
+    context: &PostInstallContext,
+) -> Result<(), CellarError> {
+    let source_path = context.resolve_allowed_path(source_dir)?;
+    let link_path = context.resolve_allowed_path(link_dir)?;
+    std::fs::create_dir_all(&link_path)?;
+    if source_path.is_dir() {
+        for entry in std::fs::read_dir(&source_path)? {
+            let entry = entry?;
+            let basename = entry.file_name();
+            let basename_str = basename.to_string_lossy();
+            let mut link_name = basename_str.to_string();
+            for part in suffix {
+                link_name.push_str(&context.resolve_segment_part(part));
+            }
+            let link = link_path.join(&link_name);
+            remove_path_if_exists(&link)?;
+            let rel = relative_from_to(&link_path, &entry.path());
+            std::os::unix::fs::symlink(rel, &link)?;
         }
     }
     Ok(())
@@ -1609,6 +1685,73 @@ end
         // chmod 0755 sets executable permissions
         let perms = std::fs::metadata(&installed)?.permissions();
         assert_eq!(perms.mode() & 0o777, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_move_and_move_children() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(keg.join("src/bin"))?;
+        std::fs::create_dir_all(keg.join("bin"))?;
+        std::fs::write(keg.join("src/bin/tool"), "tool")?;
+        std::fs::write(keg.join("bin/wheel"), "wheel")?;
+
+        let program = Program {
+            statements: vec![
+                Statement::MoveChildren {
+                    from_dir: PathExpr::new(PathBase::Prefix, &["src", "bin"]),
+                    to_dir: PathExpr::new(PathBase::Bin, &[]),
+                },
+                Statement::Move {
+                    from: PathExpr::new(PathBase::Bin, &["wheel"]),
+                    to: PathExpr::new(PathBase::Bin, &["wheel3.11"]),
+                },
+            ],
+        };
+
+        let mut context = test_context(&prefix, &keg, "1.0");
+        let rollback_roots = collect_rollback_roots(&program, &context);
+        run_with_rollback(&rollback_roots, &mut context, |ctx| {
+            execute_statements(&program.statements, ctx)
+        })?
+        .commit()?;
+
+        assert_eq!(std::fs::read_to_string(keg.join("bin/tool"))?, "tool");
+        assert_eq!(std::fs::read_to_string(keg.join("bin/wheel3.11"))?, "wheel");
+        assert!(!keg.join("bin/wheel").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_post_install_glob_chmod() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(keg.join("share/demo"))?;
+        std::fs::write(keg.join("share/demo/a.txt"), "a")?;
+        std::fs::write(keg.join("share/demo/b.txt"), "b")?;
+
+        let program = Program {
+            statements: vec![Statement::GlobChmod {
+                dir: PathExpr::new(PathBase::Pkgshare, &[]),
+                pattern: "*".to_owned(),
+                mode: 0o600,
+            }],
+        };
+
+        let mut context = test_context(&prefix, &keg, "1.0");
+        let rollback_roots = collect_rollback_roots(&program, &context);
+        run_with_rollback(&rollback_roots, &mut context, |ctx| {
+            execute_statements(&program.statements, ctx)
+        })?
+        .commit()?;
+
+        for file in [keg.join("share/demo/a.txt"), keg.join("share/demo/b.txt")] {
+            let perms = std::fs::metadata(file)?.permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
         Ok(())
     }
 

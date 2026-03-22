@@ -97,6 +97,15 @@ pub enum Statement {
         /// Glob pattern.
         pattern: String,
     },
+    /// Change permissions for entries in a directory matching a glob pattern.
+    GlobChmod {
+        /// Directory to scan.
+        dir: PathExpr,
+        /// Glob pattern.
+        pattern: String,
+        /// Unix permission mode.
+        mode: u32,
+    },
     /// Create symlinks for entries matching a glob pattern.
     GlobSymlink {
         /// Source directory to scan.
@@ -112,6 +121,20 @@ pub enum Statement {
         into_dir: PathExpr,
         /// Source file path.
         from: PathExpr,
+    },
+    /// Move/rename a file or directory.
+    Move {
+        /// Source path.
+        from: PathExpr,
+        /// Destination path.
+        to: PathExpr,
+    },
+    /// Move all children from one directory into another directory.
+    MoveChildren {
+        /// Source directory whose children will be moved.
+        from_dir: PathExpr,
+        /// Destination directory receiving the children.
+        to_dir: PathExpr,
     },
     /// Change file permissions.
     Chmod {
@@ -265,6 +288,8 @@ pub enum SegmentPart {
     CpuArch,
     /// A reference to a captured process output variable.
     CapturedOutput(String),
+    /// The basename of a captured process output path.
+    CapturedOutputBasename(String),
 }
 
 /// Base component of a [`PathExpr`].
@@ -514,6 +539,14 @@ fn normalize_method_schema<'pr>(
 
     if matches_node_npm_propagation_schema(body, ctx.parsed)? {
         return Ok(Some(normalize_node_npm_propagation()));
+    }
+
+    if let Some(stmts) = match_python_site_packages_schema(body, ctx)? {
+        return Ok(Some(stmts));
+    }
+
+    if let Some(stmts) = match_php_pear_schema(body, ctx)? {
+        return Ok(Some(stmts));
     }
 
     if matches_shared_mime_info_schema(body, ctx.parsed)? {
@@ -1078,6 +1111,347 @@ fn normalize_node_npm_propagation() -> Vec<Statement> {
     });
 
     stmts
+}
+
+fn match_python_site_packages_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    if ctx.tier != LoweringTier::WithAttributes {
+        return Ok(None);
+    }
+
+    let source = node_source(ctx.parsed, body)?;
+    if !source.contains("site_packages.mkpath")
+        || !source.contains("site_packages_cellar.parent.install_symlink site_packages")
+        || !source.contains("system python3, \"-Im\", \"ensurepip\"")
+        || !source.contains("system python3, \"-Im\", \"pip\", \"install\", \"-v\"")
+        || !source.contains("mv (site_packages/\"bin\").children, bin")
+        || !source.contains("mv bin/\"wheel\", bin/\"wheel#{version.major_minor}\"")
+    {
+        return Ok(None);
+    }
+
+    let formula_source = std::str::from_utf8(ctx.parsed.source()).map_err(|error| {
+        AnalysisError::UnsupportedPostInstallSyntax {
+            message: format!("invalid formula source utf-8: {error}"),
+        }
+    })?;
+    let setuptools_version = extract_resource_version(formula_source, "setuptools")?;
+    let pip_version = extract_resource_version(formula_source, "pip")?;
+    let wheel_version = extract_resource_version(formula_source, "wheel")?;
+
+    Ok(Some(normalize_python_site_packages(
+        &setuptools_version,
+        &pip_version,
+        &wheel_version,
+    )))
+}
+
+fn normalize_python_site_packages(
+    setuptools_version: &str,
+    pip_version: &str,
+    wheel_version: &str,
+) -> Vec<Statement> {
+    let version_major_minor_segment =
+        PathSegment::Interpolated(vec![SegmentPart::VersionMajorMinor]);
+    let python_bin = PathExpr {
+        base: PathBase::Bin,
+        segments: vec![PathSegment::Interpolated(vec![
+            SegmentPart::Literal("python".to_owned()),
+            SegmentPart::VersionMajorMinor,
+        ])],
+    };
+    let lib_cellar = PathExpr {
+        base: PathBase::Prefix,
+        segments: vec![
+            PathSegment::Literal("Frameworks".to_owned()),
+            PathSegment::Literal("Python.framework".to_owned()),
+            PathSegment::Literal("Versions".to_owned()),
+            version_major_minor_segment,
+            PathSegment::Literal("lib".to_owned()),
+            PathSegment::Interpolated(vec![
+                SegmentPart::Literal("python".to_owned()),
+                SegmentPart::VersionMajorMinor,
+            ]),
+        ],
+    };
+    let site_packages = PathExpr {
+        base: PathBase::HomebrewPrefix,
+        segments: vec![
+            PathSegment::Literal("lib".to_owned()),
+            PathSegment::Interpolated(vec![
+                SegmentPart::Literal("python".to_owned()),
+                SegmentPart::VersionMajorMinor,
+            ]),
+            PathSegment::Literal("site-packages".to_owned()),
+        ],
+    };
+    let site_packages_cellar = append_segment(&lib_cellar, "site-packages");
+    let bundled_dir = append_segment(&lib_cellar, "ensurepip/_bundled");
+    let libexec_bin = PathExpr::new(PathBase::Libexec, &["bin"]);
+    let site_packages_bin = append_segment(&site_packages, "bin");
+    let bin_dir = PathExpr::new(PathBase::Bin, &[]);
+
+    let mut statements = vec![
+        Statement::Mkpath(site_packages.clone()),
+        Statement::IfPath {
+            condition: site_packages_cellar.clone(),
+            kind: PathCondition::Exists,
+            then_branch: vec![Statement::RemoveIfExists(site_packages_cellar)],
+        },
+        Statement::InstallSymlink {
+            link_dir: lib_cellar,
+            target: site_packages.clone(),
+        },
+        Statement::RemoveIfExists(append_segment(&site_packages, "sitecustomize.pyc")),
+        Statement::RemoveIfExists(append_segment(&site_packages, "sitecustomize.pyo")),
+        Statement::System(vec![
+            Argument::Path(python_bin.clone()),
+            Argument::String("-Im".to_owned()),
+            Argument::String("ensurepip".to_owned()),
+        ]),
+        Statement::System(vec![
+            Argument::Path(python_bin),
+            Argument::String("-Im".to_owned()),
+            Argument::String("pip".to_owned()),
+            Argument::String("install".to_owned()),
+            Argument::String("-v".to_owned()),
+            Argument::String("--no-deps".to_owned()),
+            Argument::String("--no-index".to_owned()),
+            Argument::String("--upgrade".to_owned()),
+            Argument::String("--isolated".to_owned()),
+            Argument::String("--target".to_owned()),
+            Argument::Path(site_packages.clone()),
+            Argument::Path(append_segment(
+                &bundled_dir,
+                &format!("setuptools-{setuptools_version}-py3-none-any.whl"),
+            )),
+            Argument::Path(append_segment(
+                &bundled_dir,
+                &format!("pip-{pip_version}-py3-none-any.whl"),
+            )),
+            Argument::Path(PathExpr::new(
+                PathBase::Libexec,
+                &[&format!("wheel-{wheel_version}-py3-none-any.whl")],
+            )),
+        ]),
+        Statement::MoveChildren {
+            from_dir: site_packages_bin.clone(),
+            to_dir: bin_dir.clone(),
+        },
+        Statement::RemoveIfExists(site_packages_bin),
+        Statement::RemoveIfExists(append_segment(&bin_dir, "pip")),
+        Statement::RemoveIfExists(append_segment(&bin_dir, "pip3")),
+        Statement::Move {
+            from: append_segment(&bin_dir, "wheel"),
+            to: PathExpr {
+                base: PathBase::Bin,
+                segments: vec![PathSegment::Interpolated(vec![
+                    SegmentPart::Literal("wheel".to_owned()),
+                    SegmentPart::VersionMajorMinor,
+                ])],
+            },
+        },
+    ];
+
+    for (short_name, long_name) in [
+        ("pip", "pip"),
+        ("pip3", "pip"),
+        ("wheel", "wheel"),
+        ("wheel3", "wheel"),
+    ] {
+        statements.push(Statement::InstallSymlink {
+            link_dir: libexec_bin.clone(),
+            target: PathExpr {
+                base: PathBase::Bin,
+                segments: vec![PathSegment::Interpolated(vec![
+                    SegmentPart::Literal(long_name.to_owned()),
+                    SegmentPart::VersionMajorMinor,
+                ])],
+            },
+        });
+        statements.push(Statement::ForceSymlink {
+            target: PathExpr::new(PathBase::Libexec, &["bin", short_name]),
+            link: PathExpr::new(PathBase::HomebrewPrefix, &["bin", short_name]),
+        });
+    }
+
+    statements
+}
+
+fn match_php_pear_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    if ctx.tier != LoweringTier::WithAttributes {
+        return Ok(None);
+    }
+
+    let source = node_source(ctx.parsed, body)?;
+    if !source.contains("pecl_path.mkpath")
+        || !source.contains("Utils.safe_popen_read(bin/\"php-config\", \"--extension-dir\")")
+        || !source.contains("cp_r pkgshare/\"pear/.\", pear_path")
+        || !source.contains("system bin/\"pear\", \"update-channels\"")
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(normalize_php_pear_schema()))
+}
+
+fn normalize_php_pear_schema() -> Vec<Statement> {
+    let hp = |segs: &[&str]| PathExpr::new(PathBase::HomebrewPrefix, segs);
+    let etc_php = PathExpr {
+        base: PathBase::Etc,
+        segments: vec![
+            PathSegment::Literal("php".to_owned()),
+            PathSegment::Interpolated(vec![SegmentPart::VersionMajorMinor]),
+        ],
+    };
+    let pecl_path = hp(&["lib", "php", "pecl"]);
+    let php_basename = SegmentPart::CapturedOutputBasename("extension_dir".to_owned());
+    let pecl_ext_dir = PathExpr {
+        base: PathBase::HomebrewPrefix,
+        segments: vec![
+            PathSegment::Literal("lib".to_owned()),
+            PathSegment::Literal("php".to_owned()),
+            PathSegment::Literal("pecl".to_owned()),
+            PathSegment::Interpolated(vec![php_basename]),
+        ],
+    };
+    let pear_path = hp(&["share", "pear"]);
+    let opt_php_bin = hp(&["opt", "php", "bin"]);
+
+    let mut statements = vec![
+        Statement::Chmod {
+            path: PathExpr::new(PathBase::Pkgshare, &["pear", ".channels"]),
+            mode: 0o755,
+        },
+        Statement::Chmod {
+            path: PathExpr::new(PathBase::Pkgshare, &["pear", ".channels", ".alias"]),
+            mode: 0o755,
+        },
+        Statement::GlobChmod {
+            dir: PathExpr::new(PathBase::Pkgshare, &["pear", ".channels"]),
+            pattern: "*".to_owned(),
+            mode: 0o755,
+        },
+        Statement::GlobChmod {
+            dir: PathExpr::new(PathBase::Pkgshare, &["pear", ".channels", ".alias"]),
+            pattern: "*".to_owned(),
+            mode: 0o755,
+        },
+    ];
+
+    for path in [
+        PathExpr::new(PathBase::Pkgshare, &["pear", ".depdblock"]),
+        PathExpr::new(PathBase::Pkgshare, &["pear", ".filemap"]),
+        PathExpr::new(PathBase::Pkgshare, &["pear", ".depdb"]),
+        PathExpr::new(PathBase::Pkgshare, &["pear", ".lock"]),
+    ] {
+        statements.push(Statement::Chmod { path, mode: 0o644 });
+    }
+
+    statements.extend([
+        Statement::Mkpath(pecl_path.clone()),
+        Statement::IfPath {
+            condition: PathExpr::new(PathBase::Prefix, &["pecl"]),
+            kind: PathCondition::Missing,
+            then_branch: vec![Statement::ForceSymlink {
+                target: pecl_path,
+                link: PathExpr::new(PathBase::Prefix, &["pecl"]),
+            }],
+        },
+        Statement::ProcessCapture {
+            variable: "extension_dir".to_owned(),
+            command: vec![
+                Argument::Path(PathExpr::new(PathBase::Bin, &["php-config"])),
+                Argument::String("--extension-dir".to_owned()),
+            ],
+        },
+        Statement::Mkpath(pecl_ext_dir.clone()),
+        Statement::RecursiveCopy {
+            from: PathExpr::new(PathBase::Pkgshare, &["pear"]),
+            to: hp(&["share"]),
+        },
+    ]);
+
+    for path in [
+        pear_path.clone(),
+        append_segment(&pear_path, "doc"),
+        pecl_ext_dir.clone(),
+        append_segment(&pear_path, "data"),
+        append_segment(&pear_path, "cfg"),
+        append_segment(&pear_path, "htdocs"),
+        append_segment(&pear_path, "test"),
+    ] {
+        statements.push(Statement::Mkpath(path));
+    }
+
+    for (key, value) in [
+        ("php_ini", append_segment(&etc_php, "php.ini")),
+        ("php_dir", pear_path.clone()),
+        ("doc_dir", append_segment(&pear_path, "doc")),
+        ("ext_dir", pecl_ext_dir),
+        ("bin_dir", opt_php_bin.clone()),
+        ("data_dir", append_segment(&pear_path, "data")),
+        ("cfg_dir", append_segment(&pear_path, "cfg")),
+        ("www_dir", append_segment(&pear_path, "htdocs")),
+        ("man_dir", hp(&["share", "man"])),
+        ("test_dir", append_segment(&pear_path, "test")),
+        ("php_bin", append_segment(&opt_php_bin, "php")),
+    ] {
+        statements.push(Statement::System(vec![
+            Argument::Path(PathExpr::new(PathBase::Bin, &["pear"])),
+            Argument::String("config-set".to_owned()),
+            Argument::String(key.to_owned()),
+            Argument::Path(value),
+            Argument::String("system".to_owned()),
+        ]));
+    }
+
+    statements.push(Statement::System(vec![
+        Argument::Path(PathExpr::new(PathBase::Bin, &["pear"])),
+        Argument::String("update-channels".to_owned()),
+    ]));
+
+    statements
+}
+
+fn extract_resource_version(source: &str, resource_name: &str) -> Result<String, AnalysisError> {
+    let marker = format!("resource \"{resource_name}\"");
+    let Some(start) = source.find(&marker) else {
+        return unsupported(&format!("missing resource block: {resource_name}"));
+    };
+    let tail = &source[start..];
+    let Some(url_index) = tail.find("url ") else {
+        return unsupported(&format!("missing resource url: {resource_name}"));
+    };
+    let url_tail = &tail[url_index + 4..];
+    let Some(first_quote) = url_tail.find('"') else {
+        return unsupported(&format!("missing resource url quote: {resource_name}"));
+    };
+    let url_tail = &url_tail[first_quote + 1..];
+    let Some(second_quote) = url_tail.find('"') else {
+        return unsupported(&format!("unterminated resource url: {resource_name}"));
+    };
+    let url = &url_tail[..second_quote];
+    let Some(file_name) = url.rsplit('/').next() else {
+        return unsupported(&format!("invalid resource url: {resource_name}"));
+    };
+    let Some(stripped) = file_name.strip_suffix(".tar.gz") else {
+        return unsupported(&format!(
+            "unexpected resource archive suffix: {resource_name}"
+        ));
+    };
+    let prefix = format!("{resource_name}-");
+    stripped
+        .strip_prefix(&prefix)
+        .map(str::to_owned)
+        .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+            message: format!("resource url does not encode version: {resource_name}"),
+        })
 }
 
 fn matches_shared_mime_info_schema(
@@ -3035,6 +3409,162 @@ end
             )),
             "expected initdb to be guarded by Missing(PG_VERSION)"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_python_site_packages_schema_lowers() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class PythonAT311 < Formula
+  resource "pip" do
+    url "https://files.pythonhosted.org/packages/foo/pip-26.0.1.tar.gz"
+  end
+
+  resource "setuptools" do
+    url "https://files.pythonhosted.org/packages/foo/setuptools-82.0.0.tar.gz"
+  end
+
+  resource "wheel" do
+    url "https://files.pythonhosted.org/packages/foo/wheel-0.46.3.tar.gz"
+  end
+
+  def lib_cellar
+    on_macos do
+      return frameworks/"Python.framework/Versions"/version.major_minor/"lib/python#{version.major_minor}"
+    end
+  end
+
+  def site_packages_cellar
+    lib_cellar/"site-packages"
+  end
+
+  def site_packages
+    HOMEBREW_PREFIX/"lib/python#{version.major_minor}/site-packages"
+  end
+
+  def python3
+    bin/"python#{version.major_minor}"
+  end
+
+  def post_install
+    ENV.delete "PYTHONPATH"
+    site_packages.mkpath
+    site_packages_cellar.unlink if site_packages_cellar.exist?
+    site_packages_cellar.parent.install_symlink site_packages
+    system python3, "-Im", "ensurepip"
+    bundled = lib_cellar/"ensurepip/_bundled"
+    system python3, "-Im", "pip", "install", "-v",
+           "--no-deps",
+           "--no-index",
+           "--upgrade",
+           "--isolated",
+           "--target=#{site_packages}",
+           bundled/"setuptools-#{resource("setuptools").version}-py3-none-any.whl",
+           bundled/"pip-#{resource("pip").version}-py3-none-any.whl",
+           libexec/"wheel-#{resource("wheel").version}-py3-none-any.whl"
+    mv (site_packages/"bin").children, bin
+    rmdir site_packages/"bin"
+    rm_r(bin.glob("pip{,3}"))
+    mv bin/"wheel", bin/"wheel#{version.major_minor}"
+  end
+end
+"#;
+
+        let program = lower_post_install_tier2(source, "3.11.15")?;
+        assert!(
+            program
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::MoveChildren { .. }))
+        );
+        assert!(
+            program
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::Move { .. }))
+        );
+        assert!(program.statements.iter().any(|statement| matches!(
+            statement,
+            Statement::System(arguments)
+                if arguments.iter().any(|argument| matches!(
+                    argument,
+                    Argument::String(value) if value == "ensurepip"
+                ))
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn test_php_pear_schema_lowers() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Php < Formula
+  def post_install
+    pear_prefix = pkgshare/"pear"
+    pear_files = %W[
+      #{pear_prefix}/.depdblock
+      #{pear_prefix}/.filemap
+      #{pear_prefix}/.depdb
+      #{pear_prefix}/.lock
+    ]
+
+    %W[
+      #{pear_prefix}/.channels
+      #{pear_prefix}/.channels/.alias
+    ].each do |f|
+      chmod 0755, f
+      pear_files.concat(Dir["#{f}/*"])
+    end
+
+    chmod 0644, pear_files
+    pecl_path = HOMEBREW_PREFIX/"lib/php/pecl"
+    pecl_path.mkpath
+    ln_s pecl_path, prefix/"pecl" unless (prefix/"pecl").exist?
+    extension_dir = Utils.safe_popen_read(bin/"php-config", "--extension-dir").chomp
+    php_basename = File.basename(extension_dir)
+    (pecl_path/php_basename).mkpath
+    pear_path = HOMEBREW_PREFIX/"share"/"pear"
+    cp_r pkgshare/"pear/.", pear_path
+    {
+      "php_ini"  => etc/"php/#{version.major_minor}/php.ini",
+      "php_dir"  => pear_path,
+      "doc_dir"  => pear_path/"doc",
+      "ext_dir"  => pecl_path/php_basename,
+      "bin_dir"  => opt_bin,
+      "data_dir" => pear_path/"data",
+      "cfg_dir"  => pear_path/"cfg",
+      "www_dir"  => pear_path/"htdocs",
+      "man_dir"  => HOMEBREW_PREFIX/"share/man",
+      "test_dir" => pear_path/"test",
+      "php_bin"  => opt_bin/"php",
+    }.each do |key, value|
+      value.mkpath if /(?<!bin|man)_dir$/.match?(key)
+      system bin/"pear", "config-set", key, value, "system"
+    end
+
+    system bin/"pear", "update-channels"
+  end
+end
+"##;
+
+        let program = lower_post_install_tier2(source, "8.5.4")?;
+        assert!(program.statements.iter().any(|statement| matches!(
+            statement,
+            Statement::ProcessCapture { variable, .. } if variable == "extension_dir"
+        )));
+        assert!(
+            program
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::GlobChmod { .. }))
+        );
+        assert!(program.statements.iter().any(|statement| matches!(
+            statement,
+            Statement::System(arguments)
+                if arguments.iter().any(|argument| matches!(
+                    argument,
+                    Argument::String(value) if value == "update-channels"
+                ))
+        )));
         Ok(())
     }
 }
