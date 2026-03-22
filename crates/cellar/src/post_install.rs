@@ -987,7 +987,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_executes_supported_subset() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_supported_subset() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/demo/1.0");
@@ -1033,7 +1033,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_rejects_empty_source() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_empty_source() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/demo/1.0");
@@ -1045,8 +1045,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_rejects_unsupported_syntax() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_run_post_install_unsupported_syntax() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/demo/1.0");
@@ -1065,8 +1064,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_bootstraps_certificate_bundle_pattern_on_macos()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_ca_bundle() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/ca-certificates/1.0");
@@ -1107,8 +1105,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_bootstraps_certificate_bundle_via_runtime_helper_resolution()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_ca_bundle_helper() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/ca-certificates/1.0");
@@ -1149,8 +1146,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_bootstraps_openssl_cert_symlink_pattern()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_openssl_cert() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/openssl@3/1.0");
@@ -1179,8 +1175,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_bootstraps_cert_symlink_via_path_helper_resolution()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_cert_symlink_helper() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/openssl@3/1.0");
@@ -1209,8 +1204,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_rolls_back_prefix_mutation_on_failure()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_rollback() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/demo/1.0");
@@ -1238,8 +1232,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_rejects_path_traversal_and_leaves_no_escape_artifacts()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_rejects_path_traversal() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/demo/1.0");
@@ -1268,8 +1261,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_rejects_parent_directory_escape()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_rejects_parent_directory() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/demo/1.0");
@@ -1300,7 +1292,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_rejects_atomic_write_path_traversal()
+    fn test_run_post_install_rejects_atomic_write_traversal()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
@@ -1326,8 +1318,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_ruby_bundler_cleanup_schema() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_run_post_install_ruby_cleanup() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/ruby/3.4.2");
@@ -1376,8 +1367,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_node_npm_propagation_schema() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_run_post_install_node_npm() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/node/22.0.0");
@@ -1476,8 +1466,7 @@ end
     }
 
     #[test]
-    fn test_validate_post_install_accepts_ruby_and_node_schemas()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_validate_post_install_schemas() -> Result<(), Box<dyn std::error::Error>> {
         let ruby_source = r##"
 class Ruby < Formula
   def rubygems_bindir
@@ -1551,8 +1540,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_handles_homebrew_prefix_constant_path()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_homebrew_prefix() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/glib/2.88.0");
@@ -1572,8 +1560,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_normalizes_shared_mime_info_schema()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_run_post_install_shared_mime_info() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/shared-mime-info/2.4");
@@ -1620,8 +1607,7 @@ end
     }
 
     #[test]
-    fn test_run_post_install_handles_formula_opt_bin_path() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn test_run_post_install_formula_opt_bin() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let prefix = dir.path().join("prefix");
         let keg = prefix.join("Cellar/libheif/1.0");

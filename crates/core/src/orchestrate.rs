@@ -2008,8 +2008,7 @@ mod tests {
     // --- Install tests ---
 
     #[tokio::test]
-    async fn test_install_resolves_and_installs_in_topological_order()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_topological_order() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2101,8 +2100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_install_uses_compatible_bottle_method()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_plan_install_uses_compatible_bottle() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2122,7 +2120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_install_uses_source_method_when_bottle_missing()
+    async fn test_plan_install_uses_source_when_bottle_missing()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2159,7 +2157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_install_keeps_post_install_formula_plannable()
+    async fn test_plan_install_keeps_post_install_plannable()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2177,8 +2175,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_execution_plan_marks_bottle_and_source_boundaries()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_build_execution_plan_marks_boundaries() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2225,8 +2223,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_upgrade_reuses_install_method_resolution()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_plan_upgrade_reuses_method_resolution() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2278,8 +2276,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_install_runs_post_install_before_link_and_persists_receipt_and_state()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_runs_post_install_before_link() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2341,7 +2339,7 @@ end
     }
 
     #[tokio::test]
-    async fn test_install_succeeds_when_post_install_creates_prefix_owned_link_target()
+    async fn test_install_post_install_creates_link_target()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2418,8 +2416,8 @@ end
     }
 
     #[tokio::test]
-    async fn test_install_cleans_up_failed_post_install_without_receipt_or_state()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_cleans_up_failed_post_install() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2467,8 +2465,8 @@ end
     }
 
     #[tokio::test]
-    async fn test_install_cleans_up_when_ruby_source_fetch_fails()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_cleans_up_on_ruby_source_fail() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2498,8 +2496,8 @@ end
     }
 
     #[tokio::test]
-    async fn test_install_bootstraps_certificate_bundle_post_install_pattern()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_bootstraps_certificate_bundle() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2561,8 +2559,8 @@ end
     }
 
     #[tokio::test]
-    async fn test_install_bootstraps_openssl_cert_symlink_post_install_pattern()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_bootstraps_openssl_cert_symlink() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2650,8 +2648,8 @@ end
     }
 
     #[tokio::test]
-    async fn test_install_rolls_back_post_install_state_when_link_fails()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_rolls_back_post_install_state() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2705,7 +2703,7 @@ end
     }
 
     #[tokio::test]
-    async fn test_source_fallback_install_installs_build_dependency_closure_before_target()
+    async fn test_source_fallback_installs_build_deps_before_target()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2795,7 +2793,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_source_fallback_rejects_unsupported_requirement_during_planning()
+    async fn test_source_fallback_rejects_unsupported_requirement()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2819,8 +2817,8 @@ install:
     }
 
     #[tokio::test]
-    async fn test_source_fallback_cleans_up_failed_build_without_receipt_or_state()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_source_fallback_cleans_up_failed_build() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -2872,7 +2870,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_source_fallback_plan_upgrade_reuses_source_method_resolution()
+    async fn test_source_fallback_plan_upgrade_reuses_source_resolution()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2902,7 +2900,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_source_fallback_upgrade_installs_missing_build_dependencies()
+    async fn test_source_fallback_upgrade_installs_build_deps()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -2967,7 +2965,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_source_fallback_upgrade_reuses_staged_prefetch_concurrency()
+    async fn test_source_fallback_upgrade_reuses_prefetch_concurrency()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3217,7 +3215,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_resolve_incompatible_cellar_bottle_without_source_fallback_returns_error()
+    async fn test_resolve_incompatible_cellar_bottle_returns_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3297,7 +3295,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_any_skip_relocation_bottle_relocates_text_placeholders()
+    async fn test_any_skip_relocation_bottle_relocates_placeholders()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3347,7 +3345,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_upgrade_restores_old_links_when_new_payload_download_fails()
+    async fn test_upgrade_restores_old_links_on_download_fail()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3412,8 +3410,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_source_archive_traversal_does_not_escape_cache_root()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_source_archive_traversal() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
         let sha = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
@@ -3504,8 +3501,7 @@ install:
     // --- Parallel install tests ---
 
     #[tokio::test]
-    async fn test_install_independent_formulae_all_installed()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_independent_formulae() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -3545,7 +3541,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_finalize_failure_preserves_completed_installs()
+    async fn test_install_finalize_failure_preserves_installs()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3630,8 +3626,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_bounds_concurrent_prefetch_downloads()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_bounds_prefetch_downloads() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -3702,7 +3697,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_failed_download_does_not_publish_blob()
+    async fn test_install_download_fail_does_not_publish_blob()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3728,7 +3723,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_skips_download_when_blob_exists_in_store()
+    async fn test_install_skips_download_for_existing_blob()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3763,8 +3758,8 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_skips_extract_when_extract_dir_exists()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_skips_extract_for_existing_dir() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -3805,8 +3800,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_warm_path_with_multiple_formulae()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_install_warm_path_multiple_formulae() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -3848,7 +3842,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_download_failure_prevents_prefix_mutation()
+    async fn test_install_download_fail_prevents_prefix_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -3926,8 +3920,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_update_writes_metadata_and_formulae_files()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_update_writes_metadata_and_formulae() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
         let counter = Arc::new(AtomicUsize::new(0));
@@ -3996,7 +3989,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_install_plan_falls_back_to_network_on_cache_miss()
+    async fn test_install_plan_cache_miss_falls_back_to_network()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
@@ -4095,8 +4088,8 @@ install:
     }
 
     #[tokio::test]
-    async fn test_outdated_returns_empty_when_all_up_to_date()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_outdated_returns_empty_when_up_to_date() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -4336,8 +4329,7 @@ install:
     }
 
     #[tokio::test]
-    async fn test_tier2_fallback_installs_formula_using_name_attribute()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_tier2_fallback_uses_name_attribute() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -4381,8 +4373,8 @@ end
     }
 
     #[tokio::test]
-    async fn test_tier2_fallback_installs_formula_using_version_major_minor()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_tier2_fallback_uses_version_major_minor() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -4428,8 +4420,7 @@ end
     }
 
     #[tokio::test]
-    async fn test_tier2_filesystem_postgresql_mirror_tree() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_tier2_filesystem_postgresql() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -4537,8 +4528,7 @@ end
     }
 
     #[tokio::test]
-    async fn test_tier2_process_capture_in_post_install() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn test_tier2_process_capture() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 
@@ -4582,8 +4572,7 @@ end
     }
 
     #[tokio::test]
-    async fn test_post_install_prelinks_non_keg_only_formulae()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_post_install_prelinks_non_keg_only() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let layout = Layout::with_root(dir.path());
 

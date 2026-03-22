@@ -429,22 +429,21 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_uses_from_macos_string_form() -> Result<(), serde_json::Error> {
+    fn test_deserialize_uses_from_macos_string() -> Result<(), serde_json::Error> {
         let dep: MacOsDependency = serde_json::from_str(r#""curl""#)?;
         assert_eq!(dep, MacOsDependency::Name("curl".to_owned()));
         Ok(())
     }
 
     #[test]
-    fn test_deserialize_uses_from_macos_single_context_object() -> Result<(), serde_json::Error> {
+    fn test_deserialize_uses_from_macos_single_context() -> Result<(), serde_json::Error> {
         let dep: MacOsDependency = serde_json::from_str(r#"{"zsh":"test"}"#)?;
         assert_eq!(dep, detailed_dependency("zsh", &["test"]));
         Ok(())
     }
 
     #[test]
-    fn test_deserialize_uses_from_macos_multiple_contexts_object() -> Result<(), serde_json::Error>
-    {
+    fn test_deserialize_uses_from_macos_multiple_contexts() -> Result<(), serde_json::Error> {
         let dep: MacOsDependency = serde_json::from_str(r#"{"zsh":["build","test"]}"#)?;
         assert_eq!(dep, detailed_dependency("zsh", &["build", "test"]));
         Ok(())
@@ -464,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_zsh_completions_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_deserialize_zsh_completions() -> Result<(), Box<dyn std::error::Error>> {
         let json = include_str!("../tests/fixtures/formula/zsh-completions.json");
         let formula: Formula = serde_json::from_str(json)?;
         assert_eq!(
@@ -475,8 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_zsh_fast_syntax_highlighting_fixture()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn test_deserialize_zsh_fast_syntax() -> Result<(), Box<dyn std::error::Error>> {
         let json = include_str!("../tests/fixtures/formula/zsh-fast-syntax-highlighting.json");
         let formula: Formula = serde_json::from_str(json)?;
         assert_eq!(
@@ -487,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_sqlmap_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_deserialize_sqlmap() -> Result<(), Box<dyn std::error::Error>> {
         let json = include_str!("../tests/fixtures/formula/sqlmap.json");
         let formula: Formula = serde_json::from_str(json)?;
         assert_eq!(
@@ -519,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_rejects_empty_uses_from_macos_object() {
+    fn test_deserialize_rejects_empty_uses_from_macos() {
         let result: Result<Formula, _> = serde_json::from_str(&minimal_formula_json("[{}]"));
         assert!(
             result.is_err(),
@@ -528,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_rejects_multi_entry_uses_from_macos_object() {
+    fn test_deserialize_rejects_multi_entry_uses_from_macos() {
         let result: Result<Formula, _> =
             serde_json::from_str(&minimal_formula_json(r#"[{"zlib":"build","curl":"test"}]"#));
         assert!(
