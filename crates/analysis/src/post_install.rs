@@ -854,7 +854,7 @@ fn lower_call_statement<'pr>(
                 to: parse_path_expr(&arguments[1], parsed, methods, helper_stack)?,
             }])
         }
-        "system" => {
+        "system" | "quiet_system" => {
             let arguments = call_args(call);
             if arguments.is_empty() {
                 return unsupported("system expects at least one argument");
@@ -1435,5 +1435,29 @@ end
 "#;
         let result = lower_post_install(source, "1.0");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quiet_system_lowered_as_system() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Gnupg < Formula
+  def post_install
+    (var/"run").mkpath
+    quiet_system "killall", "gpg-agent"
+  end
+end
+"#;
+        let program = lower_post_install(source, "2.4.1")?;
+        assert_eq!(
+            program.statements,
+            vec![
+                Statement::Mkpath(PathExpr::new(PathBase::Var, &["run"])),
+                Statement::System(vec![
+                    Argument::String("killall".to_owned()),
+                    Argument::String("gpg-agent".to_owned()),
+                ]),
+            ]
+        );
+        Ok(())
     }
 }
