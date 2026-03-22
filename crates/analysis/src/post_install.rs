@@ -868,13 +868,18 @@ fn lower_call_statement<'pr>(
             "mkpath" => Ok(vec![Statement::Mkpath(receiver)]),
             "install_symlink" => {
                 let arguments = call_args(call);
-                if arguments.len() != 1 {
-                    return unsupported("install_symlink expects exactly one argument");
+                if arguments.is_empty() {
+                    return unsupported("install_symlink expects at least one argument");
                 }
-                Ok(vec![Statement::InstallSymlink {
-                    link_dir: receiver,
-                    target: parse_path_expr(&arguments[0], parsed, methods, helper_stack)?,
-                }])
+                arguments
+                    .iter()
+                    .map(|arg| {
+                        Ok(Statement::InstallSymlink {
+                            link_dir: receiver.clone(),
+                            target: parse_path_expr(arg, parsed, methods, helper_stack)?,
+                        })
+                    })
+                    .collect()
             }
             "atomic_write" => {
                 let arguments = call_args(call);
@@ -1658,6 +1663,34 @@ end
 ";
         let program = lower_post_install(source, "1.0")?;
         assert!(program.statements.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_symlink_multiple_args() -> Result<(), Box<dyn std::error::Error>> {
+        // (HOMEBREW_PREFIX/"bin").install_symlink bin/"rustup", bin/"rustup-init"
+        let source = r#"
+class Rustup < Formula
+  def post_install
+    (HOMEBREW_PREFIX/"bin").install_symlink bin/"rustup", bin/"rustup-init"
+  end
+end
+"#;
+        let program = lower_post_install(source, "1.0")?;
+        let hp_bin = PathExpr::new(PathBase::HomebrewPrefix, &["bin"]);
+        assert_eq!(
+            program.statements,
+            vec![
+                Statement::InstallSymlink {
+                    link_dir: hp_bin.clone(),
+                    target: PathExpr::new(PathBase::Bin, &["rustup"]),
+                },
+                Statement::InstallSymlink {
+                    link_dir: hp_bin,
+                    target: PathExpr::new(PathBase::Bin, &["rustup-init"]),
+                },
+            ]
+        );
         Ok(())
     }
 }
