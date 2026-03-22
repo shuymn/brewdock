@@ -933,6 +933,18 @@ fn lower_call_statement<'pr>(
                 helper_stack,
             )?)])
         }
+        "mkdir_p" => {
+            let arguments = call_args(call);
+            if arguments.len() != 1 {
+                return unsupported("mkdir_p expects exactly one argument");
+            }
+            Ok(vec![Statement::Mkpath(parse_path_expr(
+                &arguments[0],
+                parsed,
+                methods,
+                helper_stack,
+            )?)])
+        }
         // Homebrew logging helpers — purely informational, safe to ignore.
         "ohai" | "opoo" | "odebug" => Ok(vec![]),
         helper if methods.contains_key(helper) => {
@@ -1690,6 +1702,23 @@ end
                     target: PathExpr::new(PathBase::Bin, &["rustup-init"]),
                 },
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mkdir_p_without_receiver() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Glibc < Formula
+  def post_install
+    mkdir_p lib/"locale"
+  end
+end
+"#;
+        let program = lower_post_install(source, "2.39")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr::new(PathBase::Lib, &["locale"]))]
         );
         Ok(())
     }
