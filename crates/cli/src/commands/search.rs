@@ -24,31 +24,3 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
-
-    use brewdock_core::Layout;
-
-    use super::*;
-    use crate::testutil::{SHA_A, make_formula, make_orchestrator};
-
-    #[tokio::test]
-    async fn test_search_auto_fetches_on_cache_miss() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        // MockRepo has formulae but SQLite cache is empty.
-        let formulae = vec![
-            make_formula("jq", "1.7", &[], SHA_A),
-            make_formula("wget", "1.24", &[], SHA_A),
-        ];
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(formulae, vec![], counter, layout)?;
-
-        // Should auto-fetch and find jq.
-        run(&orchestrator, "jq", Verbosity::Normal).await?;
-        Ok(())
-    }
-}

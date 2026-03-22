@@ -11,9 +11,6 @@ mod progress;
 mod trace;
 mod verbosity;
 
-#[cfg(test)]
-mod testutil;
-
 pub(crate) use verbosity::Verbosity;
 
 /// Fast Homebrew bottle installer.

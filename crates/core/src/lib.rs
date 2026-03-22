@@ -11,8 +11,8 @@ pub mod platform;
 pub mod progress;
 mod source_build;
 
-#[doc(hidden)]
-pub mod testutil;
+#[cfg(test)]
+mod testutil;
 
 pub use brewdock_bottle::{BottleDownloader, HttpBottleDownloader, Sha256Hex};
 pub use brewdock_cellar::InstalledKeg;

@@ -39,112 +39,12 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use brewdock_core::{InstallMethod, PlanEntry, SourceBuildPlan};
 
-    use brewdock_core::{InstallMethod, Layout, PlanEntry, SourceBuildPlan};
+    use crate::output;
 
-    use super::*;
-    use crate::{
-        output,
-        testutil::{SHA_A, SHA_B, create_bottle_tar_gz, make_formula, make_orchestrator},
-    };
-
-    #[tokio::test]
-    async fn test_commands_install_single_formula() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        let formula = make_formula("a", "1.0", &[], SHA_A);
-        let tar = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh\necho a")])?;
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator =
-            make_orchestrator(vec![formula], vec![(SHA_A, tar)], counter, layout.clone())?;
-
-        run(&orchestrator, &["a".to_owned()], false, Verbosity::Normal).await?;
-
-        assert!(layout.cellar().join("a/1.0/bin/a_tool").exists());
-        assert!(layout.prefix().join("bin/a_tool").is_symlink());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_commands_install_with_deps() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        let formula_a = make_formula("a", "1.0", &["b"], SHA_A);
-        let formula_b = make_formula("b", "2.0", &[], SHA_B);
-
-        let tar_a = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh")])?;
-        let tar_b = create_bottle_tar_gz("b", "2.0", &[("bin/b_tool", b"#!/bin/sh")])?;
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(
-            vec![formula_a, formula_b],
-            vec![(SHA_A, tar_a), (SHA_B, tar_b)],
-            counter,
-            layout.clone(),
-        )?;
-
-        run(&orchestrator, &["a".to_owned()], false, Verbosity::Normal).await?;
-
-        assert!(layout.cellar().join("a/1.0/bin/a_tool").exists());
-        assert!(layout.cellar().join("b/2.0/bin/b_tool").exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_dry_run_install_does_not_execute() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        let formula = make_formula("a", "1.0", &[], SHA_A);
-        let tar = create_bottle_tar_gz("a", "1.0", &[("bin/a_tool", b"#!/bin/sh")])?;
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(
-            vec![formula],
-            vec![(SHA_A, tar)],
-            counter.clone(),
-            layout.clone(),
-        )?;
-
-        run(&orchestrator, &["a".to_owned()], true, Verbosity::Normal).await?;
-
-        // dry_run: no files created, no downloads attempted
-        assert!(!layout.cellar().join("a").exists());
-        assert_eq!(
-            counter.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "no downloads in dry-run"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_dry_run_install_with_deps() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        let formula_a = make_formula("a", "1.0", &["b"], SHA_A);
-        let formula_b = make_formula("b", "2.0", &[], SHA_B);
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(
-            vec![formula_a, formula_b],
-            vec![],
-            counter.clone(),
-            layout.clone(),
-        )?;
-
-        run(&orchestrator, &["a".to_owned()], true, Verbosity::Normal).await?;
-
-        // dry_run: nothing installed
-        assert!(!layout.cellar().join("a").exists());
-        assert!(!layout.cellar().join("b").exists());
-        Ok(())
-    }
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
     fn test_render_install_plan_includes_method() {

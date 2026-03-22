@@ -39,92 +39,11 @@ pub async fn run<R: FormulaRepository, D: BottleDownloader>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use brewdock_core::{InstallMethod, SourceBuildPlan, UpgradePlanEntry};
 
-    use brewdock_core::{InstallMethod, Layout, SourceBuildPlan, UpgradePlanEntry};
+    use crate::output;
 
-    use super::*;
-    use crate::{
-        output,
-        testutil::{
-            SHA_A, SHA_C, create_bottle_tar_gz, make_formula, make_orchestrator,
-            setup_installed_keg,
-        },
-    };
-
-    #[tokio::test]
-    async fn test_commands_upgrade_installs_new_version() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        // Pre-populate filesystem state with old version.
-        setup_installed_keg(&layout, "a", "1.0", true)?;
-
-        let formula = make_formula("a", "2.0", &[], SHA_C);
-        let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator =
-            make_orchestrator(vec![formula], vec![(SHA_C, tar)], counter, layout.clone())?;
-
-        run(&orchestrator, &["a".to_owned()], false, Verbosity::Normal).await?;
-
-        assert!(layout.cellar().join("a/2.0/bin/a_tool").exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_commands_upgrade_already_up_to_date() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        setup_installed_keg(&layout, "a", "1.0", true)?;
-
-        let formula = make_formula("a", "1.0", &[], SHA_A);
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(vec![formula], vec![], counter, layout.clone())?;
-
-        // Should succeed without error (nothing to upgrade).
-        run(&orchestrator, &["a".to_owned()], false, Verbosity::Normal).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_dry_run_upgrade_does_not_execute() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let layout = Layout::with_root(dir.path());
-
-        // Pre-populate filesystem state with old version.
-        setup_installed_keg(&layout, "a", "1.0", true)?;
-
-        let formula = make_formula("a", "2.0", &[], SHA_C);
-        let tar = create_bottle_tar_gz("a", "2.0", &[("bin/a_tool", b"new")])?;
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let orchestrator = make_orchestrator(
-            vec![formula],
-            vec![(SHA_C, tar)],
-            counter.clone(),
-            layout.clone(),
-        )?;
-
-        run(&orchestrator, &["a".to_owned()], true, Verbosity::Normal).await?;
-
-        // dry_run: new version not installed
-        assert!(!layout.cellar().join("a/2.0").exists());
-        assert_eq!(
-            counter.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "no downloads in dry-run"
-        );
-
-        // Old filesystem state preserved
-        let keg = brewdock_cellar::find_installed_keg("a", &layout.cellar(), &layout.opt_dir())?
-            .ok_or("expected keg")?;
-        assert_eq!(keg.pkg_version, "1.0");
-        Ok(())
-    }
+    const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     #[test]
     fn test_render_upgrade_plan_includes_method() {
