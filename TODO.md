@@ -24,6 +24,11 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Class: `risk-bearing`
   - Resolution: `decision`
   - Status: `resolved`
+- Question: Tier 2 (install 時 DSL 解釈) のランタイム評価器をどの crate に置くか — `brewdock-analysis` の拡張 / 新 crate / `brewdock-cellar` の拡張
+  - Class: `risk-bearing`
+  - Resolution: `decision`
+  - Status: `resolved`
+  - Notes: (a) `Program` 型に symbolic variant (`PathBase::FormulaName`, `PathBase::VersionMajorMinor` 等) を追加し、`brewdock-cellar` が install 時に `RuntimeContext` で解決する。analysis の "Pure analysis with no I/O" 制約は維持。symbolic variant は pure なデータ表現であり I/O を伴わない。プロセス実行 (`Utils.safe_popen_read`) やファイルシステムウォーク (`Pathname#find`) が必要になり `Statement` が deferred computation (変数束縛 + 後続参照) を表現し始めた段階で `brewdock-eval` crate を切り出す。ADR 0004 参照
 
 ## Theme Backlog
 

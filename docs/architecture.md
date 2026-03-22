@@ -98,7 +98,7 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 
 ## Open Questions
 
-None blocking. Decision records: [ADR 0001](adr/0001-nanobrew-install-method.md), [ADR 0002](adr/0002-user-facing-progress-output.md), [ADR 0003](adr/0003-copy-strategy-next-step.md).
+None blocking. Decision records: [ADR 0001](adr/0001-nanobrew-install-method.md), [ADR 0002](adr/0002-user-facing-progress-output.md), [ADR 0003](adr/0003-copy-strategy-next-step.md), [ADR 0004](adr/0004-three-tier-post-install-strategy.md).
 
 ## Revisit Trigger
 
