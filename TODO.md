@@ -424,6 +424,51 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: copy strategy と relocation targeting を別 spike にすると store mutation risk と wall-clock benefit の比較軸がずれる
   - Escalate if: `clonefile` 系の候補が macOS VM 上で一貫して使えず、copy cost 改善に別の長距離 architectural bet が必要になる場合
 
+- [ ] Theme: Static post_install support for gunzip-install formula pattern
+  - Outcome: buildapp, fedify, pgloader の `post_install` が静的解析で ok になり、`bd install` で `post_install` が実行される
+  - Goal: `bin.install` (ファイルコピー) と `chmod` (パーミッション変更) を `Statement` variant + cellar 実行に追加
+  - Must Not Break: 既存の `post_install` 解析・実行パスを壊さない; `task check` green
+  - Non-goals: install-time DSL 解釈; Tier 2 アーキテクチャ; bazel family (File.exist? + suffix interpolation が別途必要)
+  - Acceptance (EARS):
+    - When a formula contains `bin.install prefix/"name"`, the system shall lower it to an Install statement and execute as file copy
+    - When a formula contains `(path).chmod 0755`, the system shall lower it to a Chmod statement and execute as permission change
+    - When `bd-analyze --local buildapp fedify pgloader` is executed, all three shall report verdict `ok`
+  - Evidence: `run=cargo test -p brewdock-analysis && cargo test -p brewdock-cellar && cargo run -p brewdock-analyze -- --local buildapp fedify pgloader; oracle=analysis tests cover install+chmod lowering, cellar tests cover execution, bd-analyze reports ok for all three; visibility=independent; controls=[context]; missing=[]; companion=none`
+  - Gates: `static`, `integration`
+  - Executable doc: `cargo test -p brewdock-analysis -- test_install_statement`; `cargo test -p brewdock-cellar -- test_install_execution`; `cargo run -p brewdock-analyze -- --local buildapp fedify pgloader`
+  - Why not split vertically further?: 3 formula が同一パターン (if exist? → gunzip → install → chmod) を共有し、install と chmod は同じ formula 内で組で出現する
+  - Escalate if: Homebrew の `install` メソッドが単純なファイルコピー以上のセマンティクス (strip, mode preservation) を持つ場合
+
+- [ ] Theme: Install-time DSL evaluation foundation with attribute injection
+  - Outcome: `bd install` 時にランタイムコンテキスト (formula name, version, OS info, arch) を注入して DSL を評価するパスが動作し、静的解析のみでは解決できなかった formula の `post_install` が実行可能になる
+  - Goal: Tier 2 評価パスの確立 — ランタイムコンテキスト構造体、属性注入、`bd install` からの Tier 1→Tier 2 fallback 分岐。ADR 0004 の Tier 2 アーキテクチャを実装する
+  - Must Not Break: Tier 1 (静的解析) パスの正確性; `bd-analyze` のオフライン動作; `task check` green
+  - Non-goals: プロセス実行 (`Utils.safe_popen_read`); ファイルシステムウォーク (`Pathname#find`); イテレータ (`each`, `map`); Tier 3 (Ruby 実行)
+  - Acceptance (EARS):
+    - When `bd install` encounters a formula whose static analysis fails, the system shall attempt Tier 2 evaluation with runtime context before giving up
+    - When a formula helper uses `name` (formula attribute), the system shall inject the actual formula name at install time
+    - When a formula helper uses `version.major_minor`, the system shall derive it from the formula version metadata
+  - Evidence: `run=task check; oracle=integration tests cover Tier 1→Tier 2 fallback, attribute injection for name and version.major_minor; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=cargo run -p brewdock-analyze -- --local <target-formula>`
+  - Gates: `static`, `integration`
+  - Executable doc: `cargo test -p brewdock-analysis -- test_tier2`; `cargo test -p brewdock-core -- test_tier2_fallback`
+  - Why not split vertically further?: ランタイムコンテキスト構造体、注入メカニズム、fallback 分岐は単一の architectural wiring であり、属性注入なしに foundation だけ入れても observable な前進がない
+  - Escalate if: Open Question「Tier 2 評価器の crate 配置」が解決しない場合; `brewdock-analysis` の pure 制約との整合が取れない場合
+
+- [ ] Theme: Install-time DSL process execution and filesystem operations
+  - Outcome: `Utils.safe_popen_read` (プロセス実行) と `Pathname#find` / `relative_path_from` (ファイルシステム操作) が Tier 2 DSL 評価で動作し、llvm, php, postgresql 等の formula が `bd install` で `post_install` 実行可能になる
+  - Goal: Tier 2 に process execution (`std::process::Command`) と filesystem primitives (`walkdir`, `Path::strip_prefix`) を追加
+  - Must Not Break: Tier 1 パスの正確性; Tier 2 foundation の既存動作; `task check` green
+  - Non-goals: Tier 3 (Ruby 実行); 任意の Ruby ブロック評価; third-party tap 対応
+  - Acceptance (EARS):
+    - When a formula contains `Utils.safe_popen_read(path, args)`, the system shall execute the process at install time and capture stdout
+    - When a formula contains `path.find do |entry| ... end`, the system shall walk the filesystem and evaluate the block body with DSL primitives
+    - When representative formulas (llvm, postgresql@17) are installed, their post_install shall complete without falling back to Tier 3
+  - Evidence: `run=task check && ./tests/vm-smoke-test.sh --formula postgresql@17; oracle=integration tests cover safe_popen_read and filesystem walk, VM smoke test proves postgresql@17 post_install succeeds; visibility=implementation-visible; controls=[agent,context]; missing=[]; companion=./tests/vm-smoke-test.sh --formula llvm`
+  - Gates: `static`, `integration`, `system`
+  - Executable doc: `cargo test -p brewdock-core -- test_tier2_process`; `cargo test -p brewdock-core -- test_tier2_filesystem`; `./tests/vm-smoke-test.sh --formula postgresql@17`
+  - Why not split vertically further?: process execution と filesystem operation は postgresql family (7 formula) で組で必要。process だけ / filesystem だけでは observable な formula unlock がない
+  - Escalate if: `Utils.safe_popen_read` 対象のバイナリが keg 内で実行不可能な場合 (rpath 未解決等); ブロック本体が DSL プリミティブの組み合わせを超える場合
+
 - [x] Theme: Production manifest-targeted relocation and spike removal
   - Outcome: bottle install の materialize/relocate は extracted payload から導いた manifest を使って full-tree placeholder scan を避け、spike-only harness は production path に吸収されて削除される
   - Goal: manifest-targeted relocation を本実装に入れ、representative bottle install の `materialize-payload` wall を下げつつ spike artifact を不要にする
