@@ -27,18 +27,21 @@ Rust CLI (`bd`) that acts as a performance-oriented, Homebrew-coexisting client 
 
 ## Core Boundaries
 
-6-crate workspace:
+8-crate workspace (6 library + 2 binary):
 
 ```
-cli → core → {formula, bottle, cellar → sys}
+cli → core → {formula, bottle, cellar → {analysis, sys}}
+analyze → {formula, analysis}
 ```
 
 - `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve, metadata cache and index. No core dependency.
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
 - `brewdock-sys`: platform-specific FFI wrappers (macOS `clonefile(2)`). No other crate dependency. Only crate where `unsafe` is allowed.
-- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, Prism-backed `post_install` parse/lowering/schema-normalization primitives. Depends on formula (types only) and sys (macOS only).
+- `brewdock-analysis`: Prism-backed `post_install` parse, AST lowering, schema normalization, and validation. Pure analysis with no filesystem I/O. No core or cellar dependency.
+- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, `post_install` execution with rollback. Depends on analysis, formula (types only), and sys (macOS only).
 - `brewdock-core`: Layout, platform (`HostTag` auto-detection), lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, diagnostics, and user-facing progress event emission. Depends on formula, bottle, cellar.
-- `brewdock-cli`: clap commands (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`), tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only.
+- `brewdock-cli`: clap commands (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`), tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only. Binary name: `bd`.
+- `brewdock-analyze`: standalone formula compatibility analysis tool. Depends on formula and analysis only — no core, cellar, or sys dependency. Binary name: `bd-analyze`.
 
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
 Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
@@ -89,7 +92,7 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 | API abstraction | Generic trait (not trait object) | Static dispatch; mock in tests via generic parameter |
 | Logging | explicit progress events for user-facing output; `tracing` + `tracing-subscriber` for diagnostics and benchmark capture | Keeps terminal UX stable while preserving structured benchmark data and developer diagnostics |
 | Bottle selection | Compatible tag fallback (`arm64_sequoia -> arm64_sonoma -> arm64_ventura -> all`) | Matches target Homebrew usage without requiring exact host tag parity |
-| `post_install` execution | Parse full `homebrew/core` Ruby source with `ruby-prism`, lower only allowlisted AST shapes into internal operations, then normalize reachable filesystem effects into fixed schemas before execution | Removes Ruby runtime dependency while replacing formula-specific builtins with fail-closed generic lowering and normalization |
+| `post_install` execution | Parse full `homebrew/core` Ruby source with `ruby-prism` in `brewdock-analysis`, lower only allowlisted AST shapes into internal operations, then normalize reachable filesystem effects into fixed schemas before execution in `brewdock-cellar` | Removes Ruby runtime dependency while replacing formula-specific builtins with fail-closed generic lowering and normalization; analysis/execution split enables standalone compatibility scanning |
 | Source fallback | Generic build driver (`cmake`/`configure`/`meson`/`make`) | Enables a small first source path without full Formula DSL compatibility |
 | Ruby compatibility escape hatch | Not on the default path; if introduced later, keep it opt-in and clearly marked | Avoids collapsing the native fail-closed model into an implicit Ruby execution client |
 
