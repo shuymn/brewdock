@@ -124,7 +124,7 @@ flowchart LR
 - Parse `post_install` from full formula source and allow helper methods to participate only as static lowering material.
 - The parser accepts representational variance such as receiverless space-call / paren-call, zero-arg helper calls, receiver-based path helper calls, `if OS.mac?`, `if path.exist?`, `rm(..., force: true)`, `rm(...) if ...exist?`, `install_symlink`, and `Formula["..."].pkgetc`.
 - The evaluator never executes AST directly. It executes only lowered internal operations.
-- The initial internal operation set is fixed to `Mkpath`, `CopyFile`, `RunSystemArgv`, `RemoveIfExists`, `InstallSymlink`, `IfPathExists`, `MacOsBranch`, `CallHelper`, `ResolveFormulaPkgetc`, `RecursiveCopy`, `ForceSymlink`, `WriteFile`, `GlobRemove`, and `GlobSymlink`.
+- The lowered internal operation set includes `Mkpath`, `Copy`, `System`, `RemoveIfExists`, `InstallSymlink`, `IfPath`, `IfEnv`, `SetEnv`, `RecursiveCopy`, `CopyChildren`, `ForceSymlink`, `WriteFile`, `GlobRemove`, `GlobSymlink`, `Install`, `Chmod`, `MirrorTree`, `ChildrenSymlink`, and `ProcessCapture`.
 - macOS runtime semantics are fixed: `if OS.mac?` executes only the `then` branch; the `else` branch is parsed but is not a runtime path.
 - Path traversal segments and filesystem effects outside the allowed keg / Homebrew-prefix roots are unsupported and fail closed before mutation.
 - Unsupported nodes that remain in a reachable macOS runtime branch fail closed.

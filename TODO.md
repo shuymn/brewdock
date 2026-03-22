@@ -454,7 +454,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: ランタイムコンテキスト構造体、注入メカニズム、fallback 分岐は単一の architectural wiring であり、属性注入なしに foundation だけ入れても observable な前進がない
   - Escalate if: Open Question「Tier 2 評価器の crate 配置」が解決しない場合; `brewdock-analysis` の pure 制約との整合が取れない場合
 
-- [ ] Theme: Install-time DSL process execution and filesystem operations
+- [x] Theme: Install-time DSL process execution and filesystem operations
   - Outcome: `Utils.safe_popen_read` (プロセス実行) と `Pathname#find` / `relative_path_from` (ファイルシステム操作) が Tier 2 DSL 評価で動作し、llvm, php, postgresql 等の formula が `bd install` で `post_install` 実行可能になる
   - Goal: Tier 2 に process execution (`std::process::Command`) と filesystem primitives (`walkdir`, `Path::strip_prefix`) を追加
   - Must Not Break: Tier 1 パスの正確性; Tier 2 foundation の既存動作; `task check` green
