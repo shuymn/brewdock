@@ -17,8 +17,8 @@ pub use error::CellarError;
 pub use link::{link, unlink};
 pub use materialize::{atomic_symlink_replace, materialize};
 pub use post_install::{
-    PostInstallContext, PostInstallTransaction, extract_post_install_block, run_post_install,
-    validate_post_install,
+    PostInstallContext, PostInstallTransaction, extract_post_install_block, lower_post_install,
+    run_post_install, validate_post_install,
 };
 pub use receipt::{
     InstallReason, InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,

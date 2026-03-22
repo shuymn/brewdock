@@ -1123,7 +1123,8 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     /// or contains unsupported syntax.
     async fn check_post_install_viability(&self, formula: &Formula) -> Result<(), BrewdockError> {
         if let Some(source) = self.fetch_post_install_source(formula).await? {
-            validate_post_install(&source, &formula.versions.stable)?;
+            validate_post_install(&source, &formula.versions.stable)
+                .map_err(brewdock_cellar::CellarError::from)?;
         }
         Ok(())
     }
@@ -2390,7 +2391,7 @@ end
         assert!(matches!(
             result,
             Err(BrewdockError::Cellar(
-                brewdock_cellar::CellarError::UnsupportedPostInstallSyntax { .. }
+                brewdock_cellar::CellarError::Analysis(_)
             ))
         ));
         assert!(!layout.cellar().join("demo/1.0").exists());

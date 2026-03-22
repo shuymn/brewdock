@@ -1,0 +1,17 @@
+[package]
+name = "brewdock-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Static analysis of Homebrew formula post_install blocks for brewdock"
+
+[dependencies]
+thiserror.workspace = true
+ruby-prism = "1.9.0"
+
+[lints]
+workspace = true

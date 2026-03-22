@@ -37,6 +37,10 @@ pub enum CellarError {
     Json(#[from] serde_json::Error),
 
     /// A `post_install` block could not be parsed or contains unsupported syntax.
+    #[error(transparent)]
+    Analysis(#[from] brewdock_analysis::AnalysisError),
+
+    /// A `post_install` execution-time path validation failed.
     #[error("unsupported post_install syntax: {message}")]
     UnsupportedPostInstallSyntax {
         /// Human-readable parser failure detail.

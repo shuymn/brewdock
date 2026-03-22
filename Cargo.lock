@@ -185,6 +185,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "brewdock-analysis"
+version = "0.1.0"
+dependencies = [
+ "ruby-prism",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "brewdock-analyze"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brewdock-analysis",
+ "brewdock-formula",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "brewdock-bottle"
 version = "0.1.0"
 dependencies = [
@@ -204,9 +225,9 @@ dependencies = [
 name = "brewdock-cellar"
 version = "0.1.0"
 dependencies = [
+ "brewdock-analysis",
  "brewdock-sys",
  "rayon",
- "ruby-prism",
  "rusqlite",
  "serde",
  "serde_json",
