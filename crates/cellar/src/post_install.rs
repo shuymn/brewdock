@@ -24,6 +24,13 @@ pub struct PostInstallContext {
     formula_version: String,
     prefix: PathBuf,
     keg_path: PathBuf,
+    kernel_version_major: String,
+    macos_version: String,
+    cpu_arch: String,
+    /// Environment variables set during `post_install` and applied to spawned commands.
+    env_overrides: std::collections::BTreeMap<String, String>,
+    /// Captured process outputs (from [`Statement::ProcessCapture`]).
+    captured_outputs: std::collections::BTreeMap<String, String>,
 }
 
 /// Rollback handle for a completed `post_install` execution.
@@ -33,15 +40,36 @@ pub struct PostInstallTransaction {
     rollback_dir: PathBuf,
 }
 
+/// Runtime platform information for Tier 2 DSL evaluation.
+#[derive(Debug, Clone)]
+pub struct PlatformContext {
+    /// OS kernel version major (e.g. `"24"` on macOS Sequoia).
+    pub kernel_version_major: String,
+    /// macOS version string (e.g. `"15.1"`).
+    pub macos_version: String,
+    /// CPU architecture (e.g. `"arm64"`).
+    pub cpu_arch: String,
+}
+
 impl PostInstallContext {
     /// Creates a new context for a materialized keg.
     #[must_use]
-    pub fn new(prefix: &Path, keg_path: &Path, formula_version: &str) -> Self {
+    pub fn new(
+        prefix: &Path,
+        keg_path: &Path,
+        formula_version: &str,
+        platform: &PlatformContext,
+    ) -> Self {
         Self {
             formula_name: formula_name_from_keg(keg_path),
             formula_version: formula_version.to_owned(),
             prefix: prefix.to_path_buf(),
             keg_path: keg_path.to_path_buf(),
+            kernel_version_major: platform.kernel_version_major.clone(),
+            macos_version: platform.macos_version.clone(),
+            cpu_arch: platform.cpu_arch.clone(),
+            env_overrides: std::collections::BTreeMap::new(),
+            captured_outputs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -75,15 +103,24 @@ impl PostInstallContext {
             PathSegment::Interpolated(parts) => {
                 let mut result = String::new();
                 for part in parts {
-                    match part {
-                        SegmentPart::Literal(s) => result.push_str(s),
-                        SegmentPart::FormulaName => result.push_str(&self.formula_name),
-                        SegmentPart::VersionMajorMinor => {
-                            result.push_str(&major_minor_version(&self.formula_version));
-                        }
-                    }
+                    result.push_str(&self.resolve_segment_part(part));
                 }
                 result
+            }
+        }
+    }
+
+    fn resolve_segment_part(&self, part: &SegmentPart) -> String {
+        match part {
+            SegmentPart::Literal(s) => s.clone(),
+            SegmentPart::FormulaName => self.formula_name.clone(),
+            SegmentPart::VersionMajorMinor => major_minor_version(&self.formula_version),
+            SegmentPart::VersionMajor => major_version(&self.formula_version),
+            SegmentPart::KernelVersionMajor => self.kernel_version_major.clone(),
+            SegmentPart::MacOSVersion => self.macos_version.clone(),
+            SegmentPart::CpuArch => self.cpu_arch.clone(),
+            SegmentPart::CapturedOutput(name) => {
+                self.captured_outputs.get(name).cloned().unwrap_or_default()
             }
         }
     }
@@ -114,6 +151,11 @@ fn major_minor_version(version: &str) -> String {
     }
 }
 
+/// Extracts the major component from a version string like `"17.2"` → `"17"`.
+fn major_version(version: &str) -> String {
+    version.split('.').next().unwrap_or(version).to_owned()
+}
+
 fn formula_name_from_keg(keg_path: &Path) -> String {
     keg_path
         .parent()
@@ -129,14 +171,14 @@ fn formula_name_from_keg(keg_path: &Path) -> String {
 /// unsuccessfully.
 pub fn run_post_install(
     source: &str,
-    context: &PostInstallContext,
+    context: &mut PostInstallContext,
 ) -> Result<PostInstallTransaction, CellarError> {
     // Tier 1 → Tier 2 fallback: try static analysis first, then attribute injection.
     let program = lower_post_install(source, &context.formula_version)
         .or_else(|_| lower_post_install_tier2(source, &context.formula_version))?;
     let rollback_roots = collect_rollback_roots(&program, context);
-    run_with_rollback(&rollback_roots, || {
-        execute_statements(&program.statements, context)
+    run_with_rollback(&rollback_roots, context, |ctx| {
+        execute_statements(&program.statements, ctx)
     })
 }
 
@@ -217,8 +259,25 @@ fn collect_statement_roots(
                     }
                 }
             }
-            Statement::IfPath { then_branch, .. } => {
+            Statement::IfPath { then_branch, .. } | Statement::IfEnv { then_branch, .. } => {
                 collect_statement_roots(then_branch, context, roots);
+            }
+            Statement::MirrorTree { dest, .. } => {
+                if let Ok(path) = context.resolve_allowed_path(dest)
+                    && let Some(root) = rollback_root(&path, context)
+                {
+                    roots.insert(root);
+                }
+            }
+            Statement::ChildrenSymlink { link_dir, .. } => {
+                if let Ok(path) = context.resolve_allowed_path(link_dir)
+                    && let Some(root) = rollback_root(&path, context)
+                {
+                    roots.insert(root);
+                }
+            }
+            Statement::ProcessCapture { .. } | Statement::SetEnv { .. } => {
+                // No filesystem mutation — nothing to rollback.
             }
         }
     }
@@ -260,10 +319,11 @@ fn collapse_nested_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn run_with_rollback<F>(
     rollback_roots: &[PathBuf],
+    context: &mut PostInstallContext,
     run: F,
 ) -> Result<PostInstallTransaction, CellarError>
 where
-    F: FnOnce() -> Result<(), CellarError>,
+    F: FnOnce(&mut PostInstallContext) -> Result<(), CellarError>,
 {
     let rollback_dir = make_rollback_dir()?;
     let backups = rollback_roots
@@ -280,7 +340,7 @@ where
         })
         .collect::<Result<Vec<_>, CellarError>>()?;
 
-    match run() {
+    match run(context) {
         Ok(()) => Ok(PostInstallTransaction {
             backups,
             rollback_dir,
@@ -381,6 +441,7 @@ fn path_condition_matches(
     let path = context.resolve_allowed_path(condition)?;
     Ok(match kind {
         PathCondition::Exists => path.exists(),
+        PathCondition::Missing => !path.exists(),
         PathCondition::Symlink => path.is_symlink(),
         PathCondition::ExistsAndNotSymlink => path.exists() && !path.is_symlink(),
     })
@@ -399,7 +460,7 @@ fn path_is_allowed(path: &Path, context: &PostInstallContext) -> bool {
 
 fn execute_statements(
     statements: &[Statement],
-    context: &PostInstallContext,
+    context: &mut PostInstallContext,
 ) -> Result<(), CellarError> {
     for statement in statements {
         match statement {
@@ -537,9 +598,173 @@ fn execute_statements(
                 let permissions = std::fs::Permissions::from_mode(*mode);
                 std::fs::set_permissions(file_path, permissions)?;
             }
+            Statement::MirrorTree {
+                source,
+                dest,
+                prune_names,
+            } => {
+                execute_mirror_tree(
+                    &context.resolve_allowed_path(source)?,
+                    &context.resolve_allowed_path(dest)?,
+                    prune_names,
+                )?;
+            }
+            Statement::ChildrenSymlink {
+                source_dir,
+                link_dir,
+                suffix,
+            } => {
+                let source_path = context.resolve_allowed_path(source_dir)?;
+                let link_path = context.resolve_allowed_path(link_dir)?;
+                std::fs::create_dir_all(&link_path)?;
+                if source_path.is_dir() {
+                    for entry in std::fs::read_dir(&source_path)? {
+                        let entry = entry?;
+                        let basename = entry.file_name();
+                        let basename_str = basename.to_string_lossy();
+                        let mut link_name = basename_str.to_string();
+                        for part in suffix {
+                            link_name.push_str(&context.resolve_segment_part(part));
+                        }
+                        let link = link_path.join(&link_name);
+                        remove_path_if_exists(&link)?;
+                        let rel = relative_from_to(&link_path, &entry.path());
+                        std::os::unix::fs::symlink(rel, &link)?;
+                    }
+                }
+            }
+            Statement::IfEnv {
+                variable,
+                negate,
+                then_branch,
+            } => {
+                let is_set = std::env::var(variable).is_ok_and(|v| !v.is_empty());
+                let should_execute = if *negate { !is_set } else { is_set };
+                if should_execute {
+                    execute_statements(then_branch, context)?;
+                }
+            }
+            Statement::SetEnv { variable, value } => {
+                let resolved = resolve_content(value, context);
+                context.env_overrides.insert(variable.clone(), resolved);
+            }
+            Statement::ProcessCapture { variable, command } => {
+                let output = run_process_capture(command, context)?;
+                context.captured_outputs.insert(variable.clone(), output);
+            }
         }
     }
     Ok(())
+}
+
+/// Mirrors a source directory tree into a destination directory using symlinks.
+///
+/// This implements the Homebrew `Pathname#find` + `relative_path_from` + `install_symlink`
+/// pattern used by postgresql and similar formulas to create versioned include/lib/share trees.
+fn execute_mirror_tree(
+    source: &Path,
+    dest: &Path,
+    prune_names: &[String],
+) -> Result<(), CellarError> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+    mirror_tree_walk(source, source, dest, prune_names)
+}
+
+fn mirror_tree_walk(
+    root: &Path,
+    current: &Path,
+    dest_root: &Path,
+    prune_names: &[String],
+) -> Result<(), CellarError> {
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Prune matching names
+        if prune_names.iter().any(|p| p == name_str.as_ref()) {
+            continue;
+        }
+
+        let src = entry.path();
+        let relative = src
+            .strip_prefix(root)
+            .map_err(|err| CellarError::Io(std::io::Error::other(err)))?;
+        let dst = dest_root.join(relative);
+
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() && !entry.file_type()?.is_symlink() {
+            // Retain existing real directories at destination
+            if !dst.is_dir() || dst.is_symlink() {
+                // Remove conflicting entry and create directory
+                remove_path_if_exists(&dst)?;
+                std::fs::create_dir_all(&dst)?;
+            }
+            mirror_tree_walk(root, &src, dest_root, prune_names)?;
+        } else {
+            // File or symlink: create a symlink in dest
+            remove_path_if_exists(&dst)?;
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+                let rel_target = relative_from_to(parent, &src);
+                std::os::unix::fs::symlink(rel_target, &dst)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves DSL arguments into OS strings and splits into program + args.
+///
+/// Returns `(program, args)` where `program` is the first argument.
+fn resolve_command_line(
+    arguments: &[Argument],
+    context: &PostInstallContext,
+    caller: &str,
+) -> Result<(OsString, Vec<OsString>), CellarError> {
+    let mut command_line = arguments
+        .iter()
+        .map(|arg| match arg {
+            Argument::Path(path) => Ok(context.resolve_allowed_path(path)?.into_os_string()),
+            Argument::String(value) => Ok(OsString::from(value)),
+        })
+        .collect::<Result<Vec<_>, CellarError>>()?;
+
+    if command_line.is_empty() {
+        return Err(CellarError::UnsupportedPostInstallSyntax {
+            message: format!("{caller} expects at least one argument"),
+        });
+    }
+
+    let program = command_line.remove(0);
+    Ok((program, command_line))
+}
+
+/// Builds a [`CellarError::PostInstallCommandFailed`] from process output.
+fn command_failed_error(output: &std::process::Output) -> CellarError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    CellarError::PostInstallCommandFailed {
+        message: if stderr.trim().is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr.trim().to_owned()
+        },
+    }
+}
+
+fn run_process_capture(
+    command: &[Argument],
+    context: &PostInstallContext,
+) -> Result<String, CellarError> {
+    let output = command_output(command, context, "process capture")?;
+    if !output.status.success() {
+        return Err(command_failed_error(&output));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(stdout)
 }
 
 fn install_symlink_path(link_dir: &Path, target: &Path) -> Result<PathBuf, CellarError> {
@@ -552,20 +777,8 @@ fn install_symlink_path(link_dir: &Path, target: &Path) -> Result<PathBuf, Cella
 }
 
 fn run_system(arguments: &[Argument], context: &PostInstallContext) -> Result<(), CellarError> {
-    let command_line = arguments
-        .iter()
-        .map(|arg| match arg {
-            Argument::Path(path) => Ok(context.resolve_allowed_path(path)?.into_os_string()),
-            Argument::String(value) => Ok(OsString::from(value)),
-        })
-        .collect::<Result<Vec<_>, CellarError>>()?;
+    let (program, program_args) = resolve_command_line(arguments, context, "system")?;
 
-    let (program, program_args) =
-        command_line
-            .split_first()
-            .ok_or_else(|| CellarError::UnsupportedPostInstallSyntax {
-                message: "system expects at least one argument".to_owned(),
-            })?;
     let span = tracing::info_span!(
         "bd.child_process",
         program = %program.to_string_lossy(),
@@ -576,19 +789,28 @@ fn run_system(arguments: &[Argument], context: &PostInstallContext) -> Result<()
             .join(" "),
     );
     let _entered = span.enter();
-    let output = Command::new(program).args(program_args).output()?;
+    let output = Command::new(&program)
+        .args(&program_args)
+        .envs(&context.env_overrides)
+        .output()?;
     if output.status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(CellarError::PostInstallCommandFailed {
-        message: if stderr.trim().is_empty() {
-            format!("exit status {}", output.status)
-        } else {
-            stderr.trim().to_owned()
-        },
-    })
+    Err(command_failed_error(&output))
+}
+
+fn command_output(
+    arguments: &[Argument],
+    context: &PostInstallContext,
+    caller: &str,
+) -> Result<std::process::Output, CellarError> {
+    let (program, program_args) = resolve_command_line(arguments, context, caller)?;
+    Command::new(&program)
+        .args(&program_args)
+        .envs(&context.env_overrides)
+        .output()
+        .map_err(CellarError::from)
 }
 
 fn glob_matches(name: &str, pattern: &str) -> bool {
@@ -612,6 +834,9 @@ fn resolve_content(parts: &[ContentPart], context: &PostInstallContext) -> Strin
             ContentPart::HomebrewPrefix => {
                 result.push_str(&context.prefix.to_string_lossy());
             }
+            ContentPart::Runtime(segment_part) => {
+                result.push_str(&context.resolve_segment_part(segment_part));
+            }
         }
     }
     result
@@ -620,6 +845,18 @@ fn resolve_content(parts: &[ContentPart], context: &PostInstallContext) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_platform() -> PlatformContext {
+        PlatformContext {
+            kernel_version_major: "24".to_owned(),
+            macos_version: "15.1".to_owned(),
+            cpu_arch: "arm64".to_owned(),
+        }
+    }
+
+    fn test_context(prefix: &Path, keg: &Path, version: &str) -> PostInstallContext {
+        PostInstallContext::new(prefix, keg, version, &test_platform())
+    }
 
     fn write_executable(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(path, contents)?;
@@ -706,7 +943,7 @@ class Demo < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.0"))?.commit()?;
 
         assert_eq!(
             std::fs::read_to_string(prefix.join("var/demo/copied.txt"))?,
@@ -726,7 +963,7 @@ end
         let keg = prefix.join("Cellar/demo/1.0");
         std::fs::create_dir_all(&keg)?;
 
-        let result = run_post_install("", &PostInstallContext::new(&prefix, &keg, "1.0"));
+        let result = run_post_install("", &mut test_context(&prefix, &keg, "1.0"));
         assert!(matches!(result, Err(CellarError::Analysis(_))));
         Ok(())
     }
@@ -746,7 +983,7 @@ class Demo < Formula
 end
 "#;
 
-        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        let result = run_post_install(source, &mut test_context(&prefix, &keg, "1.0"));
         assert!(matches!(result, Err(CellarError::Analysis(_))));
         Ok(())
     }
@@ -784,7 +1021,7 @@ class CaCertificates < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.0"))?.commit()?;
 
         assert_eq!(
             std::fs::read_to_string(prefix.join("etc/ca-certificates/cert.pem"))?,
@@ -826,7 +1063,7 @@ class CaCertificates < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.0"))?.commit()?;
 
         assert_eq!(
             std::fs::read_to_string(prefix.join("etc/ca-certificates/cert.pem"))?,
@@ -857,7 +1094,7 @@ class OpensslAT3 < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.0"))?.commit()?;
 
         let cert_link = prefix.join("etc/openssl@3/cert.pem");
         assert!(cert_link.is_symlink());
@@ -887,7 +1124,7 @@ class OpensslAT3 < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.0"))?.commit()?;
 
         let cert_link = prefix.join("etc/openssl@3/cert.pem");
         assert!(cert_link.is_symlink());
@@ -914,7 +1151,7 @@ class Demo < Formula
 end
 "#;
 
-        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        let result = run_post_install(source, &mut test_context(&prefix, &keg, "1.0"));
 
         assert!(matches!(
             result,
@@ -942,7 +1179,7 @@ class Demo < Formula
 end
 "#;
 
-        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        let result = run_post_install(source, &mut test_context(&prefix, &keg, "1.0"));
         assert!(
             result.is_err(),
             "path traversal in post_install should fail closed before mutating outside the prefix"
@@ -973,7 +1210,7 @@ end
         let escaped = std::env::temp_dir().join("brewdock-owned");
         let _ = std::fs::remove_dir_all(&escaped);
 
-        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        let result = run_post_install(source, &mut test_context(&prefix, &keg, "1.0"));
 
         assert!(
             result.is_err(),
@@ -1003,7 +1240,7 @@ class Demo < Formula
 end
 "#;
 
-        let result = run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"));
+        let result = run_post_install(source, &mut test_context(&prefix, &keg, "1.0"));
         assert!(result.is_err(), "atomic_write traversal should fail closed");
         assert!(
             !escape.exists(),
@@ -1049,8 +1286,8 @@ class Ruby < Formula
 end
 "##;
 
-        let context = PostInstallContext::new(&prefix, &keg, "3.4.2");
-        run_post_install(source, &context)?.commit()?;
+        let mut context = test_context(&prefix, &keg, "3.4.2");
+        run_post_install(source, &mut context)?.commit()?;
 
         assert!(!gems_dir.join("bin/bundle").exists());
         assert!(!gems_dir.join("bin/bundler").exists());
@@ -1113,8 +1350,8 @@ class Node < Formula
 end
 "#;
 
-        let context = PostInstallContext::new(&prefix, &keg, "22.0.0");
-        run_post_install(source, &context)?.commit()?;
+        let mut context = test_context(&prefix, &keg, "22.0.0");
+        run_post_install(source, &mut context)?.commit()?;
 
         assert!(
             prefix.join("lib/node_modules/npm/bin/npm-cli.js").exists(),
@@ -1233,7 +1470,7 @@ class Fontconfig < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "2.16.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "2.16.0"))?.commit()?;
         Ok(())
     }
 
@@ -1253,7 +1490,7 @@ class Glib < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "2.88.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "2.88.0"))?.commit()?;
         assert!(prefix.join("lib/gio/modules").is_dir());
         Ok(())
     }
@@ -1288,7 +1525,7 @@ end
 
         run_post_install(
             shared_mime_info_post_install_source(),
-            &PostInstallContext::new(&prefix, &keg, "2.4"),
+            &mut test_context(&prefix, &keg, "2.4"),
         )?
         .commit()?;
 
@@ -1335,7 +1572,7 @@ class Libheif < Formula
 end
 "##;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.0"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.0"))?.commit()?;
         assert!(prefix.join("share/mime/mime.cache").exists());
         Ok(())
     }
@@ -1358,7 +1595,7 @@ class Buildapp < Formula
 end
 "#;
 
-        run_post_install(source, &PostInstallContext::new(&prefix, &keg, "1.5.6"))?.commit()?;
+        run_post_install(source, &mut test_context(&prefix, &keg, "1.5.6"))?.commit()?;
 
         // bin.install moves file into bin/
         let installed = keg.join("bin/buildapp");
@@ -1372,6 +1609,197 @@ end
         // chmod 0755 sets executable permissions
         let perms = std::fs::metadata(&installed)?.permissions();
         assert_eq!(perms.mode() & 0o777, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn test_mirror_tree_creates_symlink_structure() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(keg.join("include/postgresql/server"))?;
+        std::fs::write(keg.join("include/postgresql/libpq-fe.h"), "header")?;
+        std::fs::write(
+            keg.join("include/postgresql/server/pg_config.h"),
+            "server header",
+        )?;
+        std::fs::create_dir_all(&prefix)?;
+
+        let dest_dir = prefix.join("include/demo");
+        let mut context = test_context(&prefix, &keg, "1.0");
+
+        // Manually execute MirrorTree
+        execute_statements(
+            &[Statement::MirrorTree {
+                source: PathExpr::new(PathBase::Prefix, &["include", "postgresql"]),
+                dest: PathExpr::new(PathBase::HomebrewPrefix, &["include", "demo"]),
+                prune_names: vec![".DS_Store".to_owned()],
+            }],
+            &mut context,
+        )?;
+
+        // Check that symlinks were created
+        assert!(dest_dir.join("libpq-fe.h").is_symlink());
+        assert!(dest_dir.join("server").is_dir());
+        assert!(dest_dir.join("server/pg_config.h").is_symlink());
+
+        // Verify symlink targets resolve correctly
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("libpq-fe.h"))?,
+            "header"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest_dir.join("server/pg_config.h"))?,
+            "server header"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_children_symlink_with_suffix() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/postgresql/17.2");
+        std::fs::create_dir_all(keg.join("bin"))?;
+        std::fs::write(keg.join("bin/psql"), "#!/bin/sh\n")?;
+        std::fs::write(keg.join("bin/pg_dump"), "#!/bin/sh\n")?;
+        let link_dir = prefix.join("bin");
+        std::fs::create_dir_all(&link_dir)?;
+
+        let mut context = test_context(&prefix, &keg, "17.2");
+
+        execute_statements(
+            &[Statement::ChildrenSymlink {
+                source_dir: PathExpr::new(PathBase::Bin, &[]),
+                link_dir: PathExpr::new(PathBase::HomebrewPrefix, &["bin"]),
+                suffix: vec![
+                    SegmentPart::Literal("-".to_owned()),
+                    SegmentPart::VersionMajor,
+                ],
+            }],
+            &mut context,
+        )?;
+
+        assert!(link_dir.join("psql-17").is_symlink());
+        assert!(link_dir.join("pg_dump-17").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(link_dir.join("psql-17"))?,
+            "#!/bin/sh\n"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_if_env_skips_when_unset() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+        std::fs::create_dir_all(&prefix)?;
+
+        let mut context = test_context(&prefix, &keg, "1.0");
+
+        // Use an env var we know is not set
+        execute_statements(
+            &[Statement::IfEnv {
+                variable: "BREWDOCK_DEFINITELY_NOT_SET_12345".to_owned(),
+                negate: false,
+                then_branch: vec![Statement::Mkpath(PathExpr::new(
+                    PathBase::Var,
+                    &["test-env"],
+                ))],
+            }],
+            &mut context,
+        )?;
+
+        // Branch should NOT have executed since the var is not set
+        assert!(!prefix.join("var/test-env").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_if_env_negate_executes_when_unset() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+        std::fs::create_dir_all(&prefix)?;
+
+        let mut context = test_context(&prefix, &keg, "1.0");
+
+        // negate=true with unset var → branch SHOULD execute
+        execute_statements(
+            &[Statement::IfEnv {
+                variable: "BREWDOCK_DEFINITELY_NOT_SET_12345".to_owned(),
+                negate: true,
+                then_branch: vec![Statement::Mkpath(PathExpr::new(
+                    PathBase::Var,
+                    &["test-neg"],
+                ))],
+            }],
+            &mut context,
+        )?;
+
+        assert!(prefix.join("var/test-neg").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_capture_stores_output() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+        std::fs::create_dir_all(&prefix)?;
+
+        let mut context = test_context(&prefix, &keg, "1.0");
+
+        execute_statements(
+            &[Statement::ProcessCapture {
+                variable: "output".to_owned(),
+                command: vec![
+                    Argument::String("echo".to_owned()),
+                    Argument::String("hello world".to_owned()),
+                ],
+            }],
+            &mut context,
+        )?;
+
+        assert_eq!(
+            context.captured_outputs.get("output"),
+            Some(&"hello world".to_owned())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_env_applies_to_spawned_command() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg = prefix.join("Cellar/demo/1.0");
+        std::fs::create_dir_all(&keg)?;
+        std::fs::create_dir_all(&prefix)?;
+
+        let mut context = test_context(&prefix, &keg, "1.0");
+
+        execute_statements(
+            &[
+                Statement::SetEnv {
+                    variable: "BREWDOCK_DEMO_ENV".to_owned(),
+                    value: vec![ContentPart::Literal("expected-value".to_owned())],
+                },
+                Statement::System(vec![
+                    Argument::String("sh".to_owned()),
+                    Argument::String("-c".to_owned()),
+                    Argument::String("[ \"$BREWDOCK_DEMO_ENV\" = \"expected-value\" ]".to_owned()),
+                ]),
+            ],
+            &mut context,
+        )?;
+
         Ok(())
     }
 }

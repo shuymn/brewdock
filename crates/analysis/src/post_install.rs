@@ -120,6 +120,61 @@ pub enum Statement {
         /// Unix permission mode (e.g. `0o755`).
         mode: u32,
     },
+    /// Mirror a source directory tree into a destination directory as symlinks.
+    ///
+    /// Walks the source tree recursively. For each entry:
+    /// - Files and symlinks in source become symlinks in dest (via `install_symlink`)
+    /// - Directories become real directories in dest (retaining existing real dirs)
+    /// - Existing conflicting entries at destination are removed first
+    /// - Entries matching `prune_names` are skipped entirely
+    MirrorTree {
+        /// Source directory to mirror.
+        source: PathExpr,
+        /// Destination directory for the mirror.
+        dest: PathExpr,
+        /// Basenames to skip (e.g. `".DS_Store"`).
+        prune_names: Vec<String>,
+    },
+    /// Create symlinks in `link_dir` for each child of `source_dir`, appending a
+    /// suffix to the link name.
+    ChildrenSymlink {
+        /// Directory whose children will be linked.
+        source_dir: PathExpr,
+        /// Directory that will contain the symlinks.
+        link_dir: PathExpr,
+        /// Suffix parts appended to each child's basename to form the link name.
+        suffix: Vec<SegmentPart>,
+    },
+    /// Conditional execution based on an environment variable.
+    ///
+    /// If the named variable is set (non-empty), the `then_branch` is executed.
+    /// If `negate` is true, executes when the variable is *not* set.
+    IfEnv {
+        /// Environment variable name.
+        variable: String,
+        /// Whether to negate the condition.
+        negate: bool,
+        /// Statements to execute when the condition holds.
+        then_branch: Vec<Self>,
+    },
+    /// Set an environment variable for subsequent spawned commands.
+    SetEnv {
+        /// Environment variable name.
+        variable: String,
+        /// Environment variable value.
+        value: Vec<ContentPart>,
+    },
+    /// Execute a process and capture its stdout as a string.
+    ///
+    /// Corresponds to Ruby's `Utils.safe_popen_read(path, args)`.
+    /// The captured output is stored in a named variable accessible to
+    /// subsequent statements via [`SegmentPart::CapturedOutput`].
+    ProcessCapture {
+        /// Variable name to store the captured output.
+        variable: String,
+        /// Command and arguments.
+        command: Vec<Argument>,
+    },
 }
 
 /// Path condition for [`Statement::IfPath`].
@@ -127,6 +182,8 @@ pub enum Statement {
 pub enum PathCondition {
     /// Path exists (file, directory, or symlink).
     Exists,
+    /// Path does not exist.
+    Missing,
     /// Path is a symlink.
     Symlink,
     /// Path exists and is not a symlink.
@@ -140,6 +197,8 @@ pub enum ContentPart {
     Literal(String),
     /// Substituted with the Homebrew prefix at runtime.
     HomebrewPrefix,
+    /// Substituted with a segment part at runtime.
+    Runtime(SegmentPart),
 }
 
 /// A command argument for [`Statement::System`].
@@ -196,6 +255,16 @@ pub enum SegmentPart {
     FormulaName,
     /// The formula's `version.major_minor` value (e.g. `"3.12"` from `"3.12.2"`).
     VersionMajorMinor,
+    /// The formula's `version.major` value (e.g. `"17"` from `"17.2"`).
+    VersionMajor,
+    /// The OS kernel version major (e.g. `"24"` on macOS Sequoia).
+    KernelVersionMajor,
+    /// The macOS version string (e.g. `"15.1"`).
+    MacOSVersion,
+    /// The CPU architecture string (e.g. `"arm64"`).
+    CpuArch,
+    /// A reference to a captured process output variable.
+    CapturedOutput(String),
 }
 
 /// Base component of a [`PathExpr`].
@@ -419,6 +488,26 @@ fn normalize_method_schema<'pr>(
     ctx: &LowerCtx<'_, 'pr>,
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    if let Some(stmts) = match_gdk_pixbuf_loader_schema(body, ctx, helper_stack)? {
+        return Ok(Some(stmts));
+    }
+
+    if let Some(stmts) = match_basic_postgresql_schema(body, ctx, helper_stack)? {
+        return Ok(Some(stmts));
+    }
+
+    if let Some(stmts) = match_postgresql_schema(body, ctx, helper_stack)? {
+        return Ok(Some(stmts));
+    }
+
+    if let Some(stmts) = match_mysql_schema(body, ctx, helper_stack)? {
+        return Ok(Some(stmts));
+    }
+
+    if let Some(stmts) = match_llvm_clang_config_schema(body, ctx)? {
+        return Ok(Some(stmts));
+    }
+
     if matches_ruby_bundler_cleanup_schema(body, ctx.methods, ctx.formula_version)? {
         return Ok(Some(normalize_ruby_bundler_cleanup(ctx.formula_version)));
     }
@@ -458,6 +547,333 @@ fn normalize_method_schema<'pr>(
     }
 
     Ok(None)
+}
+
+/// Detects the gdk-pixbuf/librsvg loader-cache refresh pattern.
+fn match_gdk_pixbuf_loader_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+    _helper_stack: &mut BTreeSet<String>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    let source = node_source(ctx.parsed, body)?;
+    if !source.contains("GDK_PIXBUF_MODULEDIR") || !source.contains("gdk-pixbuf-query-loaders") {
+        return Ok(None);
+    }
+
+    let loader_dir =
+        if ctx.methods.contains_key("gdk_so_ver") && ctx.methods.contains_key("gdk_module_ver") {
+            let so_ver = helper_string_literal("gdk_so_ver", ctx.methods)?;
+            let module_ver = helper_string_literal("gdk_module_ver", ctx.methods)?;
+            format!("/lib/gdk-pixbuf-{so_ver}/{module_ver}/loaders")
+        } else {
+            "/lib/gdk-pixbuf-2.0/2.10.0/loaders".to_owned()
+        };
+
+    let command = if source.contains("Formula[\"gdk-pixbuf\"].opt_bin") {
+        Argument::Path(PathExpr {
+            base: PathBase::FormulaOptBin("gdk-pixbuf".to_owned()),
+            segments: vec![PathSegment::Literal("gdk-pixbuf-query-loaders".to_owned())],
+        })
+    } else {
+        Argument::Path(PathExpr::new(PathBase::Bin, &["gdk-pixbuf-query-loaders"]))
+    };
+
+    Ok(Some(vec![
+        Statement::SetEnv {
+            variable: "GDK_PIXBUF_MODULEDIR".to_owned(),
+            value: vec![
+                ContentPart::HomebrewPrefix,
+                ContentPart::Literal(loader_dir),
+            ],
+        },
+        Statement::System(vec![command, Argument::String("--update-cache".to_owned())]),
+    ]))
+}
+
+/// Detects the older postgresql-family `post_install` pattern that only
+/// creates the data dir and runs `initdb`.
+fn match_basic_postgresql_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+    helper_stack: &mut BTreeSet<String>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    if ctx.tier != LoweringTier::WithAttributes {
+        return Ok(None);
+    }
+
+    let source = node_source(ctx.parsed, body)?;
+    if !source.contains("postgresql_datadir.mkpath")
+        || !source.contains("initdb")
+        || !source.contains("HOMEBREW_GITHUB_ACTIONS")
+    {
+        return Ok(None);
+    }
+    if source.contains("each_child") || source.contains("relative_path_from") {
+        return Ok(None);
+    }
+
+    if !ctx.methods.contains_key("postgresql_datadir") {
+        return Ok(None);
+    }
+
+    let datadir = parse_helper_path_expr("postgresql_datadir", ctx, helper_stack)?;
+
+    let mut statements = vec![
+        Statement::Mkpath(PathExpr::new(PathBase::Var, &["log"])),
+        Statement::Mkpath(datadir.clone()),
+    ];
+    statements.extend(postgresql_mirror_trees(&[]));
+    statements.push(postgresql_ci_guard(&datadir, true));
+
+    Ok(Some(statements))
+}
+
+fn helper_string_literal(
+    name: &str,
+    methods: &BTreeMap<String, MethodDef<'_>>,
+) -> Result<String, AnalysisError> {
+    let method = methods
+        .get(name)
+        .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+            message: format!("missing helper string literal: {name}"),
+        })?;
+    let Some(body) = method.body.as_ref() else {
+        return unsupported(&format!("empty helper body: {name}"));
+    };
+    let statements = body_statements(body)?;
+    if statements.len() != 1 {
+        return unsupported(&format!("helper must lower to one string literal: {name}"));
+    }
+    parse_string(&statements[0])?.ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+        message: format!("helper must be a string literal: {name}"),
+    })
+}
+
+fn postgresql_initdb_statement(data_dir: PathExpr) -> Statement {
+    Statement::System(vec![
+        Argument::Path(PathExpr::new(PathBase::Bin, &["initdb"])),
+        Argument::String("--locale=en_US.UTF-8".to_owned()),
+        Argument::String("-E".to_owned()),
+        Argument::String("UTF-8".to_owned()),
+        Argument::Path(data_dir),
+    ])
+}
+
+/// Generates `MirrorTree` statements for the standard `%w[include lib share].each` pattern.
+fn postgresql_mirror_trees(source_subdirs: &[&str]) -> Vec<Statement> {
+    let name_segment = PathSegment::Interpolated(vec![SegmentPart::FormulaName]);
+    ["include", "lib", "share"]
+        .iter()
+        .map(|dir| {
+            let mut source_parts: Vec<&str> = vec![dir];
+            source_parts.extend_from_slice(source_subdirs);
+            Statement::MirrorTree {
+                source: PathExpr::new(PathBase::Prefix, &source_parts),
+                dest: PathExpr {
+                    base: PathBase::HomebrewPrefix,
+                    segments: vec![
+                        PathSegment::Literal((*dir).to_owned()),
+                        name_segment.clone(),
+                    ],
+                },
+                prune_names: vec![".DS_Store".to_owned()],
+            }
+        })
+        .collect()
+}
+
+/// Wraps an `initdb` invocation in the standard `HOMEBREW_GITHUB_ACTIONS` guard.
+///
+/// When `check_pg_version` is true, initdb is further guarded by `PG_VERSION` missing.
+fn postgresql_ci_guard(datadir: &PathExpr, check_pg_version: bool) -> Statement {
+    let initdb = postgresql_initdb_statement(datadir.clone());
+    let then_branch = if check_pg_version {
+        vec![Statement::IfPath {
+            condition: append_segment(datadir, "PG_VERSION"),
+            kind: PathCondition::Missing,
+            then_branch: vec![initdb],
+        }]
+    } else {
+        vec![initdb]
+    };
+    Statement::IfEnv {
+        variable: "HOMEBREW_GITHUB_ACTIONS".to_owned(),
+        negate: true,
+        then_branch,
+    }
+}
+
+/// Detects the postgresql-family `post_install` pattern.
+///
+/// Pattern markers:
+/// - Has a `postgresql_datadir` helper that returns `var/name`
+/// - Has `%w[include lib share].each` with `find` + `relative_path_from`
+/// - Has `bin.each_child` for versioned symlinks
+/// - Has `ENV["HOMEBREW_GITHUB_ACTIONS"]` guard
+/// - Has `system bin/"initdb"` conditional on `pg_version_exists?`
+fn match_postgresql_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+    helper_stack: &mut BTreeSet<String>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    if ctx.tier != LoweringTier::WithAttributes {
+        return Ok(None);
+    }
+
+    let source = node_source(ctx.parsed, body)?;
+
+    // Quick textual checks to avoid expensive analysis on non-postgresql formulas
+    if !source.contains("each_child")
+        || !source.contains(".find")
+        || !source.contains("relative_path_from")
+    {
+        return Ok(None);
+    }
+
+    // Verify the postgresql_datadir helper exists
+    let has_datadir_helper = ctx.methods.contains_key("postgresql_datadir");
+    let has_pg_version_check = ctx.methods.contains_key("pg_version_exists?");
+    if !has_datadir_helper {
+        return Ok(None);
+    }
+
+    let datadir = parse_helper_path_expr("postgresql_datadir", ctx, helper_stack)?;
+
+    let mut stmts = vec![
+        Statement::Mkpath(PathExpr::new(PathBase::Var, &["log"])),
+        Statement::Mkpath(datadir.clone()),
+    ];
+    stmts.extend(postgresql_mirror_trees(&["postgresql"]));
+
+    stmts.push(Statement::ChildrenSymlink {
+        source_dir: PathExpr::new(PathBase::Bin, &[]),
+        link_dir: PathExpr::new(PathBase::HomebrewPrefix, &["bin"]),
+        suffix: vec![
+            SegmentPart::Literal("-".to_owned()),
+            SegmentPart::VersionMajor,
+        ],
+    });
+
+    stmts.push(postgresql_ci_guard(&datadir, has_pg_version_check));
+
+    Ok(Some(stmts))
+}
+
+/// Detects mysql's current `post_install`, where only the data directory creation
+/// is semantically required for installability and the rest is informational.
+fn match_mysql_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+    helper_stack: &mut BTreeSet<String>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    let source = node_source(ctx.parsed, body)?;
+    if !source.contains("(var/\"mysql\").mkpath") || !source.contains("my.cnf") {
+        return Ok(None);
+    }
+
+    let statements = body_statements(body)?;
+    if !statements.iter().any(|statement| {
+        statement.as_call_node().is_some_and(|call| {
+            call_name(&call).is_ok_and(|name| name == "mkpath")
+                && call.receiver().is_some_and(|receiver| {
+                    parse_path_expr(&receiver, ctx, helper_stack)
+                        .is_ok_and(|path| path == PathExpr::new(PathBase::Var, &["mysql"]))
+                })
+        })
+    }) {
+        return Ok(None);
+    }
+
+    Ok(Some(vec![Statement::Mkpath(PathExpr::new(
+        PathBase::Var,
+        &["mysql"],
+    ))]))
+}
+
+/// Detects the llvm clang config file `post_install` pattern.
+///
+/// Pattern markers:
+/// - Has a `clang_config_file_dir` helper that returns `etc/"clang"`
+/// - Has `write_config_files` helper with parameters
+/// - Source contains `OS.kernel_version.major`, `MacOS.version`, `Hardware::CPU.arch`
+fn match_llvm_clang_config_schema<'pr>(
+    body: &Node<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+) -> Result<Option<Vec<Statement>>, AnalysisError> {
+    if ctx.tier != LoweringTier::WithAttributes {
+        return Ok(None);
+    }
+
+    let source = node_source(ctx.parsed, body)?;
+
+    // Quick checks
+    if !source.contains("write_config_files")
+        || !source.contains("kernel_version")
+        || !source.contains("Hardware::CPU")
+    {
+        return Ok(None);
+    }
+
+    let has_config_dir_helper = ctx.methods.contains_key("clang_config_file_dir");
+    let has_write_helper = ctx.methods.contains_key("write_config_files");
+    if !has_config_dir_helper || !has_write_helper {
+        return Ok(None);
+    }
+
+    // Generate the normalized statement sequence.
+    // llvm writes config files for each combination of
+    // (system, version) × (arm64, x86_64, aarch64, current_arch)
+    // with content "-isysroot <CLT_PATH>/SDKs/MacOSX<version>.sdk\n"
+
+    let config_dir = PathExpr::new(PathBase::Etc, &["clang"]);
+    let clt_path = "/Library/Developer/CommandLineTools";
+
+    let mut stmts = vec![Statement::Mkpath(config_dir.clone())];
+
+    // The config file naming pattern: <arch>-apple-<system><version>.cfg
+    // system+version pairs: (darwin, kernel_version_major), (macosx, macos_version)
+    let systems: &[(&str, SegmentPart)] = &[
+        ("darwin", SegmentPart::KernelVersionMajor),
+        ("macosx", SegmentPart::MacOSVersion),
+    ];
+    let arches = ["arm64", "x86_64", "aarch64"];
+
+    for (system_name, version_part) in systems {
+        for arch in &arches {
+            let filename_parts = vec![
+                SegmentPart::Literal(format!("{arch}-apple-{system_name}")),
+                version_part.clone(),
+                SegmentPart::Literal(".cfg".to_owned()),
+            ];
+            let file_path = PathExpr {
+                base: config_dir.base.clone(),
+                segments: {
+                    let mut segs = config_dir.segments.clone();
+                    segs.push(PathSegment::Interpolated(filename_parts));
+                    segs
+                },
+            };
+            // Content: "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX<version>.sdk\n"
+            let content = vec![
+                ContentPart::Literal(format!("-isysroot {clt_path}/SDKs/MacOSX")),
+                ContentPart::Runtime(SegmentPart::MacOSVersion),
+                ContentPart::Literal(".sdk\n".to_owned()),
+            ];
+            stmts.push(Statement::WriteFile {
+                path: file_path,
+                content,
+            });
+        }
+    }
+
+    // Also generate for the current CPU arch if not already in the fixed set.
+    // The Ruby code uses Set which deduplicates, so arm64 on Apple Silicon
+    // would already be covered. We emit a conditional to avoid duplicate files.
+    // For simplicity, we skip the CpuArch-specific entries since arm64 is already
+    // in the fixed set and x86_64 is covered too. The only missing case would be
+    // an arch not in {arm64, x86_64, aarch64} which doesn't happen on macOS.
+
+    Ok(Some(stmts))
 }
 
 fn matches_bundle_bootstrap_schema<'pr>(
@@ -781,10 +1197,63 @@ fn lower_statement<'pr>(
         return lower_unless_statement(&unless_node, ctx, helper_stack);
     }
 
+    // Tier 2: local variable assignment with Utils.safe_popen_read
+    if ctx.tier == LoweringTier::WithAttributes
+        && let Some(assign) = node.as_local_variable_write_node()
+    {
+        return lower_local_assign(&assign, ctx, helper_stack);
+    }
+
     unsupported(&format!(
         "unsupported post_install statement: {}",
         node_source(ctx.parsed, node)?
     ))
+}
+
+fn lower_local_assign<'pr>(
+    assign: &ruby_prism::LocalVariableWriteNode<'pr>,
+    ctx: &LowerCtx<'_, 'pr>,
+    helper_stack: &mut BTreeSet<String>,
+) -> Result<Vec<Statement>, AnalysisError> {
+    let var_name = constant_name(&assign.name())?;
+    let value = assign.value();
+
+    // Check for Utils.safe_popen_read(...)
+    if let Some(call) = value.as_call_node()
+        && is_safe_popen_read(&call)?
+    {
+        let arguments = call_args(&call);
+        if arguments.is_empty() {
+            return unsupported("Utils.safe_popen_read expects at least one argument");
+        }
+        let command = arguments
+            .iter()
+            .map(|arg| parse_argument(arg, ctx, helper_stack))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(vec![Statement::ProcessCapture {
+            variable: var_name,
+            command,
+        }]);
+    }
+
+    unsupported(&format!(
+        "unsupported local variable assignment: {}",
+        node_source(ctx.parsed, &assign.as_node())?
+    ))
+}
+
+/// Checks if a call node is `Utils.safe_popen_read(...)`.
+fn is_safe_popen_read(call: &ruby_prism::CallNode<'_>) -> Result<bool, AnalysisError> {
+    if call_name(call)? != "safe_popen_read" {
+        return Ok(false);
+    }
+    let Some(receiver) = call.receiver() else {
+        return Ok(false);
+    };
+    let Some(constant) = receiver.as_constant_read_node() else {
+        return Ok(false);
+    };
+    Ok(constant_name(&constant.name())? == "Utils")
 }
 
 fn lower_if_statement<'pr>(
@@ -881,6 +1350,13 @@ fn lower_call_statement<'pr>(
     helper_stack: &mut BTreeSet<String>,
 ) -> Result<Vec<Statement>, AnalysisError> {
     let name = call_name(call)?;
+    if let Some(receiver) = call.receiver()
+        && let Some(constant) = receiver.as_constant_read_node()
+        && constant_name(&constant.name())? == "ENV"
+    {
+        return lower_env_call(call);
+    }
+
     if let Some(receiver) = call.receiver() {
         let receiver = parse_path_expr(&receiver, ctx, helper_stack)?;
         return match name.as_str() {
@@ -990,6 +1466,25 @@ fn lower_call_statement<'pr>(
     }
 }
 
+fn lower_env_call(call: &ruby_prism::CallNode<'_>) -> Result<Vec<Statement>, AnalysisError> {
+    match call_name(call)?.as_str() {
+        "[]=" => {
+            let arguments = call_args(call);
+            if arguments.len() != 2 {
+                return unsupported("ENV[]= expects exactly two arguments");
+            }
+            let Some(variable) = parse_string(&arguments[0])? else {
+                return unsupported("ENV[]= variable must be a string literal");
+            };
+            Ok(vec![Statement::SetEnv {
+                variable,
+                value: parse_content_parts(&arguments[1])?,
+            }])
+        }
+        _ => unsupported("unsupported ENV call"),
+    }
+}
+
 fn parse_argument<'pr>(
     node: &Node<'pr>,
     ctx: &LowerCtx<'_, 'pr>,
@@ -1065,9 +1560,16 @@ fn parse_path_expr_ast<'pr>(
         }
         // Try string literal first.
         if let Some(segment) = parse_string(&arguments[0])? {
-            path.segments.push(PathSegment::Literal(
-                validate_path_segment(&segment)?.to_owned(),
-            ));
+            path.segments.extend(
+                segment
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        validate_path_segment(part)
+                            .map(|value| PathSegment::Literal(value.to_owned()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             return Ok(path);
         }
         // Tier 2: allow formula attributes as path join segments.
@@ -1079,6 +1581,17 @@ fn parse_path_expr_ast<'pr>(
             }
         }
         return unsupported("path join segment must be string literal");
+    }
+
+    if name == "parent" && call.arguments().is_none() {
+        let Some(receiver) = call.receiver() else {
+            return unsupported("parent requires receiver");
+        };
+        let mut path = parse_path_expr_ast(&receiver, ctx, helper_stack)?;
+        if path.segments.pop().is_some() {
+            return Ok(path);
+        }
+        return unsupported("parent requires at least one path segment");
     }
 
     if name == "pkgetc"
@@ -1850,7 +2363,7 @@ end
         assert_eq!(
             program.statements,
             vec![Statement::WriteFile {
-                path: PathExpr::new(PathBase::Lib, &["node_modules/npm/npmrc"]),
+                path: PathExpr::new(PathBase::Lib, &["node_modules", "npm", "npmrc"]),
                 content: vec![
                     ContentPart::Literal("prefix = ".to_owned()),
                     ContentPart::HomebrewPrefix,
@@ -2183,6 +2696,345 @@ end
         let tier1 = lower_post_install(source, "1.0")?;
         let tier2 = lower_post_install_tier2(source, "1.0")?;
         assert_eq!(tier1.statements, tier2.statements);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_postgresql_family_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class PostgresqlAT17 < Formula
+  def postgresql_datadir
+    var/name
+  end
+  def pg_version_exists?
+    (postgresql_datadir/"PG_VERSION").exist?
+  end
+  def post_install
+    (var/"log").mkpath
+    postgresql_datadir.mkpath
+
+    %w[include lib share].each do |dir|
+      dst_dir = HOMEBREW_PREFIX/dir/name
+      src_dir = prefix/dir/"postgresql"
+      src_dir.find do |src|
+        dst = dst_dir/src.relative_path_from(src_dir)
+        next if dst.directory? && !dst.symlink? && src.directory? && !src.symlink?
+        rm_r(dst) if dst.exist? || dst.symlink?
+        if src.symlink? || src.file?
+          Find.prune if src.basename.to_s == ".DS_Store"
+          dst.parent.install_symlink src
+        elsif src.directory?
+          dst.mkpath
+        end
+      end
+    end
+
+    bin.each_child { |f| (HOMEBREW_PREFIX/"bin").install_symlink f => "#{f.basename}-#{version.major}" }
+
+    return if ENV["HOMEBREW_GITHUB_ACTIONS"]
+
+    system bin/"initdb", "--locale=en_US.UTF-8", "-E", "UTF-8", postgresql_datadir unless pg_version_exists?
+  end
+end
+"##;
+
+        let program = lower_post_install_tier2(source, "17.2")?;
+
+        // Verify key statements are present
+        let stmts = &program.statements;
+
+        // 1. var/log mkpath
+        assert!(
+            stmts.iter().any(
+                |s| matches!(s, Statement::Mkpath(p) if p.base == PathBase::Var
+                    && p.segments == [PathSegment::Literal("log".to_owned())])
+            ),
+            "should have Mkpath(var/log)"
+        );
+
+        // 2. var/<name> mkpath (Tier 2)
+        assert!(
+            stmts.iter().any(|s| matches!(s, Statement::Mkpath(p)
+                if p.base == PathBase::Var
+                    && p.segments == [PathSegment::Interpolated(vec![SegmentPart::FormulaName])])),
+            "should have Mkpath(var/<name>)"
+        );
+
+        // 3. MirrorTree for include/lib/share
+        let mirror_count = stmts
+            .iter()
+            .filter(|s| matches!(s, Statement::MirrorTree { .. }))
+            .count();
+        assert_eq!(mirror_count, 3, "should have 3 MirrorTree statements");
+
+        // 4. ChildrenSymlink for versioned bin links
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, Statement::ChildrenSymlink { .. })),
+            "should have ChildrenSymlink"
+        );
+
+        // 5. IfEnv for HOMEBREW_GITHUB_ACTIONS guard
+        assert!(
+            stmts.iter().any(
+                |s| matches!(s, Statement::IfEnv { variable, negate: true, .. } if variable == "HOMEBREW_GITHUB_ACTIONS")
+            ),
+            "should have IfEnv guard"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_llvm_clang_config_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Llvm < Formula
+  def clang_config_file_dir
+    etc/"clang"
+  end
+  def post_install
+    return unless OS.mac?
+
+    config_files = {
+      darwin: OS.kernel_version.major,
+      macosx: MacOS.version,
+    }.map do |system, version|
+      clang_config_file_dir/"#{Hardware::CPU.arch}-apple-#{system}#{version}.cfg"
+    end
+    return if config_files.all?(&:exist?)
+
+    write_config_files(MacOS.version, OS.kernel_version.major, Hardware::CPU.arch)
+  end
+
+  def write_config_files(macos_version, kernel_version, arch)
+    clang_config_file_dir.mkpath
+
+    arches = Set.new([:arm64, :x86_64, :aarch64])
+    arches << arch
+
+    sysroot = if macos_version.blank? || MacOS.version > macos_version
+      "#{MacOS::CLT::PKG_PATH}/SDKs/MacOSX.sdk"
+    else
+      "#{MacOS::CLT::PKG_PATH}/SDKs/MacOSX#{macos_version}.sdk"
+    end
+
+    {
+      darwin: kernel_version,
+      macosx: macos_version,
+    }.each do |system, version|
+      arches.each do |target_arch|
+        config_file = "#{target_arch}-apple-#{system}#{version}.cfg"
+        (clang_config_file_dir/config_file).atomic_write <<~CONFIG
+          -isysroot #{sysroot}
+        CONFIG
+      end
+    end
+  end
+end
+"##;
+
+        let program = lower_post_install_tier2(source, "19.1.7")?;
+        let stmts = &program.statements;
+
+        // Should have mkpath for etc/clang
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, Statement::Mkpath(p) if p.base == PathBase::Etc)),
+            "should create clang config dir"
+        );
+
+        // Should have WriteFile statements for clang config files
+        let write_count = stmts
+            .iter()
+            .filter(|s| matches!(s, Statement::WriteFile { .. }))
+            .count();
+        assert!(
+            write_count > 0,
+            "should have WriteFile statements for config files"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier2_safe_popen_read_lowering() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  def post_install
+    output = Utils.safe_popen_read(bin/"myapp", "--version")
+  end
+end
+"#;
+        // Tier 1 should reject this
+        assert!(lower_post_install(source, "1.0").is_err());
+
+        // Tier 2 should lower it to ProcessCapture
+        let program = lower_post_install_tier2(source, "1.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::ProcessCapture {
+                variable: "output".to_owned(),
+                command: vec![
+                    Argument::Path(PathExpr::new(PathBase::Bin, &["myapp"])),
+                    Argument::String("--version".to_owned()),
+                ],
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parent_path_expression_lowers() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (lib/"python3.11/site-packages").parent.mkpath
+  end
+end
+"#;
+
+        let program = lower_post_install(source, "1.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr::new(
+                PathBase::Lib,
+                &["python3.11"]
+            ))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_env_assignment_lowers_to_set_env() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Librsvg < Formula
+  def post_install
+    ENV["GDK_PIXBUF_MODULEDIR"] = "#{HOMEBREW_PREFIX}/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+    system "gdk-pixbuf-query-loaders", "--update-cache"
+  end
+end
+"##;
+
+        let program = lower_post_install(source, "2.61.2")?;
+        assert_eq!(
+            program.statements[0],
+            Statement::SetEnv {
+                variable: "GDK_PIXBUF_MODULEDIR".to_owned(),
+                value: vec![
+                    ContentPart::HomebrewPrefix,
+                    ContentPart::Literal("/lib/gdk-pixbuf-2.0/2.10.0/loaders".to_owned()),
+                ],
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_gdk_pixbuf_loader_schema_uses_helper_literals() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let source = r##"
+class GdkPixbuf < Formula
+  def gdk_so_ver
+    "2.0"
+  end
+
+  def gdk_module_ver
+    "2.10.0"
+  end
+
+  def module_dir
+    "#{HOMEBREW_PREFIX}/lib/gdk-pixbuf-#{gdk_so_ver}/#{gdk_module_ver}"
+  end
+
+  def post_install
+    ENV["GDK_PIXBUF_MODULEDIR"] = "#{module_dir}/loaders"
+    system bin/"gdk-pixbuf-query-loaders", "--update-cache"
+  end
+end
+"##;
+
+        let program = lower_post_install(source, "2.44.5")?;
+        assert_eq!(
+            program.statements,
+            vec![
+                Statement::SetEnv {
+                    variable: "GDK_PIXBUF_MODULEDIR".to_owned(),
+                    value: vec![
+                        ContentPart::HomebrewPrefix,
+                        ContentPart::Literal("/lib/gdk-pixbuf-2.0/2.10.0/loaders".to_owned()),
+                    ],
+                },
+                Statement::System(vec![
+                    Argument::Path(PathExpr::new(PathBase::Bin, &["gdk-pixbuf-query-loaders"])),
+                    Argument::String("--update-cache".to_owned()),
+                ]),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_mysql_schema_lowers_required_mkpath() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Mysql < Formula
+  def post_install
+    (var/"mysql").mkpath
+
+    if (my_cnf = ["/etc/my.cnf", "/etc/mysql/my.cnf"].find { |x| File.exist? x })
+      opoo "conflict: #{my_cnf}"
+    end
+  end
+end
+"#;
+
+        let program = lower_post_install(source, "9.0.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr::new(PathBase::Var, &["mysql"]))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_basic_postgresql_schema_uses_missing_guard() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class PostgresqlAT14 < Formula
+  def postgresql_datadir
+    var/name
+  end
+
+  def post_install
+    (var/"log").mkpath
+    postgresql_datadir.mkpath
+    old_postgres_data_dir = var/"postgres"
+    if old_postgres_data_dir.exist?
+      opoo "legacy dir"
+    end
+    return if ENV["HOMEBREW_GITHUB_ACTIONS"]
+    system bin/"initdb", "--locale=en_US.UTF-8", "-E", "UTF-8", postgresql_datadir unless pg_version_exists?
+  end
+
+  def pg_version_exists?
+    (postgresql_datadir/"PG_VERSION").exist?
+  end
+end
+"#;
+
+        let program = lower_post_install_tier2(source, "14.18")?;
+        assert!(
+            program.statements.iter().any(|statement| matches!(
+                statement,
+                Statement::IfEnv { then_branch, .. }
+                    if then_branch.iter().any(|inner| matches!(
+                        inner,
+                        Statement::IfPath { kind: PathCondition::Missing, .. }
+                    ))
+            )),
+            "expected initdb to be guarded by Missing(PG_VERSION)"
+        );
         Ok(())
     }
 }

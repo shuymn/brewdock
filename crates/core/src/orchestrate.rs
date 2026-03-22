@@ -6,9 +6,9 @@ use std::{
 
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
-    InstallReason, InstallReceipt, InstalledKeg, PostInstallContext, PostInstallTransaction,
-    RelocationScope, discover_installed_kegs, find_installed_keg, link, lower_post_install_tier2,
-    run_post_install, unlink, validate_post_install, write_receipt,
+    InstallReason, InstallReceipt, InstalledKeg, PlatformContext, PostInstallContext,
+    PostInstallTransaction, RelocationScope, discover_installed_kegs, find_installed_keg, link,
+    lower_post_install_tier2, run_post_install, unlink, validate_post_install, write_receipt,
 };
 use brewdock_formula::{
     CellarType, FetchOutcome, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository,
@@ -217,6 +217,7 @@ pub struct Orchestrator<R, D> {
     host_tag: HostTag,
     metadata_store: MetadataStore,
     progress_sink: SharedProgressSink,
+    platform: PlatformContext,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +311,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             host_tag,
             metadata_store,
             progress_sink,
+            platform: detect_platform(),
         }
     }
 
@@ -1149,14 +1151,16 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         else {
             return Ok(None);
         };
+        let platform = self.platform.clone();
         let transaction =
             self.instrument_phase(operation, "run-post-install", &formula.name, || {
                 run_post_install(
                     &ruby_source,
-                    &PostInstallContext::new(
+                    &mut PostInstallContext::new(
                         self.layout.prefix(),
                         keg_path,
                         &formula.versions.stable,
+                        &platform,
                     ),
                 )
             })?;
@@ -1921,6 +1925,53 @@ fn unix_now() -> std::time::Duration {
 /// Returns the current Unix timestamp as `f64` seconds.
 fn unix_timestamp_f64() -> f64 {
     unix_now().as_secs_f64()
+}
+
+/// Detects the current platform context for Tier 2 DSL evaluation.
+fn detect_platform() -> PlatformContext {
+    PlatformContext {
+        kernel_version_major: detect_kernel_version_major(),
+        macos_version: detect_macos_version(),
+        cpu_arch: detect_cpu_arch(),
+    }
+}
+
+fn detect_kernel_version_major() -> String {
+    std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.trim().split('.').next().map(ToOwned::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+fn detect_macos_version() -> String {
+    std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn detect_cpu_arch() -> String {
+    #[cfg(target_arch = "aarch64")]
+    {
+        "arm64".to_owned()
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64".to_owned()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        std::env::consts::ARCH.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -4368,6 +4419,160 @@ end
                 .join("cafeobj/1.6.0/lib/cafeobj-1.6/sbcl")
                 .is_dir()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tier2_filesystem_postgresql_mirror_tree() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+        let mut formula = make_formula("postgresql@17", "17.2", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz(
+            "postgresql@17",
+            "17.2",
+            &[
+                ("bin/psql", b"#!/bin/sh\necho psql\n"),
+                ("bin/pg_dump", b"#!/bin/sh\necho pg_dump\n"),
+                ("bin/initdb", b"#!/bin/sh\nexit 0\n"),
+                ("include/postgresql/libpq-fe.h", b"/* header */"),
+                (
+                    "include/postgresql/server/pg_config.h",
+                    b"/* server header */",
+                ),
+                ("lib/postgresql/libpq.dylib", b"dylib-stub"),
+            ],
+        )?;
+
+        let source = r##"
+class PostgresqlAT17 < Formula
+  def postgresql_datadir
+    var/name
+  end
+  def pg_version_exists?
+    (postgresql_datadir/"PG_VERSION").exist?
+  end
+  def post_install
+    (var/"log").mkpath
+    postgresql_datadir.mkpath
+
+    %w[include lib share].each do |dir|
+      dst_dir = HOMEBREW_PREFIX/dir/name
+      src_dir = prefix/dir/"postgresql"
+      src_dir.find do |src|
+        dst = dst_dir/src.relative_path_from(src_dir)
+        next if dst.directory? && !dst.symlink? && src.directory? && !src.symlink?
+        rm_r(dst) if dst.exist? || dst.symlink?
+        if src.symlink? || src.file?
+          Find.prune if src.basename.to_s == ".DS_Store"
+          dst.parent.install_symlink src
+        elsif src.directory?
+          dst.mkpath
+        end
+      end
+    end
+
+    bin.each_child { |f| (HOMEBREW_PREFIX/"bin").install_symlink f => "#{f.basename}-#{version.major}" }
+
+    return if ENV["HOMEBREW_GITHUB_ACTIONS"]
+
+    system bin/"initdb", "--locale=en_US.UTF-8", "-E", "UTF-8", postgresql_datadir unless pg_version_exists?
+  end
+end
+"##;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/postgresql@17.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["postgresql@17"]).await?;
+        assert_eq!(installed, vec!["postgresql@17"]);
+
+        // Verify MirrorTree: include/postgresql@17 should contain symlinks
+        let mirror_dir = layout.prefix().join("include/postgresql@17");
+        assert!(
+            mirror_dir.join("libpq-fe.h").is_symlink(),
+            "mirror should create symlink for header"
+        );
+        assert!(
+            mirror_dir.join("server").is_dir(),
+            "mirror should create directory for server/"
+        );
+        assert!(
+            mirror_dir.join("server/pg_config.h").is_symlink(),
+            "mirror should create symlink for nested header"
+        );
+
+        // Verify ChildrenSymlink: versioned bin symlinks
+        assert!(
+            layout.prefix().join("bin/psql-17").is_symlink(),
+            "versioned symlink for psql"
+        );
+        assert!(
+            layout.prefix().join("bin/pg_dump-17").is_symlink(),
+            "versioned symlink for pg_dump"
+        );
+
+        // Verify datadir was created
+        assert!(
+            layout.prefix().join("var/postgresql@17").is_dir(),
+            "postgresql datadir should exist"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tier2_process_capture_in_post_install() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
+        let mut formula = make_formula("myapp", "2.0", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar =
+            create_bottle_tar_gz("myapp", "2.0", &[("bin/myapp", b"#!/bin/sh\necho hello\n")])?;
+
+        // Synthetic formula that uses safe_popen_read
+        let source = r#"
+class Myapp < Formula
+  def post_install
+    output = Utils.safe_popen_read("echo", "captured-value")
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/myapp.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["myapp"]).await?;
+        assert_eq!(installed, vec!["myapp"]);
+
+        // The formula should install successfully (process capture is just a side-effect)
+        assert!(
+            layout
+                .cellar()
+                .join("myapp/2.0/INSTALL_RECEIPT.json")
+                .exists()
+        );
+
         Ok(())
     }
 }
