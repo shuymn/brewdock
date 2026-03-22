@@ -1151,6 +1151,11 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         else {
             return Ok(None);
         };
+        if !formula.keg_only {
+            self.instrument_phase(operation, "pre-link-post-install", &formula.name, || {
+                link(keg_path, self.layout.prefix())
+            })?;
+        }
         let platform = self.platform.clone();
         let transaction =
             self.instrument_phase(operation, "run-post-install", &formula.name, || {
@@ -4573,6 +4578,66 @@ end
                 .exists()
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_post_install_prelinks_non_keg_only_formulae()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let layout = Layout::with_root(dir.path());
+
+        let sha = "abababababababababababababababababababababababababababababababab";
+        let mut formula = make_formula("postgresql@14", "14.22", &[], sha);
+        formula.post_install_defined = true;
+
+        let tar = create_bottle_tar_gz(
+            "postgresql@14",
+            "14.22",
+            &[
+                (
+                    "bin/initdb",
+                    b"#!/bin/sh\nprefix=$(cd \"$(dirname \"$0\")/../../../..\" && pwd)\n[ -f \"$prefix/lib/postgresql@14/libpq.5.dylib\" ]\n",
+                ),
+                ("lib/postgresql@14/libpq.5.dylib", b"dylib-stub"),
+            ],
+        )?;
+
+        let source = r#"
+class PostgresqlAT14 < Formula
+  def postgresql_datadir
+    var/name
+  end
+
+  def pg_version_exists?
+    (postgresql_datadir/"PG_VERSION").exist?
+  end
+
+  def post_install
+    postgresql_datadir.mkpath
+    return if ENV["HOMEBREW_GITHUB_ACTIONS"]
+    system bin/"initdb", "--locale=en_US.UTF-8", "-E", "UTF-8", postgresql_datadir unless pg_version_exists?
+  end
+end
+"#;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let orchestrator = make_orchestrator_with_sources(
+            vec![formula],
+            HashMap::from([("Formula/postgresql@14.rb".to_owned(), source.to_owned())]),
+            vec![(sha, tar)],
+            counter,
+            layout.clone(),
+        )?;
+
+        let installed = orchestrator.install(&["postgresql@14"]).await?;
+        assert_eq!(installed, vec!["postgresql@14"]);
+        assert!(
+            layout
+                .prefix()
+                .join("lib/postgresql@14/libpq.5.dylib")
+                .is_symlink()
+        );
         Ok(())
     }
 }
