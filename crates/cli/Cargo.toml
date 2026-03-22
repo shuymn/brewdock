@@ -20,7 +20,7 @@ anyhow = "1"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["rt", "macros"] }
-indicatif = "0.17"
+indicatif = "0.18"
 
 [dev-dependencies]
 brewdock-formula = { path = "../formula" }
