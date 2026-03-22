@@ -1015,6 +1015,10 @@ fn parse_path_expr_ast<'pr>(
         return unsupported(&format!("unsupported constant in path expression: {name}"));
     }
 
+    if let Some(interp) = node.as_interpolated_string_node() {
+        return parse_interpolated_path_expr_ast(&interp, parsed, methods, helper_stack);
+    }
+
     let Some(call) = node.as_call_node() else {
         return unsupported(&format!(
             "unsupported path expression: {}",
@@ -1073,6 +1077,53 @@ fn parse_path_expr_ast<'pr>(
         "unsupported path expression: {}",
         node_source(parsed, node)?
     ))
+}
+
+fn parse_interpolated_path_expr_ast<'pr>(
+    interp: &ruby_prism::InterpolatedStringNode<'pr>,
+    parsed: &ParseResult<'pr>,
+    methods: &BTreeMap<String, MethodDef<'pr>>,
+    helper_stack: &mut BTreeSet<String>,
+) -> Result<PathExpr, AnalysisError> {
+    let parts: Vec<_> = interp.parts().iter().collect();
+    let Some(first) = parts.first() else {
+        return unsupported("empty interpolated path expression");
+    };
+    let Some(embedded) = first.as_embedded_statements_node() else {
+        return unsupported(&format!(
+            "interpolated path must start with embedded expression: {}",
+            node_source(parsed, first)?
+        ));
+    };
+    let stmts =
+        embedded
+            .statements()
+            .ok_or_else(|| AnalysisError::UnsupportedPostInstallSyntax {
+                message: "empty embedded expression in interpolated path".to_owned(),
+            })?;
+    let body: Vec<_> = stmts.body().iter().collect();
+    if body.len() != 1 {
+        return unsupported("embedded path expression must be a single expression");
+    }
+    let mut path = parse_path_expr_ast(&body[0], parsed, methods, helper_stack)?;
+    for part in &parts[1..] {
+        let Some(string) = part.as_string_node() else {
+            return unsupported(&format!(
+                "interpolated path segment must be string literal: {}",
+                node_source(parsed, part)?
+            ));
+        };
+        let segment_str = String::from_utf8(string.unescaped().to_vec()).map_err(|error| {
+            AnalysisError::UnsupportedPostInstallSyntax {
+                message: format!("invalid utf-8 in interpolated path: {error}"),
+            }
+        })?;
+        for segment in segment_str.split('/').filter(|s| !s.is_empty()) {
+            path.segments
+                .push(validate_path_segment(segment)?.to_owned());
+        }
+    }
+    Ok(path)
 }
 
 fn parse_helper_path_expr<'pr>(
@@ -1719,6 +1770,32 @@ end
         assert_eq!(
             program.statements,
             vec![Statement::Mkpath(PathExpr::new(PathBase::Lib, &["locale"]))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_system_with_formula_opt_bin_interpolation() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Gtk4 < Formula
+  def post_install
+    system "#{Formula["glib"].opt_bin}/glib-compile-schemas", "#{HOMEBREW_PREFIX}/share/glib-2.0/schemas"
+  end
+end
+"##;
+        let program = lower_post_install(source, "4.0.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::System(vec![
+                Argument::Path(PathExpr::new(
+                    PathBase::FormulaOptBin("glib".to_owned()),
+                    &["glib-compile-schemas"]
+                )),
+                Argument::Path(PathExpr::new(
+                    PathBase::HomebrewPrefix,
+                    &["share", "glib-2.0", "schemas"]
+                )),
+            ])]
         );
         Ok(())
     }
