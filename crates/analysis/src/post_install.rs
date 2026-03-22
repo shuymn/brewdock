@@ -704,6 +704,16 @@ fn lower_statement<'pr>(
         return lower_call_statement(&call, parsed, methods, helper_stack, formula_version);
     }
 
+    if let Some(unless_node) = node.as_unless_node() {
+        return lower_unless_statement(
+            &unless_node,
+            parsed,
+            methods,
+            helper_stack,
+            formula_version,
+        );
+    }
+
     unsupported(&format!(
         "unsupported post_install statement: {}",
         node_source(parsed, node)?
@@ -766,6 +776,33 @@ fn lower_if_statement<'pr>(
     unsupported(&format!(
         "unsupported post_install conditional: {}",
         node_source(parsed, &if_node.predicate())?
+    ))
+}
+
+fn lower_unless_statement<'pr>(
+    unless_node: &ruby_prism::UnlessNode<'pr>,
+    parsed: &ParseResult<'pr>,
+    methods: &BTreeMap<String, MethodDef<'pr>>,
+    helper_stack: &mut BTreeSet<String>,
+    formula_version: &str,
+) -> Result<Vec<Statement>, AnalysisError> {
+    // `unless OS.mac?` — on macOS OS.mac? is TRUE → unless body never executes → skip
+    if predicate_is_os_runtime(&unless_node.predicate(), "mac?")? {
+        return Ok(vec![]);
+    }
+    // `unless OS.linux?` — on macOS OS.linux? is FALSE → unless body always executes
+    if predicate_is_os_runtime(&unless_node.predicate(), "linux?")? {
+        return lower_statements_node_opt(
+            unless_node.statements(),
+            parsed,
+            methods,
+            helper_stack,
+            formula_version,
+        );
+    }
+    unsupported(&format!(
+        "unsupported unless condition: {}",
+        node_source(parsed, &unless_node.predicate())?
     ))
 }
 
@@ -1587,6 +1624,40 @@ end
                 .iter()
                 .any(|s| matches!(s, Statement::WriteFile { .. }))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_return_unless_os_mac_is_skipped() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  def post_install
+    return unless OS.mac?
+    (var/"run").mkpath
+  end
+end
+"#;
+        let program = lower_post_install(source, "1.0")?;
+        // The guard `return unless OS.mac?` is skipped on macOS; only mkpath remains.
+        assert_eq!(
+            program.statements,
+            vec![Statement::Mkpath(PathExpr::new(PathBase::Var, &["run"]))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unless_os_mac_alone_produces_empty_program() -> Result<(), Box<dyn std::error::Error>> {
+        // A post_install that only ever runs on non-macOS systems.
+        let source = r"
+class Demo < Formula
+  def post_install
+    return unless OS.mac?
+  end
+end
+";
+        let program = lower_post_install(source, "1.0")?;
+        assert!(program.statements.is_empty());
         Ok(())
     }
 }
