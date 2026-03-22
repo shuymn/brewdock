@@ -439,7 +439,7 @@ Architecture decisions are fixed in [docs/architecture.md](docs/architecture.md)
   - Why not split vertically further?: 3 formula が同一パターン (if exist? → gunzip → install → chmod) を共有し、install と chmod は同じ formula 内で組で出現する
   - Escalate if: Homebrew の `install` メソッドが単純なファイルコピー以上のセマンティクス (strip, mode preservation) を持つ場合
 
-- [ ] Theme: Install-time DSL evaluation foundation with attribute injection
+- [x] Theme: Install-time DSL evaluation foundation with attribute injection
   - Outcome: `bd install` 時にランタイムコンテキスト (formula name, version, OS info, arch) を注入して DSL を評価するパスが動作し、静的解析のみでは解決できなかった formula の `post_install` が実行可能になる
   - Goal: Tier 2 評価パスの確立 — ランタイムコンテキスト構造体、属性注入、`bd install` からの Tier 1→Tier 2 fallback 分岐。ADR 0004 の Tier 2 アーキテクチャを実装する
   - Must Not Break: Tier 1 (静的解析) パスの正確性; `bd-analyze` のオフライン動作; `task check` green
