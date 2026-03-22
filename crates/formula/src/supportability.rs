@@ -21,11 +21,20 @@ pub fn check_supportability(formula: &Formula, host_tag: &str) -> Result<(), For
         return Err(unsupported(&formula.name, UnsupportedReason::Disabled));
     }
 
-    if formula.pour_bottle_only_if.is_some() {
-        return Err(unsupported(
-            &formula.name,
-            UnsupportedReason::PourBottleRestricted,
-        ));
+    if let Some(condition) = &formula.pour_bottle_only_if {
+        match condition.as_str() {
+            // CLT is always assumed available: brewdock targets macOS with Homebrew
+            // installed, which requires CLT. Formulas with this restriction use the
+            // bottle when CLT is present and fall back to source otherwise; since
+            // brewdock only supports bottle installs, treat CLT as satisfied.
+            "clt_installed" => {}
+            _ => {
+                return Err(unsupported(
+                    &formula.name,
+                    UnsupportedReason::PourBottleRestricted,
+                ));
+            }
+        }
     }
 
     if formula.versions.bottle && select_bottle(formula, host_tag).is_some() {
@@ -105,7 +114,7 @@ mod tests {
     #[test]
     fn test_supportability_pour_bottle_only_if() {
         let mut formula = test_formula("pour", &[]);
-        formula.pour_bottle_only_if = Some("some_condition".to_owned());
+        formula.pour_bottle_only_if = Some("unknown_condition".to_owned());
         let err = check_supportability(&formula, TAG);
         assert!(matches!(
             err,
@@ -114,6 +123,14 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_supportability_clt_installed_is_ok() -> Result<(), FormulaError> {
+        let mut formula = test_formula("gcc", &[]);
+        formula.pour_bottle_only_if = Some("clt_installed".to_owned());
+        check_supportability(&formula, TAG)?;
+        Ok(())
     }
 
     #[test]
