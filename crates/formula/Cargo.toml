@@ -14,7 +14,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 [dev-dependencies]
 httpmock = "=0.8.3"
