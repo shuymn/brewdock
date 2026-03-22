@@ -839,6 +839,17 @@ fn lower_call_statement<'pr>(
                     target: parse_path_expr(&arguments[0], parsed, methods, helper_stack)?,
                 }])
             }
+            "atomic_write" => {
+                let arguments = call_args(call);
+                if arguments.len() != 1 {
+                    return unsupported("atomic_write expects exactly one argument");
+                }
+                let content = parse_content_parts(&arguments[0])?;
+                Ok(vec![Statement::WriteFile {
+                    path: receiver,
+                    content,
+                }])
+            }
             _ => unsupported(&format!("unsupported post_install call: {name}")),
         };
     }
@@ -1239,6 +1250,52 @@ fn parse_string(node: &Node<'_>) -> Result<Option<String>, AnalysisError> {
     Ok(None)
 }
 
+/// Parses the argument to `atomic_write` into a [`Vec<ContentPart>`].
+///
+/// Accepts plain string literals and interpolated strings where the only
+/// interpolation is `#{HOMEBREW_PREFIX}`.
+fn parse_content_parts(node: &Node<'_>) -> Result<Vec<ContentPart>, AnalysisError> {
+    if let Some(value) = parse_string(node)? {
+        return Ok(vec![ContentPart::Literal(value)]);
+    }
+    if let Some(interp) = node.as_interpolated_string_node() {
+        let mut parts = Vec::new();
+        for part in &interp.parts() {
+            if let Some(string) = part.as_string_node() {
+                let value = String::from_utf8(string.unescaped().to_vec()).map_err(|error| {
+                    AnalysisError::UnsupportedPostInstallSyntax {
+                        message: format!("invalid utf-8 in string content: {error}"),
+                    }
+                })?;
+                if !value.is_empty() {
+                    parts.push(ContentPart::Literal(value));
+                }
+            } else if let Some(embedded) = part.as_embedded_statements_node() {
+                let stmts = embedded.statements().ok_or_else(|| {
+                    AnalysisError::UnsupportedPostInstallSyntax {
+                        message: "empty interpolation in atomic_write argument".to_owned(),
+                    }
+                })?;
+                let body: Vec<_> = stmts.body().iter().collect();
+                if body.len() != 1 {
+                    return unsupported("atomic_write interpolation must be a single expression");
+                }
+                let Some(constant) = body[0].as_constant_read_node() else {
+                    return unsupported("atomic_write only supports HOMEBREW_PREFIX interpolation");
+                };
+                if constant_name(&constant.name())? != "HOMEBREW_PREFIX" {
+                    return unsupported("atomic_write only supports HOMEBREW_PREFIX interpolation");
+                }
+                parts.push(ContentPart::HomebrewPrefix);
+            } else {
+                return unsupported("unsupported interpolation part in atomic_write argument");
+            }
+        }
+        return Ok(parts);
+    }
+    unsupported("atomic_write argument must be a string literal")
+}
+
 fn is_force_true_keyword(node: &Node<'_>, parsed: &ParseResult<'_>) -> Result<bool, AnalysisError> {
     let source = node_source(parsed, node)?;
     Ok(source.trim() == "force: true")
@@ -1457,6 +1514,78 @@ end
                     Argument::String("gpg-agent".to_owned()),
                 ]),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_write_string_lowered_as_write_file() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Node22 < Formula
+  def post_install
+    (lib/"node_modules/npm/npmrc").atomic_write("prefix = #{HOMEBREW_PREFIX}\n")
+  end
+end
+"#;
+        let program = lower_post_install(source, "22.0.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::WriteFile {
+                path: PathExpr::new(PathBase::Lib, &["node_modules/npm/npmrc"]),
+                content: vec![
+                    ContentPart::Literal("prefix = ".to_owned()),
+                    ContentPart::HomebrewPrefix,
+                    ContentPart::Literal("\n".to_owned()),
+                ],
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_write_plain_string() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  def post_install
+    (etc/"demo.conf").atomic_write("hello\n")
+  end
+end
+"#;
+        let program = lower_post_install(source, "1.0")?;
+        assert_eq!(
+            program.statements,
+            vec![Statement::WriteFile {
+                path: PathExpr::new(PathBase::Etc, &["demo.conf"]),
+                content: vec![ContentPart::Literal("hello\n".to_owned())],
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_bundle_bootstrap_atomic_write_still_produces_copy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class CaCertificates < Formula
+  def post_install
+    pkgetc.mkpath
+    (pkgetc/"cert.pem").atomic_write(File.read(pkgshare/"cacert.pem"))
+  end
+end
+"#;
+        let program = lower_post_install(source, "2024.01")?;
+        // Schema normalizes this to Mkpath + Copy, not WriteFile
+        assert!(
+            program
+                .statements
+                .iter()
+                .any(|s| matches!(s, Statement::Copy { .. }))
+        );
+        assert!(
+            !program
+                .statements
+                .iter()
+                .any(|s| matches!(s, Statement::WriteFile { .. }))
         );
         Ok(())
     }
