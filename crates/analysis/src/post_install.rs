@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ruby_prism::{ConstantId, Node, ParseResult, parse as parse_ruby};
+use ruby_prism::{CallNode, ConstantId, Node, ParseResult, Visit, parse as parse_ruby};
 
 use crate::error::AnalysisError;
 
@@ -1640,6 +1640,310 @@ fn unsupported<T>(message: &str) -> Result<T, AnalysisError> {
     Err(AnalysisError::UnsupportedPostInstallSyntax {
         message: message.to_owned(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Feature census
+// ---------------------------------------------------------------------------
+
+/// Feature census for a formula `post_install` block.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostInstallFeatures {
+    // --- Receiverless calls ---
+    /// Uses `system` or `quiet_system`.
+    pub system: bool,
+    /// Uses `cp`.
+    pub cp: bool,
+    /// Uses `rm`.
+    pub rm: bool,
+    /// Uses `mkdir_p`.
+    pub mkdir_p: bool,
+    /// Uses `ohai`, `opoo`, or `odebug`.
+    pub log: bool,
+
+    // --- Receiver calls ---
+    /// Uses `.mkpath`.
+    pub mkpath: bool,
+    /// Uses `.install_symlink`.
+    pub install_symlink: bool,
+    /// Uses `.atomic_write`.
+    pub atomic_write: bool,
+    /// Uses `.chmod`.
+    pub chmod: bool,
+    /// Uses `.install`.
+    pub install: bool,
+
+    // --- ENV ---
+    /// Uses `ENV[]=`.
+    pub env: bool,
+
+    // --- Control flow ---
+    /// Uses `if` or `unless` with `OS.mac?` or `OS.linux?`.
+    pub os_condition: bool,
+    /// Uses `if` with `.exist?`, `.symlink?`, or `.directory?`.
+    pub path_condition: bool,
+
+    // --- Path bases ---
+    /// Uses `prefix`.
+    pub prefix: bool,
+    /// Uses `bin`.
+    pub bin: bool,
+    /// Uses `etc`.
+    pub etc: bool,
+    /// Uses `lib`.
+    pub lib: bool,
+    /// Uses `libexec`.
+    pub libexec: bool,
+    /// Uses `pkgetc`.
+    pub pkgetc: bool,
+    /// Uses `pkgshare`.
+    pub pkgshare: bool,
+    /// Uses `sbin`.
+    pub sbin: bool,
+    /// Uses `share`.
+    pub share: bool,
+    /// Uses `var`.
+    pub var: bool,
+    /// Uses `HOMEBREW_PREFIX`.
+    pub homebrew_prefix: bool,
+
+    // --- Other ---
+    /// Calls custom helper methods defined in the formula class.
+    pub helper_methods: bool,
+    /// Uses `name` attribute.
+    pub formula_name: bool,
+    /// Uses `version.major_minor` or `version.major`.
+    pub formula_version: bool,
+    /// Uses `Utils.safe_popen_read`.
+    pub process_capture: bool,
+    /// Uses `Formula["..."]` references.
+    pub formula_ref: bool,
+}
+
+impl PostInstallFeatures {
+    /// Returns the enabled feature names in a stable order.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        macro_rules! push_if {
+            ($field:ident, $name:literal) => {
+                if self.$field {
+                    names.push($name);
+                }
+            };
+        }
+        push_if!(system, "system");
+        push_if!(cp, "cp");
+        push_if!(rm, "rm");
+        push_if!(mkdir_p, "mkdir_p");
+        push_if!(log, "log");
+        push_if!(mkpath, "mkpath");
+        push_if!(install_symlink, "install_symlink");
+        push_if!(atomic_write, "atomic_write");
+        push_if!(chmod, "chmod");
+        push_if!(install, "install");
+        push_if!(env, "ENV");
+        push_if!(os_condition, "os_condition");
+        push_if!(path_condition, "path_condition");
+        push_if!(prefix, "prefix");
+        push_if!(bin, "bin");
+        push_if!(etc, "etc");
+        push_if!(lib, "lib");
+        push_if!(libexec, "libexec");
+        push_if!(pkgetc, "pkgetc");
+        push_if!(pkgshare, "pkgshare");
+        push_if!(sbin, "sbin");
+        push_if!(share, "share");
+        push_if!(var, "var");
+        push_if!(homebrew_prefix, "HOMEBREW_PREFIX");
+        push_if!(helper_methods, "helper_methods");
+        push_if!(formula_name, "formula_name");
+        push_if!(formula_version, "formula_version");
+        push_if!(process_capture, "process_capture");
+        push_if!(formula_ref, "formula_ref");
+        names
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature collector visitor
+// ---------------------------------------------------------------------------
+
+struct PostInstallFeatureCollector<'a> {
+    features: PostInstallFeatures,
+    user_methods: &'a BTreeSet<&'a str>,
+}
+
+/// Returns `true` when the call node's receiver is a constant read matching
+/// `expected` (e.g. `"ENV"`, `"Utils"`, `"Formula"`).
+fn receiver_is_constant(node: &CallNode<'_>, expected: &str) -> bool {
+    let Some(receiver) = node.receiver() else {
+        return false;
+    };
+    let Some(constant) = receiver.as_constant_read_node() else {
+        return false;
+    };
+    matches!(constant_name(&constant.name()).as_deref(), Ok(n) if n == expected)
+}
+
+/// Returns `true` when the receiver is a call to `"version"` (no receiver, no
+/// args), i.e. `version.major_minor` or `version.major`.
+fn receiver_is_version_call(node: &CallNode<'_>) -> bool {
+    let Some(receiver) = node.receiver() else {
+        return false;
+    };
+    let Some(call) = receiver.as_call_node() else {
+        return false;
+    };
+    matches!(call_name(&call).as_deref(), Ok("version"))
+}
+
+impl PostInstallFeatureCollector<'_> {
+    fn visit_receiverless(&mut self, name: &str, has_args: bool) {
+        match name {
+            "system" | "quiet_system" => self.features.system = true,
+            "cp" => self.features.cp = true,
+            "rm" => self.features.rm = true,
+            "mkdir_p" => self.features.mkdir_p = true,
+            "ohai" | "opoo" | "odebug" => self.features.log = true,
+            _ if !has_args => match name {
+                "prefix" => self.features.prefix = true,
+                "bin" => self.features.bin = true,
+                "etc" => self.features.etc = true,
+                "lib" => self.features.lib = true,
+                "libexec" => self.features.libexec = true,
+                "pkgetc" => self.features.pkgetc = true,
+                "pkgshare" => self.features.pkgshare = true,
+                "sbin" => self.features.sbin = true,
+                "share" => self.features.share = true,
+                "var" => self.features.var = true,
+                "name" => self.features.formula_name = true,
+                _ => {
+                    if self.user_methods.contains(name) {
+                        self.features.helper_methods = true;
+                    }
+                }
+            },
+            _ => {
+                if self.user_methods.contains(name) {
+                    self.features.helper_methods = true;
+                }
+            }
+        }
+    }
+
+    fn visit_receiver_call(&mut self, name: &str, node: &CallNode<'_>) {
+        match name {
+            "mkpath" => self.features.mkpath = true,
+            "install_symlink" => self.features.install_symlink = true,
+            "atomic_write" => self.features.atomic_write = true,
+            "chmod" => self.features.chmod = true,
+            "install" => self.features.install = true,
+            "[]=" if receiver_is_constant(node, "ENV") => self.features.env = true,
+            "mac?" | "linux?" => self.features.os_condition = true,
+            "exist?" | "symlink?" | "directory?" => self.features.path_condition = true,
+            "major_minor" | "major" if receiver_is_version_call(node) => {
+                self.features.formula_version = true;
+            }
+            "safe_popen_read" if receiver_is_constant(node, "Utils") => {
+                self.features.process_capture = true;
+            }
+            "[]" if receiver_is_constant(node, "Formula") => self.features.formula_ref = true,
+            _ => {}
+        }
+    }
+}
+
+impl<'pr> Visit<'pr> for PostInstallFeatureCollector<'_> {
+    fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+        if let Ok(name) = call_name(node) {
+            if node.receiver().is_some() {
+                self.visit_receiver_call(&name, node);
+            } else {
+                self.visit_receiverless(&name, node.arguments().is_some());
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+
+    fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+        if matches!(
+            constant_name(&node.name()).as_deref(),
+            Ok("HOMEBREW_PREFIX")
+        ) {
+            self.features.homebrew_prefix = true;
+        }
+        ruby_prism::visit_constant_read_node(self, node);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combined analysis
+// ---------------------------------------------------------------------------
+
+/// Combined analysis result from a single parse of a `post_install` block.
+#[derive(Debug, Clone)]
+pub struct PostInstallAnalysis {
+    /// Feature census of the block.
+    pub features: PostInstallFeatures,
+    /// Tier 1 lowering result — `Ok(program)` if lowering succeeded.
+    pub lowering: Result<Program, AnalysisError>,
+}
+
+/// Performs complete `post_install` analysis in a single parse pass.
+///
+/// Returns `Ok(None)` when no `def post_install` is found (not an error).
+/// Returns `Ok(Some(...))` when the method is found; `lowering` may be `Err`
+/// even when the feature census succeeds.
+///
+/// # Errors
+///
+/// Returns [`AnalysisError::UnsupportedPostInstallSyntax`] only when Prism
+/// cannot parse the source at all.
+pub fn analyze_post_install_all(
+    source: &str,
+    formula_version: &str,
+) -> Result<Option<PostInstallAnalysis>, AnalysisError> {
+    let parsed = parse_source(source)?;
+    let methods = build_method_table(&parsed)?;
+
+    let Some(method) = methods.get("post_install") else {
+        return Ok(None);
+    };
+    let Some(body) = method.body.as_ref() else {
+        return Ok(None);
+    };
+
+    // Build the set of user-defined helper method names.
+    let user_methods: BTreeSet<&str> = methods
+        .keys()
+        .filter(|k| k.as_str() != "post_install")
+        .map(String::as_str)
+        .collect();
+
+    // Feature census via AST visitor.
+    let mut collector = PostInstallFeatureCollector {
+        features: PostInstallFeatures::default(),
+        user_methods: &user_methods,
+    };
+    collector.visit(body);
+    let features = collector.features;
+
+    // Tier 1 lowering (may fail for unsupported syntax).
+    let ctx = LowerCtx {
+        parsed: &parsed,
+        methods: &methods,
+        formula_version,
+        tier: LoweringTier::Static,
+    };
+    let lowering = {
+        let mut helper_stack = BTreeSet::new();
+        lower_method("post_install", &ctx, &mut helper_stack)
+            .map(|stmts| Program { statements: stmts })
+    };
+
+    Ok(Some(PostInstallAnalysis { features, lowering }))
 }
 
 #[cfg(test)]

@@ -24,11 +24,13 @@ pub mod test_do;
 
 pub use error::AnalysisError;
 pub use post_install::{
-    Argument, ContentPart, PathBase, PathCondition, PathExpr, PathSegment, Program, SegmentPart,
-    Statement, extract_post_install_block, lower_post_install, lower_post_install_tier2,
+    Argument, ContentPart, PathBase, PathCondition, PathExpr, PathSegment, PostInstallAnalysis,
+    PostInstallFeatures, Program, SegmentPart, Statement, analyze_post_install_all,
+    extract_post_install_block, lower_post_install, lower_post_install_tier2,
     validate_post_install,
 };
 pub use test_do::{
-    TestArg, TestExpr, TestPathBase, TestPathExpr, TestProgram, TestStatement, TestStringExpr,
-    TestStringPart, analyze_test_do, extract_test_do_block, lower_test_do, validate_test_do,
+    TestArg, TestDoAnalysis, TestDoFeatures, TestExpr, TestPathBase, TestPathExpr, TestProgram,
+    TestStatement, TestStringExpr, TestStringPart, analyze_test_do, analyze_test_do_all,
+    extract_test_do_block, lower_test_do, validate_test_do,
 };

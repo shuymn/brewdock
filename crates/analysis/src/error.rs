@@ -1,5 +1,5 @@
 /// Errors from static analysis of formula `post_install` blocks.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AnalysisError {
     /// A `post_install` block could not be parsed or contains unsupported syntax.
     #[error("unsupported post_install syntax: {message}")]

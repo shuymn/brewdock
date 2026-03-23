@@ -867,3 +867,156 @@ end
     )));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Feature census tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_features_system_mkpath() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def post_install
+    (var/"demo").mkpath
+    mkdir_p prefix/"etc"
+    system "echo", "hello"
+  end
+end
+"#;
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.features.mkpath);
+    assert!(analysis.features.mkdir_p);
+    assert!(analysis.features.system);
+    assert!(analysis.features.var);
+    assert!(analysis.features.prefix);
+    Ok(())
+}
+
+#[test]
+fn test_features_env() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def post_install
+    ENV["FOO"] = "bar"
+  end
+end
+"#;
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.features.env);
+    Ok(())
+}
+
+#[test]
+fn test_features_os_condition() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def post_install
+    if OS.mac?
+      system "echo", "mac"
+    end
+  end
+end
+"#;
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.features.os_condition);
+    assert!(analysis.features.system);
+    Ok(())
+}
+
+#[test]
+fn test_features_path_bases() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def post_install
+    (bin/"demo").install_symlink prefix/"lib/demo"
+    (share/"doc").mkpath
+  end
+end
+"#;
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.features.bin);
+    assert!(analysis.features.prefix);
+    assert!(analysis.features.share);
+    assert!(analysis.features.install_symlink);
+    assert!(analysis.features.mkpath);
+    Ok(())
+}
+
+#[test]
+fn test_features_helper_methods() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def post_install
+    configure_foo
+  end
+
+  def configure_foo
+    (prefix/"etc").mkpath
+  end
+end
+"#;
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.features.helper_methods);
+    Ok(())
+}
+
+#[test]
+fn test_analyze_all_no_block() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def install
+    system "make"
+  end
+end
+"#;
+
+    let result = analyze_post_install_all(source, "1.0")?;
+
+    assert!(result.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_analyze_all_lowerable() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+class Demo < Formula
+  def post_install
+    (var/"demo").mkpath
+    system "echo", "done"
+  end
+end
+"#;
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.features.mkpath);
+    assert!(analysis.features.system);
+    assert!(analysis.lowering.is_ok());
+    Ok(())
+}
+
+#[test]
+fn test_analyze_all_unlowerable() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r"
+class Demo < Formula
+  def post_install
+    some_totally_unsupported_call
+  end
+end
+";
+
+    let analysis = analyze_post_install_all(source, "1.0")?.ok_or("should find block")?;
+
+    assert!(analysis.lowering.is_err());
+    Ok(())
+}

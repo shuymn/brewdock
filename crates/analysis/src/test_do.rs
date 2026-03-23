@@ -244,6 +244,43 @@ pub fn analyze_test_do(source: &str) -> Result<TestDoFeatures, AnalysisError> {
     Ok(collector.features)
 }
 
+/// Combined analysis result from a single parse of a `test do` block.
+#[derive(Debug, Clone)]
+pub struct TestDoAnalysis {
+    /// Feature census of the block.
+    pub features: TestDoFeatures,
+    /// v1 runtime lowering result — `Ok(program)` if lowering succeeded.
+    pub lowering: Result<TestProgram, AnalysisError>,
+}
+
+/// Performs complete `test do` analysis in a single parse pass.
+///
+/// Returns `Ok(None)` when no `test do` block is found (not an error).
+/// Returns `Ok(Some(...))` when a block is found; `lowering` may be `Err`
+/// even when the feature census succeeds.
+///
+/// # Errors
+///
+/// Returns [`AnalysisError::UnsupportedTestDoSyntax`] only when Prism cannot
+/// parse the source at all.
+pub fn analyze_test_do_all(source: &str) -> Result<Option<TestDoAnalysis>, AnalysisError> {
+    let parsed = parse_source(source)?;
+    let Some(block) = find_test_block(&parsed)? else {
+        return Ok(None);
+    };
+
+    let mut collector = TestDoFeatureCollector::default();
+    collector.visit(&block.as_node());
+    let features = collector.features;
+
+    let lowering = block.body().map_or_else(
+        || Err(unsupported_test("missing test do body")),
+        |body| lower_body_node(&parsed, &body).map(|stmts| TestProgram { statements: stmts }),
+    );
+
+    Ok(Some(TestDoAnalysis { features, lowering }))
+}
+
 /// Lowers a `test do` block into the v1 runtime IR.
 ///
 /// # Errors
@@ -837,6 +874,79 @@ end
 "#;
 
         let result = lower_test_do(source);
+
+        assert!(matches!(
+            result,
+            Err(AnalysisError::UnsupportedTestDoSyntax { .. })
+        ));
+    }
+
+    #[test]
+    fn test_analyze_all_no_block() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  def install
+    system "make"
+  end
+end
+"#;
+
+        let result = analyze_test_do_all(source)?;
+
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_all_lowerable() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Shfmt < Formula
+  test do
+    assert_match version.to_s, shell_output("#{bin}/shfmt --version")
+    (testpath/"test").write "\t\techo foo"
+    system bin/"shfmt", testpath/"test"
+  end
+end
+"##;
+
+        let analysis = analyze_test_do_all(source)?.ok_or("should find block")?;
+
+        assert!(analysis.features.assert_match);
+        assert!(analysis.features.shell_output);
+        assert!(analysis.features.bin);
+        assert!(analysis.features.system);
+        assert!(analysis.features.testpath);
+        assert!(analysis.features.write);
+        assert!(analysis.lowering.is_ok());
+        assert_eq!(
+            analysis.lowering.as_ref().ok().map(|p| p.statements.len()),
+            Some(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_all_unlowerable() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    ENV["FOO"] = "bar"
+  end
+end
+"#;
+
+        let analysis = analyze_test_do_all(source)?.ok_or("should find block")?;
+
+        assert!(analysis.features.env);
+        assert!(analysis.lowering.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_all_parse_error() {
+        let source = "{{{{not valid ruby at all";
+
+        let result = analyze_test_do_all(source);
 
         assert!(matches!(
             result,
