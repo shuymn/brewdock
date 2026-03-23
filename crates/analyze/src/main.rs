@@ -4,12 +4,16 @@
 //!
 //! Analyzes Homebrew formulae to determine whether they can be installed
 //! by brewdock, checking both supportability (bottle availability, disabled
-//! status, pour restrictions) and `post_install` compatibility.
+//! status, pour restrictions) and `post_install` compatibility. Optional
+//! `test do` analysis reports both parse coverage and v1 runtime-lowering coverage.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use brewdock_analysis::{extract_post_install_block, validate_post_install};
+use brewdock_analysis::{
+    analyze_test_do, extract_post_install_block, extract_test_do_block, lower_test_do,
+    validate_post_install,
+};
 use brewdock_formula::{
     Formula, FormulaRepository, HttpFormulaRepository, check_supportability, select_bottle,
 };
@@ -36,6 +40,10 @@ struct Cli {
         default_value = "/opt/homebrew/Library/Taps/homebrew/homebrew-core"
     )]
     tap_path: PathBuf,
+
+    /// Analyze `test do` blocks and report runtime subset support.
+    #[arg(long)]
+    test_do: bool,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -73,8 +81,18 @@ struct FormulaReport {
     has_bottle: bool,
     has_post_install: bool,
     post_install_ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_test_do: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_do_parse_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_do_runtime_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_do_features: Option<Vec<String>>,
     supportability_error: Option<String>,
     post_install_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_do_error: Option<String>,
 }
 
 fn formula_rb_path(tap_path: &Path, name: &str) -> Option<PathBuf> {
@@ -98,24 +116,101 @@ fn check_post_install_source(source: &str, version: &str) -> (bool, bool, Option
     }
 }
 
-async fn analyze_formula_api(repo: &HttpFormulaRepository, name: &str) -> Result<FormulaReport> {
+fn check_test_do_source(source: &str) -> (bool, bool, bool, Option<String>, Vec<String>) {
+    let has_test_do = extract_test_do_block(source).is_ok();
+    if !has_test_do {
+        return (false, true, true, None, Vec::new());
+    }
+
+    let features = analyze_test_do(source).map(|features| {
+        features
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    let parse_ok = features.is_ok();
+    let runtime = lower_test_do(source);
+    let runtime_ok = runtime.is_ok();
+
+    let error = if let Err(error) = runtime {
+        Some(error.to_string())
+    } else if let Err(error) = &features {
+        Some(error.to_string())
+    } else {
+        None
+    };
+
+    (
+        true,
+        parse_ok,
+        runtime_ok,
+        error,
+        features.unwrap_or_default(),
+    )
+}
+
+async fn analyze_formula_api(
+    repo: &HttpFormulaRepository,
+    name: &str,
+    check_test_do: bool,
+) -> Result<FormulaReport> {
     let formula: Formula = repo.formula(name).await?;
 
     let supportability_error = check_supportability(&formula, HOST_TAG).err();
     let has_bottle = formula.versions.bottle && select_bottle(&formula, HOST_TAG).is_some();
 
-    let (has_post_install, post_install_ok, post_install_error) = if formula.post_install_defined {
+    let ruby_source = if formula.post_install_defined || check_test_do {
         if let Some(ruby_source_path) = formula.ruby_source_path.as_deref() {
-            match repo.ruby_source(ruby_source_path).await {
-                Ok(source) => check_post_install_source(&source, &formula.versions.stable),
-                Err(e) => (true, false, Some(format!("fetch failed: {e}"))),
-            }
+            Some(repo.ruby_source(ruby_source_path).await)
         } else {
-            (true, false, Some("no ruby_source_path".to_owned()))
+            None
+        }
+    } else {
+        None
+    };
+
+    let (has_post_install, post_install_ok, post_install_error) = if formula.post_install_defined {
+        match ruby_source.as_ref() {
+            Some(Ok(source)) => check_post_install_source(source, &formula.versions.stable),
+            Some(Err(error)) => (true, false, Some(format!("fetch failed: {error}"))),
+            None => (true, false, Some("no ruby_source_path".to_owned())),
         }
     } else {
         (false, true, None)
     };
+
+    let (has_test_do, test_do_parse_ok, test_do_runtime_ok, test_do_error, test_do_features) =
+        if check_test_do {
+            match ruby_source.as_ref() {
+                Some(Ok(source)) => {
+                    let (has, parse_ok, runtime_ok, error, features) = check_test_do_source(source);
+                    (
+                        Some(has),
+                        Some(parse_ok),
+                        Some(runtime_ok),
+                        error,
+                        Some(features),
+                    )
+                }
+                Some(Err(error)) => (
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    Some(format!("fetch failed: {error}")),
+                    Some(Vec::new()),
+                ),
+                None => (
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    Some("no ruby_source_path".to_owned()),
+                    Some(Vec::new()),
+                ),
+            }
+        } else {
+            (None, None, None, None, None)
+        };
 
     let verdict = if supportability_error.is_some() {
         Verdict::Unsupported
@@ -131,12 +226,21 @@ async fn analyze_formula_api(repo: &HttpFormulaRepository, name: &str) -> Result
         has_bottle,
         has_post_install,
         post_install_ok,
+        has_test_do,
+        test_do_parse_ok,
+        test_do_runtime_ok,
+        test_do_features,
         supportability_error: supportability_error.map(|e| e.to_string()),
         post_install_error,
+        test_do_error,
     })
 }
 
-fn analyze_formula_local(name: &str, tap_path: &Path) -> Result<FormulaReport> {
+fn analyze_formula_local(
+    name: &str,
+    tap_path: &Path,
+    check_test_do: bool,
+) -> Result<FormulaReport> {
     let rb_path =
         formula_rb_path(tap_path, name).with_context(|| format!("empty formula name: {name}"))?;
 
@@ -145,6 +249,19 @@ fn analyze_formula_local(name: &str, tap_path: &Path) -> Result<FormulaReport> {
 
     let (has_post_install, post_install_ok, post_install_error) =
         check_post_install_source(&source, "0.0.0");
+    let (has_test_do, test_do_parse_ok, test_do_runtime_ok, test_do_error, test_do_features) =
+        if check_test_do {
+            let (has, parse_ok, runtime_ok, error, features) = check_test_do_source(&source);
+            (
+                Some(has),
+                Some(parse_ok),
+                Some(runtime_ok),
+                error,
+                Some(features),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
 
     // Local analysis cannot check supportability (no JSON metadata).
     let verdict = if !post_install_ok && has_post_install {
@@ -159,8 +276,13 @@ fn analyze_formula_local(name: &str, tap_path: &Path) -> Result<FormulaReport> {
         has_bottle: false, // unknown from local .rb
         has_post_install,
         post_install_ok,
+        has_test_do,
+        test_do_parse_ok,
+        test_do_runtime_ok,
+        test_do_features,
         supportability_error: None,
         post_install_error,
+        test_do_error,
     })
 }
 
@@ -171,17 +293,30 @@ fn error_report(name: String, error: impl std::fmt::Display) -> FormulaReport {
         has_bottle: false,
         has_post_install: false,
         post_install_ok: false,
+        has_test_do: None,
+        test_do_parse_ok: None,
+        test_do_runtime_ok: None,
+        test_do_features: None,
         supportability_error: Some(format!("{error}")),
         post_install_error: None,
+        test_do_error: None,
     }
 }
 
-fn print_table(reports: &[FormulaReport]) {
-    println!(
-        "{:<30} {:<12} {:<8} {:<12} error",
-        "Formula", "verdict", "bottle", "post_install"
-    );
-    println!("{}", "-".repeat(100));
+fn print_table(reports: &[FormulaReport], include_test_do: bool) {
+    if include_test_do {
+        println!(
+            "{:<30} {:<12} {:<8} {:<12} {:<10} {:<10} error",
+            "Formula", "verdict", "bottle", "post_install", "test_parse", "test_rt"
+        );
+        println!("{}", "-".repeat(124));
+    } else {
+        println!(
+            "{:<30} {:<12} {:<8} {:<12} error",
+            "Formula", "verdict", "bottle", "post_install"
+        );
+        println!("{}", "-".repeat(100));
+    }
 
     let mut counts = [0u32; 4]; // ok, post_install_unsupported, unsupported, error
 
@@ -204,14 +339,32 @@ fn print_table(reports: &[FormulaReport]) {
             .supportability_error
             .as_deref()
             .or(report.post_install_error.as_deref())
+            .or(report.test_do_error.as_deref())
             .unwrap_or("");
-        println!(
-            "{:<30} {:<12} {:<8} {:<12} {}",
-            report.name, verdict_str, bottle, post_install, error
-        );
+        if include_test_do {
+            let test_parse = match (report.has_test_do, report.test_do_parse_ok) {
+                (Some(true), Some(true)) => "ok",
+                (Some(true), Some(false)) => "FAIL",
+                _ => "-",
+            };
+            let test_runtime = match (report.has_test_do, report.test_do_runtime_ok) {
+                (Some(true), Some(true)) => "ok",
+                (Some(true), Some(false)) => "FAIL",
+                _ => "-",
+            };
+            println!(
+                "{:<30} {:<12} {:<8} {:<12} {:<10} {:<10} {}",
+                report.name, verdict_str, bottle, post_install, test_parse, test_runtime, error
+            );
+        } else {
+            println!(
+                "{:<30} {:<12} {:<8} {:<12} {}",
+                report.name, verdict_str, bottle, post_install, error
+            );
+        }
     }
 
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(if include_test_do { 124 } else { 100 }));
     println!(
         "Total: {} | ok: {} | post_install skipped: {} | unsupported: {} | error: {}",
         reports.len(),
@@ -256,7 +409,7 @@ async fn main() -> Result<()> {
             );
         }
         for name in &formulas {
-            match analyze_formula_local(name, &cli.tap_path) {
+            match analyze_formula_local(name, &cli.tap_path, cli.test_do) {
                 Ok(report) => reports.push(report),
                 Err(e) => reports.push(error_report(name.clone(), e)),
             }
@@ -264,7 +417,7 @@ async fn main() -> Result<()> {
     } else {
         let repo = HttpFormulaRepository::new();
         for name in &formulas {
-            match analyze_formula_api(&repo, name).await {
+            match analyze_formula_api(&repo, name, cli.test_do).await {
                 Ok(report) => reports.push(report),
                 Err(e) => reports.push(error_report(name.clone(), e)),
             }
@@ -272,7 +425,7 @@ async fn main() -> Result<()> {
     }
 
     match cli.format {
-        OutputFormat::Table => print_table(&reports),
+        OutputFormat::Table => print_table(&reports, cli.test_do),
         OutputFormat::Json => print_json(&reports)?,
     }
 
