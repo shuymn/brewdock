@@ -204,6 +204,52 @@ pub fn create_bottle_tar_gz(
     Ok(compressed)
 }
 
+pub enum BottleArchiveEntry<'a> {
+    File(&'a str, &'a [u8]),
+    Symlink(&'a str, &'a str),
+}
+
+pub fn create_bottle_tar_gz_with_entries(
+    name: &str,
+    version: &str,
+    entries: &[BottleArchiveEntry<'_>],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    use flate2::{Compression, write::GzEncoder};
+
+    let buf = Vec::new();
+    let encoder = GzEncoder::new(buf, Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+
+    for entry in entries {
+        match entry {
+            BottleArchiveEntry::File(path, contents) => {
+                let full_path = format!("{name}/{version}/{path}");
+                let mut header = tar::Header::new_gnu();
+                header.set_path(&full_path)?;
+                header.set_size(contents.len() as u64);
+                header.set_mode(bottle_entry_mode(path));
+                header.set_cksum();
+                builder.append(&header, *contents)?;
+            }
+            BottleArchiveEntry::Symlink(path, target) => {
+                let full_path = format!("{name}/{version}/{path}");
+                let mut header = tar::Header::new_gnu();
+                header.set_path(&full_path)?;
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_link_name(target)?;
+                header.set_cksum();
+                builder.append(&header, std::io::empty())?;
+            }
+        }
+    }
+
+    let encoder = builder.into_inner()?;
+    let compressed = encoder.finish()?;
+    Ok(compressed)
+}
+
 fn bottle_entry_mode(path: &str) -> u32 {
     if path.starts_with("bin/") || path.starts_with("sbin/") {
         0o755

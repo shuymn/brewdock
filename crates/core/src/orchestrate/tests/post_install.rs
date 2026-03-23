@@ -5,7 +5,8 @@ use std::{
 
 use super::{BrewdockError, Layout};
 use crate::testutil::{
-    assert_installed, assert_not_installed, create_bottle_tar_gz, make_formula, make_orchestrator,
+    BottleArchiveEntry, assert_installed, assert_not_installed, create_bottle_tar_gz,
+    create_bottle_tar_gz_with_entries, make_formula, make_orchestrator,
     make_orchestrator_with_sources,
 };
 
@@ -189,6 +190,97 @@ end
     );
     assert_not_installed(&layout, "demo");
     assert!(!layout.prefix().join("bin").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_install_runs_bottle_prefix_install_before_post_install()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::with_root(dir.path());
+
+    let sha = "ababababcdcdcdcdababababcdcdcdcdababababcdcdcdcdababababcdcdcdcd";
+    let mut formula = make_formula("kafka", "4.2.0", &[], sha);
+    formula.post_install_defined = true;
+
+    let tar = create_bottle_tar_gz_with_entries(
+        "kafka",
+        "4.2.0",
+        &[
+            BottleArchiveEntry::File(".bottle/etc/kafka/server.properties", b"logs=1\n"),
+            BottleArchiveEntry::Symlink("libexec/config", "../../../../etc/kafka"),
+            BottleArchiveEntry::File("bin/check-config", b"#!/bin/sh\ncat \"$1\" > \"$2\"\n"),
+        ],
+    )?;
+
+    let source = r#"
+class Kafka < Formula
+  def post_install
+    system "/bin/sh", bin/"check-config", etc/"kafka/server.properties", var/"copied.txt"
+  end
+end
+"#;
+
+    let orchestrator = make_orchestrator_with_sources(
+        vec![formula],
+        HashMap::from([("Formula/kafka.rb".to_owned(), source.to_owned())]),
+        vec![(sha, tar)],
+        Arc::new(AtomicUsize::new(0)),
+        layout.clone(),
+    )?;
+
+    orchestrator.install(&["kafka"]).await?;
+
+    assert_eq!(
+        std::fs::read_to_string(layout.prefix().join("var/copied.txt"))?,
+        "logs=1\n"
+    );
+    assert_eq!(
+        std::fs::read_link(layout.cellar().join("kafka/4.2.0/libexec/config"))?,
+        std::path::PathBuf::from("../../../../etc/kafka")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_install_rolls_back_bottle_prefix_entries_on_post_install_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::with_root(dir.path());
+
+    let sha = "efefefefcdcdcdcdababababcdcdcdcdababababcdcdcdcdababababcdcdcdcd";
+    let mut formula = make_formula("demo", "1.0", &[], sha);
+    formula.post_install_defined = true;
+
+    let tar = create_bottle_tar_gz_with_entries(
+        "demo",
+        "1.0",
+        &[BottleArchiveEntry::File(
+            ".bottle/etc/demo/config.toml",
+            b"demo=true\n",
+        )],
+    )?;
+    let source = r#"
+class Demo < Formula
+  def post_install
+    unsupported_call "boom"
+  end
+end
+"#;
+
+    let orchestrator = make_orchestrator_with_sources(
+        vec![formula],
+        HashMap::from([("Formula/demo.rb".to_owned(), source.to_owned())]),
+        vec![(sha, tar)],
+        Arc::new(AtomicUsize::new(0)),
+        layout.clone(),
+    )?;
+
+    let result = orchestrator.install(&["demo"]).await;
+
+    assert!(result.is_err());
+    assert!(!layout.prefix().join("etc/demo/config.toml").exists());
+    assert!(!layout.prefix().join("etc/demo").exists());
     Ok(())
 }
 

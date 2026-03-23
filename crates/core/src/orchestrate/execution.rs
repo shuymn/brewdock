@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use brewdock_bottle::{BlobStore, BottleDownloader, extract_tar_gz};
 use brewdock_cellar::{
     InstallReason, InstallReceipt, PostInstallContext, PostInstallTransaction, RelocationScope,
-    link, lower_post_install_tier2, run_post_install, validate_post_install, write_receipt,
+    install_bottle_etc_var, link, lower_post_install_tier2, run_post_install,
+    validate_post_install, write_receipt,
 };
 use brewdock_formula::{
     CellarType, Formula, FormulaCache, FormulaError, FormulaName, FormulaRepository,
@@ -278,15 +279,13 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
     ) -> Result<(), BrewdockError> {
         let name = formula.name.as_str();
         let keg_path = finalize_ctx.keg_path;
-
-        let post_install_transaction = self
-            .instrument_async_phase(
+        let bottle_prefix_transaction = self
+            .instrument_phase(
                 install_context.operation,
-                "post-install",
+                "install-bottle-prefix",
                 name,
-                self.execute_post_install(install_context.operation, formula, keg_path),
+                || install_bottle_etc_var(keg_path, self.layout.prefix()),
             )
-            .await
             .inspect_err(|_| {
                 let _ = cleanup_failed_install(
                     keg_path,
@@ -295,6 +294,33 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
                     &formula.name,
                 );
             })?;
+
+        let post_install_transaction = match self
+            .instrument_async_phase(
+                install_context.operation,
+                "post-install",
+                name,
+                self.execute_post_install(install_context.operation, formula, keg_path),
+            )
+            .await
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if let Err(rollback_err) = bottle_prefix_transaction.rollback() {
+                    tracing::warn!(
+                        ?rollback_err,
+                        "failed to rollback bottle prefix transaction"
+                    );
+                }
+                cleanup_failed_install(
+                    keg_path,
+                    self.layout.prefix(),
+                    &self.layout.opt_dir(),
+                    &formula.name,
+                )?;
+                return Err(error);
+            }
+        };
 
         let is_requested = install_context.requested.contains(formula.name.as_str());
         let receipt = build_receipt(
@@ -316,6 +342,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
             if let Some(transaction) = post_install_transaction {
                 transaction.rollback()?;
             }
+            bottle_prefix_transaction.rollback()?;
             cleanup_failed_install(
                 keg_path,
                 self.layout.prefix(),
@@ -328,6 +355,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         if let Some(transaction) = post_install_transaction {
             transaction.commit()?;
         }
+        bottle_prefix_transaction.commit();
 
         tracing::info!(name, "installation complete");
         Ok(())
