@@ -87,8 +87,14 @@ fn validate_entry_target<R: std::io::Read>(
             )));
         }
 
-        let entry_parent = entry_path.parent().unwrap_or_else(|| Path::new(""));
-        let _normalized_target = normalize_archive_path(&entry_parent.join(target))?;
+        // Relative symlink targets may legitimately traverse outside the
+        // archive root in Homebrew bottles, e.g. to `opt/...` or `etc/...`.
+        // `tar::Entry::unpack_in` still constrains extraction writes to `dest`,
+        // so only hard links need archive-root validation here.
+        if entry_type == EntryType::Link {
+            let entry_parent = entry_path.parent().unwrap_or_else(|| Path::new(""));
+            normalize_archive_path(&entry_parent.join(target))?;
+        }
     }
 
     Ok(())
@@ -238,6 +244,77 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(dest.join("bin/tool"))?, "tool");
         Ok(())
+    }
+
+    #[test]
+    fn test_extract_tar_gz_allows_relative_symlink_to_prefix_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let archive = create_single_link_tar_gz(
+            "kafka/4.2.0/libexec/config",
+            tar::EntryType::Symlink,
+            "../../../../etc/kafka",
+        )?;
+
+        let dir = tempfile::tempdir()?;
+        let archive_path = dir.path().join("kafka-symlink.tar.gz");
+        std::fs::write(&archive_path, archive)?;
+
+        let dest = dir.path().join("out");
+        extract_tar_gz(&archive_path, &dest)?;
+
+        let link = dest.join("kafka/4.2.0/libexec/config");
+        assert!(link.is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link)?,
+            PathBuf::from("../../../../etc/kafka")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_tar_gz_rejects_hardlink_outside_archive_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let archive = create_single_link_tar_gz(
+            "demo/1.0/bin/tool",
+            tar::EntryType::Link,
+            "../../../../etc/passwd",
+        )?;
+
+        let dir = tempfile::tempdir()?;
+        let archive_path = dir.path().join("bad-hardlink.tar.gz");
+        std::fs::write(&archive_path, archive)?;
+
+        let dest = dir.path().join("out");
+        let result = extract_tar_gz(&archive_path, &dest);
+
+        assert!(
+            result.is_err(),
+            "hardlink escaping archive root should fail"
+        );
+        Ok(())
+    }
+
+    fn create_single_link_tar_gz(
+        path: &str,
+        entry_type: tar::EntryType,
+        link_name: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use flate2::{Compression, write::GzEncoder};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path)?;
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name(link_name)?;
+        header.set_cksum();
+        builder.append(&header, std::io::empty())?;
+
+        let encoder = builder.into_inner()?;
+        Ok(encoder.finish()?)
     }
 
     fn create_attack_tar_gz() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
