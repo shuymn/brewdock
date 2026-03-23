@@ -53,4 +53,25 @@ pub enum CellarError {
         /// Human-readable command failure detail.
         message: String,
     },
+
+    /// A `test do` execution-time path validation failed.
+    #[error("unsupported test do syntax: {message}")]
+    UnsupportedTestDoSyntax {
+        /// Human-readable parser failure detail.
+        message: String,
+    },
+
+    /// Executing a `test do` command failed.
+    #[error("test do command failed: {message}")]
+    TestDoCommandFailed {
+        /// Human-readable command failure detail.
+        message: String,
+    },
+
+    /// A `test do` assertion failed.
+    #[error("test do assertion failed: {message}")]
+    TestDoAssertionFailed {
+        /// Human-readable assertion failure detail.
+        message: String,
+    },
 }

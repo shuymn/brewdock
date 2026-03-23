@@ -11,6 +11,7 @@ pub mod post_install;
 pub mod receipt;
 pub mod relocate;
 pub mod state;
+pub mod test_do;
 
 pub use discover::{InstalledKeg, discover_installed_kegs, find_installed_keg};
 pub use error::CellarError;
@@ -27,3 +28,4 @@ pub use receipt::{
     write_receipt,
 };
 pub use relocate::{RelocationManifest, RelocationScope, relocate_keg, relocate_keg_with_manifest};
+pub use test_do::{TestDoContext, run_test_do};
