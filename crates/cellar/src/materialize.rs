@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{error::CellarError, fs, link::relative_from_to};
 
@@ -89,6 +89,100 @@ pub fn atomic_symlink_replace(target: &Path, link_path: &Path) -> Result<(), Cel
     Ok(())
 }
 
+/// Prefix-visible paths created from `.bottle/etc` and `.bottle/var`.
+#[derive(Debug, Default)]
+pub struct BottlePrefixTransaction {
+    created_paths: Vec<PathBuf>,
+}
+
+impl BottlePrefixTransaction {
+    /// Records a path that should be removed on rollback.
+    fn record(&mut self, path: PathBuf) {
+        self.created_paths.push(path);
+    }
+
+    /// Commits the transaction.
+    pub fn commit(self) {}
+
+    /// Removes any prefix-visible paths created by the transaction.
+    ///
+    /// Paths are removed in reverse creation order so files/symlinks disappear
+    /// before the parent directories we created to hold them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file or directory cannot be removed.
+    pub fn rollback(self) -> Result<(), CellarError> {
+        for path in self.created_paths.into_iter().rev() {
+            match path.symlink_metadata() {
+                Ok(metadata) if metadata.is_dir() => {
+                    std::fs::remove_dir(&path)?;
+                }
+                Ok(_) => {
+                    std::fs::remove_file(&path)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(CellarError::from(error)),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Installs Homebrew bottle-managed `etc` and `var` entries into the prefix.
+///
+/// Relative symlinks are preserved, but destinations remain constrained to
+/// `prefix/etc` and `prefix/var`. This matches Homebrew's `.bottle` install
+/// behavior without turning it into a generic escape hatch.
+///
+/// If any step fails after prefix paths were created, those paths are removed
+/// before the error is returned (same paths as [`BottlePrefixTransaction::rollback`]).
+///
+/// # Errors
+///
+/// Returns an error if any file operation fails or a bottle path escapes the
+/// prefix root.
+pub fn install_bottle_etc_var(
+    keg_path: &Path,
+    prefix: &Path,
+) -> Result<BottlePrefixTransaction, CellarError> {
+    let bottle_root = keg_path.join(".bottle");
+    if !bottle_root.exists() {
+        return Ok(BottlePrefixTransaction::default());
+    }
+
+    let mut transaction = BottlePrefixTransaction::default();
+    let outcome = (|| -> Result<(), CellarError> {
+        for subdir in ["etc", "var"] {
+            let source_root = bottle_root.join(subdir);
+            if source_root.is_dir() {
+                install_bottle_subtree(
+                    &source_root,
+                    &source_root,
+                    &prefix.join(subdir),
+                    &mut transaction,
+                )?;
+                remove_empty_dir_if_exists(&source_root)?;
+            }
+        }
+        remove_empty_dir_if_exists(&bottle_root)?;
+        Ok(())
+    })();
+
+    match outcome {
+        Ok(()) => Ok(transaction),
+        Err(error) => {
+            if let Err(rollback_err) = transaction.rollback() {
+                tracing::warn!(
+                    ?rollback_err,
+                    "failed to rollback bottle prefix transaction after install_bottle_etc_var error"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Copies a directory tree, trying `clonefile(2)` first on macOS, falling back
 /// to recursive copy.
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
@@ -160,6 +254,213 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::
         }
     }
     Ok(())
+}
+
+fn install_bottle_subtree(
+    source_root: &Path,
+    current_source: &Path,
+    dest_root: &Path,
+    transaction: &mut BottlePrefixTransaction,
+) -> Result<(), CellarError> {
+    for entry in std::fs::read_dir(current_source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let rel_path = source_path
+            .strip_prefix(source_root)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let dest_path = validated_dest_path(dest_root, rel_path)?;
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            ensure_dir_exists(&dest_path, transaction)?;
+            install_bottle_subtree(source_root, &source_path, dest_root, transaction)?;
+            remove_empty_dir_if_exists(&source_path)?;
+            continue;
+        }
+
+        if let Some(parent) = dest_path.parent() {
+            ensure_dir_exists(parent, transaction)?;
+        }
+
+        if file_type.is_symlink() {
+            install_bottle_symlink(&source_path, &dest_path, transaction)?;
+        } else {
+            install_bottle_file(&source_path, &dest_path, transaction)?;
+        }
+    }
+    Ok(())
+}
+
+fn validated_dest_path(dest_root: &Path, rel_path: &Path) -> Result<PathBuf, CellarError> {
+    let joined = dest_root.join(rel_path);
+    let normalized = fs::normalize_absolute_path(&joined).ok_or_else(|| {
+        CellarError::UnsupportedPostInstallSyntax {
+            message: format!("bottle path escapes prefix root: {}", joined.display()),
+        }
+    })?;
+    if normalized.starts_with(dest_root) {
+        return Ok(normalized);
+    }
+    Err(CellarError::UnsupportedPostInstallSyntax {
+        message: format!("bottle path escapes prefix root: {}", normalized.display()),
+    })
+}
+
+fn ensure_dir_exists(
+    dir: &Path,
+    transaction: &mut BottlePrefixTransaction,
+) -> Result<(), CellarError> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    // Record every new ancestor, not just the leaf, so rollback removes all created levels.
+    let mut to_create = Vec::new();
+    let mut current = dir;
+    while !current.exists() {
+        to_create.push(current.to_path_buf());
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => break,
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    // Record parents before children so rollback (which iterates reversed)
+    // removes children before their parents.
+    for path in to_create.into_iter().rev() {
+        transaction.record(path);
+    }
+    Ok(())
+}
+
+fn install_bottle_file(
+    source_path: &Path,
+    dest_path: &Path,
+    transaction: &mut BottlePrefixTransaction,
+) -> Result<(), CellarError> {
+    let (target_path, target_preexisting) =
+        choose_install_destination_for_file(source_path, dest_path)?;
+    if target_path == dest_path && target_preexisting {
+        std::fs::remove_file(source_path)?;
+        return Ok(());
+    }
+    if target_path != dest_path && target_preexisting && files_identical(source_path, &target_path)?
+    {
+        std::fs::remove_file(source_path)?;
+        return Ok(());
+    }
+
+    fs::make_writable(&target_path)?;
+    std::fs::copy(source_path, &target_path)?;
+    if !target_preexisting {
+        transaction.record(target_path);
+    }
+    std::fs::remove_file(source_path)?;
+    Ok(())
+}
+
+fn install_bottle_symlink(
+    source_path: &Path,
+    dest_path: &Path,
+    transaction: &mut BottlePrefixTransaction,
+) -> Result<(), CellarError> {
+    let target = std::fs::read_link(source_path)?;
+    if target.is_absolute() {
+        return Err(CellarError::UnsupportedPostInstallSyntax {
+            message: format!(
+                "absolute symlink in bottle: {} -> {}",
+                source_path.display(),
+                target.display()
+            ),
+        });
+    }
+
+    let (target_path, already_correct) =
+        choose_install_destination_for_symlink(&target, dest_path)?;
+    if already_correct {
+        std::fs::remove_file(source_path)?;
+        return Ok(());
+    }
+
+    let target_preexisting = target_path.symlink_metadata().is_ok();
+    if target_preexisting {
+        if symlink_target_matches(&target_path, &target)? {
+            std::fs::remove_file(source_path)?;
+            return Ok(());
+        }
+        fs::make_writable(&target_path)?;
+        std::fs::remove_file(&target_path)?;
+    }
+    std::os::unix::fs::symlink(&target, &target_path)?;
+    if !target_preexisting {
+        transaction.record(target_path);
+    }
+    std::fs::remove_file(source_path)?;
+    Ok(())
+}
+
+fn choose_install_destination_for_file(
+    source_path: &Path,
+    dest_path: &Path,
+) -> Result<(PathBuf, bool), CellarError> {
+    if !dest_path.exists() {
+        return Ok((dest_path.to_path_buf(), false));
+    }
+    if files_identical(source_path, dest_path)? {
+        return Ok((dest_path.to_path_buf(), true));
+    }
+    let default = default_install_path(dest_path);
+    let exists = default.exists();
+    Ok((default, exists))
+}
+
+fn choose_install_destination_for_symlink(
+    target: &Path,
+    dest_path: &Path,
+) -> Result<(PathBuf, bool), CellarError> {
+    if dest_path.symlink_metadata().is_err() {
+        return Ok((dest_path.to_path_buf(), false));
+    }
+    if symlink_target_matches(dest_path, target)? {
+        return Ok((dest_path.to_path_buf(), true));
+    }
+    Ok((default_install_path(dest_path), false))
+}
+
+fn default_install_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.default", path.display()))
+}
+
+fn files_identical(source: &Path, dest: &Path) -> Result<bool, CellarError> {
+    match std::fs::read(dest) {
+        Ok(dest_bytes) => Ok(std::fs::read(source)? == dest_bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CellarError::from(error)),
+    }
+}
+
+fn symlink_target_matches(path: &Path, target: &Path) -> Result<bool, CellarError> {
+    match std::fs::read_link(path) {
+        Ok(existing_target) => Ok(existing_target == target),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CellarError::from(error)),
+    }
+}
+
+fn remove_empty_dir_if_exists(path: &Path) -> Result<(), CellarError> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::DirectoryNotEmpty
+                    | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(CellarError::from(error)),
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +667,150 @@ mod tests {
 
         assert!(keg_path.join("file.txt").exists());
         assert!(opt_dir.join("formula").is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_bottle_etc_var_moves_files_into_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/demo/1.0");
+
+        std::fs::create_dir_all(keg_path.join(".bottle/etc/demo"))?;
+        std::fs::write(keg_path.join(".bottle/etc/demo/config.toml"), "demo=true\n")?;
+
+        let transaction = install_bottle_etc_var(&keg_path, &prefix)?;
+
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("etc/demo/config.toml"))?,
+            "demo=true\n"
+        );
+        assert!(!keg_path.join(".bottle/etc/demo/config.toml").exists());
+
+        transaction.commit();
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_bottle_etc_var_writes_default_for_differing_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/demo/1.0");
+
+        std::fs::create_dir_all(prefix.join("etc/demo"))?;
+        std::fs::write(prefix.join("etc/demo/config.toml"), "user=true\n")?;
+        std::fs::create_dir_all(keg_path.join(".bottle/etc/demo"))?;
+        std::fs::write(keg_path.join(".bottle/etc/demo/config.toml"), "demo=true\n")?;
+
+        let transaction = install_bottle_etc_var(&keg_path, &prefix)?;
+
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("etc/demo/config.toml"))?,
+            "user=true\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("etc/demo/config.toml.default"))?,
+            "demo=true\n"
+        );
+
+        transaction.commit();
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_bottle_etc_var_skips_identical_existing_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/demo/1.0");
+
+        std::fs::create_dir_all(prefix.join("etc/demo"))?;
+        std::fs::write(prefix.join("etc/demo/config.toml"), "demo=true\n")?;
+        std::fs::create_dir_all(keg_path.join(".bottle/etc/demo"))?;
+        std::fs::write(keg_path.join(".bottle/etc/demo/config.toml"), "demo=true\n")?;
+
+        let transaction = install_bottle_etc_var(&keg_path, &prefix)?;
+
+        assert!(!prefix.join("etc/demo/config.toml.default").exists());
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("etc/demo/config.toml"))?,
+            "demo=true\n"
+        );
+
+        transaction.commit();
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_bottle_etc_var_preserves_relative_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/kafka/4.2.0");
+
+        std::fs::create_dir_all(keg_path.join(".bottle/etc/kafka"))?;
+        std::fs::write(
+            keg_path.join(".bottle/etc/kafka/server.properties"),
+            "logs=1\n",
+        )?;
+        std::fs::create_dir_all(keg_path.join("libexec"))?;
+        std::os::unix::fs::symlink("../../../../etc/kafka", keg_path.join("libexec/config"))?;
+
+        let transaction = install_bottle_etc_var(&keg_path, &prefix)?;
+
+        assert_eq!(
+            std::fs::read_link(keg_path.join("libexec/config"))?,
+            PathBuf::from("../../../../etc/kafka")
+        );
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("etc/kafka/server.properties"))?,
+            "logs=1\n"
+        );
+
+        transaction.commit();
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_bottle_etc_var_rolls_back_created_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/demo/1.0");
+
+        std::fs::create_dir_all(keg_path.join(".bottle/var/demo"))?;
+        std::fs::write(keg_path.join(".bottle/var/demo/state.txt"), "demo\n")?;
+
+        let transaction = install_bottle_etc_var(&keg_path, &prefix)?;
+        transaction.rollback()?;
+
+        assert!(!prefix.join("var/demo/state.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_bottle_etc_var_rolls_back_prefix_on_error_after_etc_succeeds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let prefix = dir.path().join("prefix");
+        let keg_path = prefix.join("Cellar/demo/1.0");
+
+        std::fs::create_dir_all(keg_path.join(".bottle/etc/demo"))?;
+        std::fs::write(keg_path.join(".bottle/etc/demo/config.toml"), "ok\n")?;
+        std::fs::create_dir_all(keg_path.join(".bottle/var"))?;
+        std::os::unix::fs::symlink("/abs-target", keg_path.join(".bottle/var/bad"))?;
+
+        let result = install_bottle_etc_var(&keg_path, &prefix);
+        assert!(
+            result.is_err(),
+            "absolute symlink under .bottle/var should fail"
+        );
+
+        assert!(!prefix.join("etc/demo/config.toml").exists());
+        assert!(!prefix.join("etc/demo").exists());
+        assert!(!prefix.join("etc").exists());
         Ok(())
     }
 }

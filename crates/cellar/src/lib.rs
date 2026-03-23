@@ -15,7 +15,9 @@ pub mod state;
 pub use discover::{InstalledKeg, discover_installed_kegs, find_installed_keg};
 pub use error::CellarError;
 pub use link::{link, unlink};
-pub use materialize::{atomic_symlink_replace, materialize};
+pub use materialize::{
+    BottlePrefixTransaction, atomic_symlink_replace, install_bottle_etc_var, materialize,
+};
 pub use post_install::{
     PlatformContext, PostInstallContext, PostInstallTransaction, extract_post_install_block,
     lower_post_install, lower_post_install_tier2, run_post_install, validate_post_install,
