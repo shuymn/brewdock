@@ -38,13 +38,15 @@ analyze → {formula, analysis}
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
 - `brewdock-sys`: platform-specific FFI wrappers (macOS `clonefile(2)`). No other crate dependency. Only crate where `unsafe` is allowed.
 - `brewdock-analysis`: Prism-backed `post_install` parse, AST lowering, schema normalization, and validation. Pure analysis with no filesystem I/O. No core or cellar dependency.
-- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, `post_install` execution with rollback. Depends on analysis, formula (types only), and sys (macOS only).
-- `brewdock-core`: Layout, platform (`HostTag` auto-detection), lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, diagnostics, and user-facing progress event emission. Depends on formula, bottle, cellar.
+- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, `post_install` execution with rollback. Public `post_install.rs` owns context and entrypoints; private `post_install/{execute,rollback}.rs` own statement execution and rollback mechanics. Depends on analysis, formula (types only), and sys (macOS only).
+- `brewdock-core`: Layout, platform (`HostTag` auto-detection), lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, diagnostics, and user-facing progress event emission. Public `orchestrate.rs` remains the entrypoint while private `orchestrate/{planning,query,execution}.rs` and `source_build/{archive,runner}.rs` own split mechanics. Depends on formula, bottle, cellar.
 - `brewdock-cli`: clap commands (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`), tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only. Binary name: `bd`.
 - `brewdock-analyze`: standalone formula compatibility analysis tool. Depends on formula and analysis only — no core, cellar, or sys dependency. Binary name: `bd-analyze`.
 
 Layout lives in core. Lower crates receive paths as `&Path` arguments, never depend on Layout directly.
-Core orchestration modules should own phase ordering and rollback policy; source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
+Core orchestration modules should own phase ordering and rollback policy; current internal splits follow that rule (`query` / `planning` / `execution` in `brewdock-core`, `archive` / `runner` in `source_build`).
+Source build execution details, receipt/finalize helpers, and similar low-level mechanics belong in private helper modules under `brewdock-core`, not in the public orchestration entrypoint itself.
+`brewdock-cellar` keeps `post_install` as a thin entrypoint over private `execute` and `rollback` helpers so the fail-closed runtime boundary stays explicit.
 Install orchestration is stage-driven via an explicit execution plan:
 
 ```mermaid
