@@ -37,8 +37,8 @@ analyze → {formula, analysis}
 - `brewdock-formula`: types, API client, bottle selection, install method planning inputs, dep resolve, metadata cache and index. No core dependency.
 - `brewdock-bottle`: download, SHA256 verify, extract, CAS store. Depends on formula (types only).
 - `brewdock-sys`: platform-specific FFI wrappers (macOS `clonefile(2)`). No other crate dependency. Only crate where `unsafe` is allowed.
-- `brewdock-analysis`: Prism-backed `post_install` parse, AST lowering, schema normalization, and validation. Pure analysis with no filesystem I/O. No core or cellar dependency.
-- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, `post_install` execution with rollback. Public `post_install.rs` owns context and entrypoints; private `post_install/{execute,rollback}.rs` own statement execution and rollback mechanics. Depends on analysis, formula (types only), and sys (macOS only).
+- `brewdock-analysis`: Prism-backed `post_install` parse, AST lowering, schema normalization, validation, and restricted `test do` lowering. Pure analysis with no filesystem I/O. No core or cellar dependency.
+- `brewdock-cellar`: materialize (with `clonefile` COW copy on macOS), receipt, relocation, linking, keg discovery, SQLite state, `post_install` execution with rollback, and restricted `test do` runtime execution. Public `post_install.rs` and `test_do.rs` own entrypoints; private `post_install/{execute,rollback}.rs` own post-install execution and rollback mechanics. Depends on analysis, formula (types only), and sys (macOS only).
 - `brewdock-core`: Layout, platform (`HostTag` auto-detection), lock, orchestration (install/upgrade), install method resolution, source build coordination, error aggregation, diagnostics, and user-facing progress event emission. Public `orchestrate.rs` remains the entrypoint while private `orchestrate/{planning,query,execution}.rs` and `source_build/{archive,runner}.rs` own split mechanics. Depends on formula, bottle, cellar.
 - `brewdock-cli`: clap commands (`install`, `update`, `upgrade`, `outdated`, `search`, `info`, `list`, `cleanup`, `doctor`), tokio runtime, `indicatif`-based progress rendering, and static result formatting. Depends on core only. Binary name: `bd`.
 - `brewdock-analyze`: standalone formula compatibility analysis tool. Depends on formula and analysis only — no core, cellar, or sys dependency. Binary name: `bd-analyze`.
@@ -95,12 +95,13 @@ Test isolation: code never hardcodes `/opt/homebrew`. `Layout::with_root(tempdir
 | Logging | explicit progress events for user-facing output; `tracing` + `tracing-subscriber` for diagnostics and benchmark capture | Keeps terminal UX stable while preserving structured benchmark data and developer diagnostics |
 | Bottle selection | Compatible tag fallback (`arm64_sequoia -> arm64_sonoma -> arm64_ventura -> all`) | Matches target Homebrew usage without requiring exact host tag parity |
 | `post_install` execution | Parse full `homebrew/core` Ruby source with `ruby-prism` in `brewdock-analysis`, lower only allowlisted AST shapes into internal operations, then normalize reachable filesystem effects into fixed schemas before execution in `brewdock-cellar` | Removes Ruby runtime dependency while replacing formula-specific builtins with fail-closed generic lowering and normalization; analysis/execution split enables standalone compatibility scanning |
+| `test do` execution | Parse full `homebrew/core` Ruby source with `ruby-prism` in `brewdock-analysis`, lower only the allowed `test do` subset into internal test operations, then execute them inside a temporary `testpath` sandbox in `brewdock-cellar` | Keeps `test do` support native and fail-closed while tracking runtime coverage independently from parse coverage |
 | Source fallback | Generic build driver (`cmake`/`configure`/`meson`/`make`) | Enables a small first source path without full Formula DSL compatibility |
 | Ruby compatibility escape hatch | Not on the default path; if introduced later, keep it opt-in and clearly marked | Avoids collapsing the native fail-closed model into an implicit Ruby execution client |
 
 ## Open Questions
 
-None blocking. Decision records: [ADR 0001](adr/0001-nanobrew-install-method.md), [ADR 0002](adr/0002-user-facing-progress-output.md), [ADR 0003](adr/0003-copy-strategy-next-step.md), [ADR 0004](adr/0004-three-tier-post-install-strategy.md).
+None blocking. Decision records: [ADR 0001](adr/0001-nanobrew-install-method.md), [ADR 0002](adr/0002-user-facing-progress-output.md), [ADR 0003](adr/0003-copy-strategy-next-step.md), [ADR 0004](adr/0004-three-tier-post-install-strategy.md), [ADR 0005](adr/0005-test-do-runtime-v1.md).
 
 ## Revisit Trigger
 
