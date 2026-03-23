@@ -81,6 +81,7 @@ readonly DEFAULT_FORMULAE=(
   zsh-fast-syntax-highlighting
 )
 readonly PRIMARY_FORMULA="jq"
+readonly PRIMARY_FORMULA_DEP="oniguruma"
 readonly DRY_RUN_FORMULA="ripgrep"
 
 # Formulae for cross-compatibility tests (bd ↔ brew).
@@ -671,6 +672,26 @@ for formula in "${CROSS_TEST_BD_TO_BREW[@]}"; do
     continue
   fi
   pass "brew recognizes $formula"
+
+  if [ "$formula" = "$PRIMARY_FORMULA" ]; then
+    log "  brew reinstall $formula"
+    brew_reinstall_output=$(vm_ssh "/opt/homebrew/bin/brew reinstall $formula" 2>&1 || true)
+    echo "$brew_reinstall_output"
+    if ! echo "$brew_reinstall_output" | grep -q "Pouring $formula"; then
+      record_cross_result "bd→brew-reinstall:$formula" "FAIL" "brew reinstall failed"
+      continue
+    fi
+
+    if ! vm_ssh "test -f /opt/homebrew/Cellar/$formula/*/INSTALL_RECEIPT.json && test -f /opt/homebrew/Cellar/$PRIMARY_FORMULA_DEP/*/INSTALL_RECEIPT.json" >/dev/null 2>&1; then
+      record_cross_result "bd→brew-reinstall:$formula" "FAIL" "receipt missing after brew reinstall"
+      continue
+    fi
+    if ! vm_ssh "export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\" && jq --version" >/dev/null 2>&1; then
+      record_cross_result "bd→brew-reinstall:$formula" "FAIL" "jq broken after brew reinstall"
+      continue
+    fi
+    pass "brew reinstall $formula after bd install"
+  fi
 
   log "  brew upgrade $formula"
   brew_upgrade_output=$(vm_ssh "/opt/homebrew/bin/brew upgrade $formula" 2>&1 || true)
