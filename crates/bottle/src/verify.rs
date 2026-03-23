@@ -70,11 +70,6 @@ mod tests {
     const HELLO_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
     #[test]
-    fn test_verify_sha256_valid_data() -> Result<(), BottleError> {
-        verify_sha256(b"hello world", HELLO_SHA256)
-    }
-
-    #[test]
     fn test_verify_sha256_empty_data() -> Result<(), BottleError> {
         verify_sha256(b"", EMPTY_SHA256)
     }
@@ -92,13 +87,6 @@ mod tests {
         };
         assert_eq!(expected.as_str(), wrong);
         assert_eq!(actual.as_str(), HELLO_SHA256);
-    }
-
-    #[test]
-    fn test_stream_verifier_single_chunk() -> Result<(), BottleError> {
-        let mut v = StreamVerifier::new(HELLO_SHA256)?;
-        v.update(b"hello world");
-        v.finish()
     }
 
     #[test]

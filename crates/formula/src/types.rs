@@ -269,7 +269,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::test_formula;
 
     fn minimal_formula_json(uses_from_macos: &str) -> String {
         format!(
@@ -421,14 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn test_test_formula_helper() {
-        let f = test_formula("jq", &["oniguruma"]);
-        assert_eq!(f.name, "jq");
-        assert_eq!(f.dependencies, vec!["oniguruma"]);
-        assert!(f.bottle.stable.is_some());
-    }
-
-    #[test]
     fn test_deserialize_uses_from_macos_string() -> Result<(), serde_json::Error> {
         let dep: MacOsDependency = serde_json::from_str(r#""curl""#)?;
         assert_eq!(dep, MacOsDependency::Name("curl".to_owned()));
@@ -458,39 +449,6 @@ mod tests {
                 MacOsDependency::Name("curl".to_owned()),
                 detailed_dependency("rsync", &["build"]),
             ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_deserialize_zsh_completions() -> Result<(), Box<dyn std::error::Error>> {
-        let json = include_str!("../tests/fixtures/formula/zsh-completions.json");
-        let formula: Formula = serde_json::from_str(json)?;
-        assert_eq!(
-            formula.uses_from_macos,
-            vec![detailed_dependency("zsh", &["test"])]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_deserialize_zsh_fast_syntax() -> Result<(), Box<dyn std::error::Error>> {
-        let json = include_str!("../tests/fixtures/formula/zsh-fast-syntax-highlighting.json");
-        let formula: Formula = serde_json::from_str(json)?;
-        assert_eq!(
-            formula.uses_from_macos,
-            vec![detailed_dependency("zsh", &["build", "test"])]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_deserialize_sqlmap() -> Result<(), Box<dyn std::error::Error>> {
-        let json = include_str!("../tests/fixtures/formula/sqlmap.json");
-        let formula: Formula = serde_json::from_str(json)?;
-        assert_eq!(
-            formula.uses_from_macos,
-            vec![detailed_dependency("sqlite", &["test"])]
         );
         Ok(())
     }

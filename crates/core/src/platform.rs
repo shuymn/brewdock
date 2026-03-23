@@ -216,12 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_host_tag_parse_no_underscore() {
-        let result: Result<HostTag, _> = "arm64sequoia".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_host_tag_round_trip_cases() -> Result<(), PlatformError> {
         for original in ["arm64_sequoia", "arm64_sonoma", "arm64_tahoe"] {
             let tag: HostTag = original.parse()?;

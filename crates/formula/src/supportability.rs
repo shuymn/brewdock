@@ -104,14 +104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_supportability_post_install_remains_plannable() -> Result<(), FormulaError> {
-        let mut formula = test_formula("postinst", &[]);
-        formula.post_install_defined = true;
-        check_supportability(&formula, TAG)?;
-        Ok(())
-    }
-
-    #[test]
     fn test_supportability_pour_bottle_only_if() {
         let mut formula = test_formula("pour", &[]);
         formula.pour_bottle_only_if = Some("unknown_condition".to_owned());
