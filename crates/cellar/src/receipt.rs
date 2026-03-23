@@ -117,8 +117,16 @@ impl InstallReceipt {
             aliases: Vec::new(),
             runtime_dependencies,
             source,
-            arch: std::env::consts::ARCH.to_owned(),
+            arch: canonical_homebrew_arch(std::env::consts::ARCH).to_owned(),
         }
+    }
+}
+
+fn canonical_homebrew_arch(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => arch,
     }
 }
 
@@ -225,6 +233,10 @@ mod tests {
         assert_eq!(value["source"]["tap"].as_str(), Some("homebrew/core"));
         assert_eq!(value["source"]["spec"].as_str(), Some("stable"));
         assert_eq!(value["source"]["versions"]["stable"].as_str(), Some("1.7"));
+        assert_eq!(
+            value["arch"].as_str(),
+            Some(canonical_homebrew_arch(std::env::consts::ARCH))
+        );
 
         let deps = value["runtime_dependencies"]
             .as_array()
@@ -254,9 +266,26 @@ mod tests {
     }
 
     #[test]
-    fn test_receipt_arch_matches_runtime() {
+    fn test_receipt_arch_matches_homebrew_canonical_value() {
         let receipt = sample_receipt();
-        assert_eq!(receipt.arch, std::env::consts::ARCH);
+        assert_eq!(
+            receipt.arch,
+            canonical_homebrew_arch(std::env::consts::ARCH)
+        );
+    }
+
+    #[test]
+    fn test_canonical_homebrew_arch_normalizes_known_values() {
+        let cases = [
+            ("aarch64", "arm64"),
+            ("arm64", "arm64"),
+            ("x86_64", "x86_64"),
+            ("mips64", "mips64"),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(canonical_homebrew_arch(raw), expected, "raw arch {raw}");
+        }
     }
 
     #[test]
