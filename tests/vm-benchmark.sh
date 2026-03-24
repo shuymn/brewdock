@@ -23,6 +23,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$SCRIPT_DIR/vm-config.sh"
 
 readonly DEFAULT_FORMULAE=(
   tree
@@ -37,7 +38,7 @@ readonly DEFAULT_MANAGERS=(
   homebrew
 )
 
-BASE_IMAGE="ghcr.io/cirruslabs/macos-sequoia-base:latest"
+BASE_IMAGE="$BREWDOCK_VM_BASE_IMAGE"
 VM_NAME="brewdock-benchmark-$$"
 SSH_USER="admin"
 SSH_PASS="admin"
