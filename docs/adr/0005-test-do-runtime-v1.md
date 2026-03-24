@@ -13,8 +13,7 @@ v1 として restricted `test do` runtime を導入する。
 - `brewdock-analysis` は `test do` を feature census に加えて runtime IR (`TestProgram`) に lower する
 - `brewdock-cellar` は `run_test_do` と `TestDoContext` を持ち、temporary `testpath` sandbox 内でだけ副作用を許可する
 - v1 subset は以下に限定する
-  - `assert_match`
-  - `assert_equal`
+  - `assert_match`, `assert_equal`
   - `shell_output(command[, expected_status])`
   - `system`
   - `testpath/"..."` と `.write`
@@ -22,6 +21,15 @@ v1 として restricted `test do` runtime を導入する。
   - `version.to_s`
   - local variable assignment / read
   - `.chomp`
+- v1.1 で以下を追加:
+  - bare `version` (= `version.to_s` と同等)
+  - `assert_path_exists`, `refute_path_exists`
+  - `refute_match`
+  - `mkpath`, `touch`
+  - `pipe_output(command, stdin[, expected_status])`
+  - `.strip`, `.read`
+  - `if OS.mac?` / `unless OS.mac?` 静的折り畳み (macOS 前提)
+  - 追加 path bases: `include`, `lib`, `libexec`, `pkgshare`, `sbin`, `share`
 - unsupported syntax は lower 時に fail-closed にする
 - runtime error は command failure / assertion failure / path validation failure を分けて報告する
 
@@ -35,7 +43,8 @@ v1 として restricted `test do` runtime を導入する。
 
 - `test do` の runtime support は parse support と分離して追跡できる
 - v1 は `testpath` sandbox 内に副作用を閉じ込められる
-- 次段階では `ENV`, `assert_path_exists`, `pipe_output`, `mkpath` を追加候補にできる
+- v1.1 で top-100 の td_rt coverage が ~23% → ~39% に改善
+- 次段階では `ENV` (read/write/compiler methods), `resource` blocks, `require`, `free_port`, `cp`/`cp_r`, `cd` を追加候補にできる
 
 ## Revisit Trigger
 
