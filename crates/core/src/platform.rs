@@ -1,5 +1,6 @@
 use std::{fmt, str::FromStr};
 
+use brewdock_cellar::{PlatformContext, canonical_homebrew_arch};
 use strum::{Display, EnumString};
 
 /// A platform identifier for Homebrew bottles (e.g., `arm64_sequoia`).
@@ -13,6 +14,24 @@ impl HostTag {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Returns the Homebrew arch portion of the host tag.
+    #[must_use]
+    pub fn arch(&self) -> &str {
+        self.0.split_once('_').map_or("", |(arch, _)| arch)
+    }
+
+    /// Returns the macOS codename portion of the host tag.
+    #[must_use]
+    pub fn macos_codename(&self) -> Option<&str> {
+        self.0.split_once('_').map(|(_, codename)| codename)
+    }
+
+    /// Returns the macOS major version implied by the host tag codename.
+    #[must_use]
+    pub fn macos_major(&self) -> Option<u16> {
+        self.macos_codename().and_then(macos_major_from_codename)
     }
 
     /// Detects the host tag for the current macOS system.
@@ -69,6 +88,15 @@ impl HostTag {
     #[cfg(not(target_os = "macos"))]
     pub const fn detect() -> Result<Self, PlatformError> {
         Err(PlatformError::Unsupported)
+    }
+}
+
+#[must_use]
+pub(crate) fn detect_platform_context() -> PlatformContext {
+    PlatformContext {
+        kernel_version_major: detect_kernel_version_major(),
+        macos_version: detect_macos_version(),
+        cpu_arch: detect_cpu_arch(),
     }
 }
 
@@ -184,18 +212,56 @@ pub enum PlatformError {
     Detection(String),
 }
 
-/// Maps a macOS major version to its codename.
+const MACOS_VERSIONS: &[(u16, &str)] = &[
+    (26, "tahoe"),
+    (15, "sequoia"),
+    (14, "sonoma"),
+    (13, "ventura"),
+    (12, "monterey"),
+    (11, "big_sur"),
+];
+
 #[cfg(target_os = "macos")]
-const fn macos_codename(major: u16) -> Result<&'static str, PlatformError> {
-    match major {
-        26 => Ok("tahoe"),
-        15 => Ok("sequoia"),
-        14 => Ok("sonoma"),
-        13 => Ok("ventura"),
-        12 => Ok("monterey"),
-        11 => Ok("big_sur"),
-        _ => Err(PlatformError::Unsupported),
-    }
+fn macos_codename(major: u16) -> Result<&'static str, PlatformError> {
+    MACOS_VERSIONS
+        .iter()
+        .find(|(m, _)| *m == major)
+        .map(|(_, name)| *name)
+        .ok_or(PlatformError::Unsupported)
+}
+
+fn macos_major_from_codename(codename: &str) -> Option<u16> {
+    MACOS_VERSIONS
+        .iter()
+        .find(|(_, name)| *name == codename)
+        .map(|(major, _)| *major)
+}
+
+fn detect_kernel_version_major() -> String {
+    std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let version = String::from_utf8_lossy(&output.stdout);
+            version.trim().split('.').next().map(ToOwned::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+fn detect_macos_version() -> String {
+    std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn detect_cpu_arch() -> String {
+    canonical_homebrew_arch(std::env::consts::ARCH).to_owned()
 }
 
 #[cfg(test)]
@@ -226,6 +292,15 @@ mod tests {
                 "to_string mismatch for {original}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_host_tag_accessors() -> Result<(), PlatformError> {
+        let tag: HostTag = "arm64_sequoia".parse()?;
+        assert_eq!(tag.arch(), "arm64");
+        assert_eq!(tag.macos_codename(), Some("sequoia"));
+        assert_eq!(tag.macos_major(), Some(15));
         Ok(())
     }
 
