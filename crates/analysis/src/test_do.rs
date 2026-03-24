@@ -31,6 +31,19 @@ pub enum TestStatement {
         expected: TestExpr,
         actual: TestExpr,
     },
+    /// Create a directory (and parents) under `testpath`.
+    Mkpath(TestPathExpr),
+    /// Create an empty file (or update mtime) under `testpath`.
+    Touch(TestExpr),
+    /// Assert that `actual` does NOT contain `expected`.
+    RefuteMatch {
+        expected: TestExpr,
+        actual: TestExpr,
+    },
+    /// Assert that a path exists on the filesystem.
+    AssertPathExists { path: TestExpr },
+    /// Assert that a path does NOT exist on the filesystem.
+    RefutePathExists { path: TestExpr },
 }
 
 /// Lowered test expression.
@@ -51,8 +64,21 @@ pub enum TestExpr {
         /// Optional expected exit code.
         expected_status: Option<i32>,
     },
+    /// Command output captured from the shell with stdin piped.
+    PipeOutput {
+        /// Shell command string.
+        command: TestStringExpr,
+        /// Content piped to stdin.
+        stdin: Box<Self>,
+        /// Optional expected exit code.
+        expected_status: Option<i32>,
+    },
     /// Strip a trailing newline sequence.
     Chomp(Box<Self>),
+    /// Strip leading and trailing whitespace.
+    Strip(Box<Self>),
+    /// Read the contents of a file.
+    ReadFile(TestPathExpr),
 }
 
 /// String expression with literal and interpolated parts.
@@ -103,6 +129,18 @@ pub enum TestPathBase {
     Prefix,
     /// `prefix/bin`.
     Bin,
+    /// `prefix/include`.
+    Include,
+    /// `prefix/lib`.
+    Lib,
+    /// `prefix/libexec`.
+    Libexec,
+    /// `prefix/share/<formula_name>`.
+    Pkgshare,
+    /// `prefix/sbin`.
+    Sbin,
+    /// `prefix/share`.
+    Share,
 }
 
 /// Allowed path expression in the v1 `test do` runtime.
@@ -313,17 +351,101 @@ fn lower_body_node(
     parsed: &ParseResult<'_>,
     body: &Node<'_>,
 ) -> Result<Vec<TestStatement>, AnalysisError> {
-    let children = if let Some(statements) = body.as_statements_node() {
-        statements.body().iter().collect::<Vec<_>>()
-    } else {
+    let Some(statements) = body.as_statements_node() else {
         return Err(unsupported_test("unsupported test do body"));
     };
+    lower_statements_opt(parsed, Some(statements))
+}
 
-    let mut lowered = Vec::with_capacity(children.len());
-    for child in children {
+fn predicate_is_os_call(node: &Node<'_>, method: &str) -> Result<bool, AnalysisError> {
+    let Some(call) = node.as_call_node() else {
+        return Ok(false);
+    };
+    if call_name(&call)? != method {
+        return Ok(false);
+    }
+    let Some(receiver) = call.receiver() else {
+        return Ok(false);
+    };
+    let Some(receiver) = receiver.as_constant_read_node() else {
+        return Ok(false);
+    };
+    Ok(constant_name(&receiver.name())? == "OS")
+}
+
+fn lower_statements_opt(
+    parsed: &ParseResult<'_>,
+    statements: Option<ruby_prism::StatementsNode<'_>>,
+) -> Result<Vec<TestStatement>, AnalysisError> {
+    let Some(statements) = statements else {
+        return Ok(Vec::new());
+    };
+    let mut lowered = Vec::new();
+    for child in &statements.body() {
+        if let Some(if_node) = child.as_if_node() {
+            lowered.extend(lower_if_os(parsed, &if_node)?);
+            continue;
+        }
+        if let Some(unless_node) = child.as_unless_node() {
+            lowered.extend(lower_unless_os(parsed, &unless_node)?);
+            continue;
+        }
         lowered.push(lower_statement(parsed, &child)?);
     }
     Ok(lowered)
+}
+
+fn lower_if_os(
+    parsed: &ParseResult<'_>,
+    if_node: &ruby_prism::IfNode<'_>,
+) -> Result<Vec<TestStatement>, AnalysisError> {
+    // `if OS.mac?` — on macOS: true → take then-branch
+    if predicate_is_os_call(&if_node.predicate(), "mac?")? {
+        return lower_statements_opt(parsed, if_node.statements());
+    }
+    // `if OS.linux?` — on macOS: false → take else-branch
+    if predicate_is_os_call(&if_node.predicate(), "linux?")? {
+        return lower_else_branch(parsed, if_node.subsequent());
+    }
+    Err(unsupported_test(&format!(
+        "unsupported test do statement: {}",
+        node_source(parsed, &if_node.predicate())?
+    )))
+}
+
+fn lower_unless_os(
+    parsed: &ParseResult<'_>,
+    unless_node: &ruby_prism::UnlessNode<'_>,
+) -> Result<Vec<TestStatement>, AnalysisError> {
+    // `unless OS.mac?` — on macOS: true → skip body
+    if predicate_is_os_call(&unless_node.predicate(), "mac?")? {
+        return Ok(Vec::new());
+    }
+    // `unless OS.linux?` — on macOS: false → take body
+    if predicate_is_os_call(&unless_node.predicate(), "linux?")? {
+        return lower_statements_opt(parsed, unless_node.statements());
+    }
+    Err(unsupported_test(&format!(
+        "unsupported test do statement: {}",
+        node_source(parsed, &unless_node.predicate())?
+    )))
+}
+
+fn lower_else_branch(
+    parsed: &ParseResult<'_>,
+    subsequent: Option<Node<'_>>,
+) -> Result<Vec<TestStatement>, AnalysisError> {
+    let Some(subsequent) = subsequent else {
+        return Ok(Vec::new());
+    };
+    if let Some(else_node) = subsequent.as_else_node() {
+        return lower_statements_opt(parsed, else_node.statements());
+    }
+    // elsif → treat as nested if
+    if let Some(if_node) = subsequent.as_if_node() {
+        return lower_if_os(parsed, &if_node);
+    }
+    Err(unsupported_test("unsupported else branch"))
 }
 
 fn lower_statement(
@@ -368,6 +490,12 @@ fn lower_call_statement(
                     content: parse_expr(parsed, &arguments[0])?,
                 })
             }
+            "mkpath" => {
+                let TestExpr::Path(path) = receiver else {
+                    return Err(unsupported_test("mkpath receiver must be a path"));
+                };
+                Ok(TestStatement::Mkpath(path))
+            }
             _ => Err(unsupported_test(&format!(
                 "unsupported test do call: {name}"
             ))),
@@ -410,6 +538,43 @@ fn lower_call_statement(
                 expected: parse_expr(parsed, &arguments[0])?,
                 actual: parse_expr(parsed, &arguments[1])?,
             })
+        }
+        "refute_match" => {
+            let arguments = call_args(call);
+            if arguments.len() != 2 {
+                return Err(unsupported_test(
+                    "refute_match expects exactly two arguments",
+                ));
+            }
+            Ok(TestStatement::RefuteMatch {
+                expected: parse_expr(parsed, &arguments[0])?,
+                actual: parse_expr(parsed, &arguments[1])?,
+            })
+        }
+        "assert_path_exists" => {
+            let arguments = call_args(call);
+            if arguments.is_empty() || arguments.len() > 2 {
+                return Err(unsupported_test("assert_path_exists expects 1-2 arguments"));
+            }
+            Ok(TestStatement::AssertPathExists {
+                path: parse_expr(parsed, &arguments[0])?,
+            })
+        }
+        "refute_path_exists" => {
+            let arguments = call_args(call);
+            if arguments.is_empty() || arguments.len() > 2 {
+                return Err(unsupported_test("refute_path_exists expects 1-2 arguments"));
+            }
+            Ok(TestStatement::RefutePathExists {
+                path: parse_expr(parsed, &arguments[0])?,
+            })
+        }
+        "touch" => {
+            let arguments = call_args(call);
+            if arguments.len() != 1 {
+                return Err(unsupported_test("touch expects exactly one argument"));
+            }
+            Ok(TestStatement::Touch(parse_expr(parsed, &arguments[0])?))
         }
         _ => Err(unsupported_test(&format!(
             "unsupported test do statement: {name}"
@@ -465,6 +630,31 @@ fn parse_expr(parsed: &ParseResult<'_>, node: &Node<'_>) -> Result<TestExpr, Ana
                 expected_status,
             });
         }
+        if name == "pipe_output" {
+            let arguments = call_args(&call);
+            if !(1..=3).contains(&arguments.len()) {
+                return Err(unsupported_test("pipe_output expects 1-3 arguments"));
+            }
+            let command = parse_string_expr(parsed, &arguments[0])?;
+            let stdin = Box::new(if arguments.len() >= 2 {
+                parse_expr(parsed, &arguments[1])?
+            } else {
+                TestExpr::String(TestStringExpr::literal(""))
+            });
+            let expected_status = if arguments.len() == 3 {
+                Some(parse_integer(&arguments[2])?)
+            } else {
+                None
+            };
+            return Ok(TestExpr::PipeOutput {
+                command,
+                stdin,
+                expected_status,
+            });
+        }
+        if name == "version" && call.receiver().is_none() && call.arguments().is_none() {
+            return Ok(TestExpr::VersionString);
+        }
         if name == "to_s"
             && let Some(receiver) = call.receiver()
             && let Some(version_call) = receiver.as_call_node()
@@ -479,6 +669,19 @@ fn parse_expr(parsed: &ParseResult<'_>, node: &Node<'_>) -> Result<TestExpr, Ana
                 return Err(unsupported_test("chomp requires receiver"));
             };
             return Ok(TestExpr::Chomp(Box::new(parse_expr(parsed, &receiver)?)));
+        }
+        if name == "strip" {
+            let Some(receiver) = call.receiver() else {
+                return Err(unsupported_test("strip requires receiver"));
+            };
+            return Ok(TestExpr::Strip(Box::new(parse_expr(parsed, &receiver)?)));
+        }
+        if name == "read"
+            && call.arguments().is_none()
+            && let Some(receiver) = call.receiver()
+            && let Ok(path) = parse_path_expr(parsed, &receiver)
+        {
+            return Ok(TestExpr::ReadFile(path));
         }
     }
     if let Some(regex) = node.as_regular_expression_node() {
@@ -599,6 +802,12 @@ fn parse_path_expr(
         "testpath" => TestPathBase::Testpath,
         "prefix" => TestPathBase::Prefix,
         "bin" => TestPathBase::Bin,
+        "include" => TestPathBase::Include,
+        "lib" => TestPathBase::Lib,
+        "libexec" => TestPathBase::Libexec,
+        "pkgshare" => TestPathBase::Pkgshare,
+        "sbin" => TestPathBase::Sbin,
+        "share" => TestPathBase::Share,
         _ => {
             return Err(unsupported_test(&format!(
                 "unsupported path base: {}",
@@ -952,5 +1161,329 @@ end
             result,
             Err(AnalysisError::UnsupportedTestDoSyntax { .. })
         ));
+    }
+
+    #[test]
+    fn test_lower_bare_version_in_assert_match() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Gh < Formula
+  test do
+    assert_match version, shell_output("#{bin}/gh --version")
+  end
+end
+"##;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(
+            &program.statements[0],
+            TestStatement::AssertMatch {
+                expected: TestExpr::VersionString,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_bare_version_in_interpolation() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Demo < Formula
+  test do
+    assert_match "v#{version}", shell_output("#{bin}/demo --version")
+  end
+end
+"##;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        if let TestStatement::AssertMatch { expected, .. } = &program.statements[0] {
+            assert!(
+                matches!(expected, TestExpr::String(s) if s.parts.iter().any(|p| matches!(p, TestStringPart::VersionString)))
+            );
+        } else {
+            return Err("expected AssertMatch".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_refute_match() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Demo < Formula
+  test do
+    refute_match "error", shell_output("#{bin}/demo --check")
+  end
+end
+"##;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(
+            &program.statements[0],
+            TestStatement::RefuteMatch { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_assert_path_exists() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    system bin/"demo", "--init"
+    assert_path_exists testpath/"output.txt"
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 2);
+        assert!(matches!(
+            &program.statements[1],
+            TestStatement::AssertPathExists {
+                path: TestExpr::Path(_),
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_assert_path_exists_with_message() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    assert_path_exists testpath/"output.txt", "output should exist"
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(
+            &program.statements[0],
+            TestStatement::AssertPathExists { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_refute_path_exists() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    refute_path_exists testpath/"should_not_exist"
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(
+            &program.statements[0],
+            TestStatement::RefutePathExists {
+                path: TestExpr::Path(_),
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_mkpath() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    (testpath/"sub/dir").mkpath
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(&program.statements[0], TestStatement::Mkpath(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_touch() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    touch testpath/"foo_file"
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(&program.statements[0], TestStatement::Touch(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_pipe_output_two_args() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Jq < Formula
+  test do
+    assert_equal "2\n", pipe_output("#{bin}/jq .bar", '{"foo":1, "bar":2}')
+  end
+end
+"##;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        if let TestStatement::AssertEqual { actual, .. } = &program.statements[0] {
+            assert!(matches!(actual, TestExpr::PipeOutput { .. }));
+        } else {
+            return Err("expected AssertEqual".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_pipe_output_three_args() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Demo < Formula
+  test do
+    assert_match "ok", pipe_output("#{bin}/demo", "input", 0)
+  end
+end
+"##;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        if let TestStatement::AssertMatch { actual, .. } = &program.statements[0] {
+            assert!(matches!(
+                actual,
+                TestExpr::PipeOutput {
+                    expected_status: Some(0),
+                    ..
+                }
+            ));
+        } else {
+            return Err("expected AssertMatch".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_strip() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r##"
+class Demo < Formula
+  test do
+    output = shell_output("#{bin}/demo").strip
+    assert_equal "hello", output
+  end
+end
+"##;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 2);
+        if let TestStatement::Assign { value, .. } = &program.statements[0] {
+            assert!(matches!(value, TestExpr::Strip(_)));
+        } else {
+            return Err("expected Assign".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_read_file() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    assert_equal "hello", (testpath/"output.txt").read.chomp
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        if let TestStatement::AssertEqual { actual, .. } = &program.statements[0] {
+            assert!(
+                matches!(actual, TestExpr::Chomp(inner) if matches!(inner.as_ref(), TestExpr::ReadFile(_)))
+            );
+        } else {
+            return Err("expected AssertEqual".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_if_os_mac() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    if OS.mac?
+      system bin/"demo", "--mac"
+    else
+      system bin/"demo", "--linux"
+    end
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        // On macOS, only the then-branch should be emitted
+        assert_eq!(program.statements.len(), 1);
+        assert!(matches!(&program.statements[0], TestStatement::System(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_unless_os_mac_skips_body() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    system bin/"demo"
+    unless OS.mac?
+      system bin/"demo", "--linux-only"
+    end
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        // unless OS.mac? body is skipped on macOS
+        assert_eq!(program.statements.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lower_pkgshare_path() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+class Demo < Formula
+  test do
+    assert_path_exists pkgshare/"data.txt"
+  end
+end
+"#;
+
+        let program = lower_test_do(source)?;
+
+        assert_eq!(program.statements.len(), 1);
+        if let TestStatement::AssertPathExists {
+            path: TestExpr::Path(path),
+        } = &program.statements[0]
+        {
+            assert_eq!(path.base, TestPathBase::Pkgshare);
+        } else {
+            return Err("expected AssertPathExists with Pkgshare".into());
+        }
+        Ok(())
     }
 }
