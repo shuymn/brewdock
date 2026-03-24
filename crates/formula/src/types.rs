@@ -185,6 +185,15 @@ pub enum Requirement {
 pub struct NamedEntry {
     /// Name of the dependency or requirement.
     pub name: String,
+    /// Optional version or platform value attached to the entry.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Contexts where the entry applies.
+    #[serde(default)]
+    pub contexts: Vec<String>,
+    /// Specs where the entry applies.
+    #[serde(default)]
+    pub specs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
