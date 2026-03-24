@@ -18,6 +18,7 @@ use crate::{
     BrewdockError, HostTag, Layout,
     finalize::{build_receipt, build_receipt_deps, build_receipt_source, refresh_opt_link},
     lock::FileLock,
+    platform::detect_platform_context,
     progress::{NoopProgressSink, ProgressEvent, SharedProgressSink},
     source_build::build_source_plan,
 };
@@ -714,6 +715,7 @@ impl<R: FormulaRepository, D: BottleDownloader> Orchestrator<R, D> {
         Ok(InstallMethod::Source(build_source_plan(
             formula,
             &self.layout,
+            &self.host_tag,
         )?))
     }
 
@@ -1053,49 +1055,7 @@ fn unix_timestamp_f64() -> f64 {
 
 /// Detects the current platform context for Tier 2 DSL evaluation.
 fn detect_platform() -> PlatformContext {
-    PlatformContext {
-        kernel_version_major: detect_kernel_version_major(),
-        macos_version: detect_macos_version(),
-        cpu_arch: detect_cpu_arch(),
-    }
-}
-
-fn detect_kernel_version_major() -> String {
-    std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.trim().split('.').next().map(ToOwned::to_owned)
-        })
-        .unwrap_or_default()
-}
-
-fn detect_macos_version() -> String {
-    std::process::Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default()
-}
-
-fn detect_cpu_arch() -> String {
-    #[cfg(target_arch = "aarch64")]
-    {
-        "arm64".to_owned()
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        "x86_64".to_owned()
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        std::env::consts::ARCH.to_owned()
-    }
+    detect_platform_context()
 }
 
 #[cfg(test)]

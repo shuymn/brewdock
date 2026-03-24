@@ -96,6 +96,24 @@ tasks:
     cmds:
       - cargo clean
 
+  clean:vm:
+    desc: Remove Tart VMs and cached macOS images used by brewdock tasks
+    summary: |
+      Deletes local Tart VMs named brewdock-* and cached Cirrus macOS images so
+      VM smoke/benchmark runs can reclaim disk without tracking multiple cleanup tasks.
+    preconditions:
+      - sh: command -v tart >/dev/null 2>&1
+        msg: "tart is not installed. Please install it first."
+    cmds:
+      - |
+        set -eu
+        tart list | awk 'NR > 1 && $1 == "local" && $2 ~ /^brewdock-/ { print $2 }' | while read -r name; do
+          tart delete "$name" || true
+        done
+        tart list | awk 'NR > 1 && $1 == "OCI" && $2 ~ /^ghcr.io\/cirruslabs\/macos-/ { print $2 }' | while read -r name; do
+          tart delete "$name" || true
+        done
+
   install:lefthook:
     internal: true
     desc: Install git hooks if needed

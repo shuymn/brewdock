@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::AtomicUsize};
 
 use brewdock_cellar::find_installed_keg;
-use brewdock_formula::Requirement;
+use brewdock_formula::{Formula, NamedEntry, Requirement};
 
 use super::{BrewdockError, InstallMethod, Layout};
 use crate::{
@@ -102,16 +102,47 @@ install:
     Ok(())
 }
 
+fn make_no_bottle_formula_with_requirements(requirements: Vec<Requirement>) -> Formula {
+    let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
+    formula.versions.bottle = false;
+    formula.bottle.stable = None;
+    formula.requirements = requirements;
+    formula
+}
+
+#[tokio::test]
+async fn test_source_fallback_allows_system_requirement() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::with_root(dir.path());
+    let formula =
+        make_no_bottle_formula_with_requirements(vec![Requirement::Name("xcode".to_owned())]);
+
+    let orchestrator = make_orchestrator(
+        vec![formula],
+        vec![],
+        Arc::new(AtomicUsize::new(0)),
+        layout.clone(),
+    )?;
+    let plan = orchestrator.plan_install(&["a"]).await?;
+    let entry = plan.first().ok_or("expected install plan entry")?;
+
+    assert!(matches!(
+        &entry.method,
+        InstallMethod::Source(source)
+            if source.formula_name == "a" && source.cellar_path == layout.cellar().join("a/1.0")
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_source_fallback_rejects_unsupported_requirement()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let layout = Layout::with_root(dir.path());
-
-    let mut formula = make_formula("a", "1.0", &[], PLAN_SHA);
-    formula.versions.bottle = false;
-    formula.bottle.stable = None;
-    formula.requirements = vec![Requirement::Name("xcode".to_owned())];
+    let formula = make_no_bottle_formula_with_requirements(vec![Requirement::Name(
+        "some_custom_requirement".to_owned(),
+    )]);
 
     let orchestrator =
         make_orchestrator(vec![formula], vec![], Arc::new(AtomicUsize::new(0)), layout)?;
@@ -121,7 +152,89 @@ async fn test_source_fallback_rejects_unsupported_requirement()
         result,
         Err(BrewdockError::SourceBuild(
             SourceBuildError::UnsupportedRequirement(requirement)
-        )) if requirement == "xcode"
+        )) if requirement == "some_custom_requirement"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_fallback_rejects_future_macos_requirement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::with_root(dir.path());
+    let formula =
+        make_no_bottle_formula_with_requirements(vec![Requirement::Detailed(NamedEntry {
+            name: "macos".to_owned(),
+            version: Some("26".to_owned()),
+            contexts: Vec::new(),
+            specs: Vec::new(),
+        })]);
+
+    let orchestrator =
+        make_orchestrator(vec![formula], vec![], Arc::new(AtomicUsize::new(0)), layout)?;
+    let result = orchestrator.plan_install(&["a"]).await;
+
+    assert!(matches!(
+        result,
+        Err(BrewdockError::SourceBuild(
+            SourceBuildError::UnsupportedRequirement(requirement)
+        )) if requirement == "macos"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_fallback_rejects_wrong_arch_requirement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::with_root(dir.path());
+    let formula =
+        make_no_bottle_formula_with_requirements(vec![Requirement::Detailed(NamedEntry {
+            name: "arch".to_owned(),
+            version: Some("x86_64".to_owned()),
+            contexts: Vec::new(),
+            specs: Vec::new(),
+        })]);
+
+    let orchestrator =
+        make_orchestrator(vec![formula], vec![], Arc::new(AtomicUsize::new(0)), layout)?;
+    let result = orchestrator.plan_install(&["a"]).await;
+
+    assert!(matches!(
+        result,
+        Err(BrewdockError::SourceBuild(
+            SourceBuildError::UnsupportedRequirement(requirement)
+        )) if requirement == "arch"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_source_fallback_allows_maximum_macos_requirement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let layout = Layout::with_root(dir.path());
+    let formula =
+        make_no_bottle_formula_with_requirements(vec![Requirement::Detailed(NamedEntry {
+            name: "maximum_macos".to_owned(),
+            version: Some("26".to_owned()),
+            contexts: Vec::new(),
+            specs: Vec::new(),
+        })]);
+
+    let orchestrator = make_orchestrator(
+        vec![formula],
+        vec![],
+        Arc::new(AtomicUsize::new(0)),
+        layout.clone(),
+    )?;
+    let plan = orchestrator.plan_install(&["a"]).await?;
+    let entry = plan.first().ok_or("expected install plan entry")?;
+
+    assert!(matches!(
+        &entry.method,
+        InstallMethod::Source(source)
+            if source.formula_name == "a" && source.cellar_path == layout.cellar().join("a/1.0")
     ));
     Ok(())
 }

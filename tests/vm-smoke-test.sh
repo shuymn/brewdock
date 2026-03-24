@@ -14,7 +14,7 @@
 #
 # Prerequisites:
 #   - Tart (https://tart.run) installed
-#   - Base image pulled:  tart pull ghcr.io/cirruslabs/macos-sequoia-base:latest
+#   - Base image pulled:  tart pull "$BREWDOCK_VM_BASE_IMAGE"
 #   - Release binary built: cargo build --release -p brewdock-cli
 #
 # Authentication:
@@ -23,7 +23,7 @@
 #
 # The script:
 #   1. Generates a temporary SSH keypair
-#   2. Clones a disposable VM from the base image
+#   2. Clones a disposable VM from the Xcode-equipped base image
 #   3. Boots the VM with a shared directory containing the keypair and binary
 #   4. Installs the public key into the VM via the mount, then uses key auth
 #   5. Runs: bd update -> installability sweep -> deep verification (if jq requested) -> bd --dry-run
@@ -33,6 +33,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$SCRIPT_DIR/vm-config.sh"
 
 readonly DEFAULT_FORMULAE=(
   actionlint
@@ -90,7 +91,9 @@ readonly CROSS_TEST_BD_TO_BREW=(jq ripgrep bat)
 readonly CROSS_TEST_BREW_TO_BD=(tree figlet)
 
 VM_NAME="brewdock-smoke-$$"
-BASE_IMAGE="ghcr.io/cirruslabs/macos-sequoia-base:latest"
+# Use an Xcode image with Swift 6.2.x so source builds for Swift packages
+# like `container` do not fail on the VM's default toolchain version.
+BASE_IMAGE="$BREWDOCK_VM_BASE_IMAGE"
 BD_BINARY="$PROJECT_ROOT/target/release/bd"
 SSH_USER="admin"
 SSH_PASS="admin"

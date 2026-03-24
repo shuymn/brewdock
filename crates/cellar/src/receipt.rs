@@ -122,7 +122,8 @@ impl InstallReceipt {
     }
 }
 
-fn canonical_homebrew_arch(arch: &str) -> &str {
+#[must_use]
+pub fn canonical_homebrew_arch(arch: &str) -> &str {
     match arch {
         "aarch64" => "arm64",
         "x86_64" => "x86_64",

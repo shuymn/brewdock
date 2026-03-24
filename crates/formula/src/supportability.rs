@@ -27,7 +27,9 @@ pub fn check_supportability(formula: &Formula, host_tag: &str) -> Result<(), For
             // installed, which requires CLT. Formulas with this restriction use the
             // bottle when CLT is present and fall back to source otherwise; since
             // brewdock only supports bottle installs, treat CLT as satisfied.
-            "clt_installed" => {}
+            // brewdock always uses the default Homebrew prefix, so default_prefix
+            // is always satisfied.
+            "clt_installed" | "default_prefix" => {}
             _ => {
                 return Err(unsupported(
                     &formula.name,
@@ -121,6 +123,14 @@ mod tests {
     fn test_supportability_clt_installed_is_ok() -> Result<(), FormulaError> {
         let mut formula = test_formula("gcc", &[]);
         formula.pour_bottle_only_if = Some("clt_installed".to_owned());
+        check_supportability(&formula, TAG)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_supportability_default_prefix_is_ok() -> Result<(), FormulaError> {
+        let mut formula = test_formula("gcc", &[]);
+        formula.pour_bottle_only_if = Some("default_prefix".to_owned());
         check_supportability(&formula, TAG)?;
         Ok(())
     }

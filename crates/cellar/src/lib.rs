@@ -25,7 +25,7 @@ pub use post_install::{
 };
 pub use receipt::{
     InstallReason, InstallReceipt, ReceiptDependency, ReceiptSource, ReceiptSourceVersions,
-    write_receipt,
+    canonical_homebrew_arch, write_receipt,
 };
 pub use relocate::{RelocationManifest, RelocationScope, relocate_keg, relocate_keg_with_manifest};
 pub use test_do::{TestDoContext, run_test_do};
