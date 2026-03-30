@@ -28,7 +28,7 @@ jobs:
           cache: true
 
       - name: Set up Task
-        uses: shuymn/github-actions/.github/actions/setup-task@417b9296c6693ab840d5bb5600a18581ab877752
+        uses: shuymn/github-actions/.github/actions/setup-task@ac04e25175ec6bfe1c2010eebf392a9f3cf7f108
 
       - name: Check formatting
         run: task fmt:check
@@ -56,7 +56,7 @@ jobs:
           cache: true
 
       - name: Set up Task
-        uses: shuymn/github-actions/.github/actions/setup-task@417b9296c6693ab840d5bb5600a18581ab877752
+        uses: shuymn/github-actions/.github/actions/setup-task@ac04e25175ec6bfe1c2010eebf392a9f3cf7f108
 
       - name: Run tests
         run: task test
@@ -81,7 +81,7 @@ jobs:
           cache: true
 
       - name: Set up Task
-        uses: shuymn/github-actions/.github/actions/setup-task@417b9296c6693ab840d5bb5600a18581ab877752
+        uses: shuymn/github-actions/.github/actions/setup-task@ac04e25175ec6bfe1c2010eebf392a9f3cf7f108
 
       - name: Build workspace
         run: task build
