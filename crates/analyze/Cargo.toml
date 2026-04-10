@@ -19,7 +19,7 @@ brewdock-formula = { path = "../formula" }
 anyhow = "1"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "=1.50.0", features = ["rt", "macros"] }
+tokio = { version = "=1.51.0", features = ["rt", "macros"] }
 clap = { version = "4", features = ["derive"] }
 
 [lints]
