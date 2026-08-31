@@ -28,7 +28,7 @@ brewdock-bottle = { path = "../bottle" }
 brewdock-cellar = { path = "../cellar" }
 serde_json.workspace = true
 tempfile = "=3.27.0"
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 tar = "=0.4.45"
 
 [lints]
