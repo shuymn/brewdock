@@ -21,7 +21,7 @@ brewdock-cellar = { path = "../cellar" }
 fs2 = "0.4"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 tar = "=0.4.45"
 
 [dev-dependencies]
